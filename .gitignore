@@ -1,0 +1,30 @@
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE 配置
+.vscode/
+.idea/
+pyrightconfig.json
+
+# 流量包文件（通常较大）
+*.pcap
+*.pcapng
+*.cap
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 日志和临时文件
+*.log
+*.tmp
+
+test/
+tests/
+output/
+.claude/
+CLAUDE.md
+docs/

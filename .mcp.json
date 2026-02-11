@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "TingLan": {
+      "command": "python",
+      "args": ["E:/cyber_safe/流量分析/our_project/mcp_server.py"]
+    }
+  }
+}
