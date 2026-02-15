@@ -837,11 +837,6 @@ class AnalysisSummary:
     attack_detections: List[AttackDetectionInfo] = field(default_factory=list)  # 攻击检测结果
     analysis_time: float = 0.0
 
-    # 按置信度统计
-    high_confidence_count: int = 0
-    medium_confidence_count: int = 0
-    low_confidence_count: int = 0
-
     @property
     def threat_count(self) -> int:
         return len(self.detections)
@@ -855,16 +850,3 @@ class AnalysisSummary:
             grouped[det.detection_type].append(det)
         return grouped
 
-    @property
-    def detection_by_confidence(self) -> Dict[str, List[DetectionResult]]:
-        grouped = {"high": [], "medium": [], "low": []}
-        for det in self.detections:
-            conf = det.confidence if det.confidence in grouped else "low"
-            grouped[conf].append(det)
-        return grouped
-
-    def update_confidence_counts(self):
-        by_conf = self.detection_by_confidence
-        self.high_confidence_count = len(by_conf["high"])
-        self.medium_confidence_count = len(by_conf["medium"])
-        self.low_confidence_count = len(by_conf["low"])

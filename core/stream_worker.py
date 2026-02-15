@@ -694,8 +694,11 @@ class StreamAnalysisWorker(QThread):
         results: List[AutoDecodingResult] = []
 
         try:
-            from core.auto_decoder import MultiLayerDecoder
-            decoder = MultiLayerDecoder()
+            from core.auto_decoder import MagicDecoder
+            from core.cyberchef_bridge import CyberChefBridge
+
+            bridge = CyberChefBridge()
+            decoder = MagicDecoder(bridge=bridge if bridge.is_available() else None)
 
             total = len(detections)
             for i, detection in enumerate(detections):
@@ -708,16 +711,40 @@ class StreamAnalysisWorker(QThread):
 
                 payloads_to_decode = []
 
+                # 收集已解码的载荷
+                if detection.payloads:
+                    for payload in detection.payloads:
+                        if payload.decoded_content and len(payload.decoded_content) > 4:
+                            payloads_to_decode.append(
+                                (f"payload:{payload.param_name}", payload.decoded_content)
+                            )
+
+                # 收集参数字典里的值
+                if detection.payload and isinstance(detection.payload, dict):
+                    for key, value in detection.payload.items():
+                        if isinstance(value, dict):
+                            decoded = value.get('decoded', '')
+                            if decoded and len(str(decoded)) > 4:
+                                payloads_to_decode.append((f"param:{key}", str(decoded)))
+
+                # 收集原始请求体
                 if detection.raw_result and isinstance(detection.raw_result, dict):
                     raw_body = detection.raw_result.get('raw_request_body', '')
                     if raw_body and len(raw_body) > 10:
                         payloads_to_decode.append(("request_body", str(raw_body)[:5000]))
 
+                    # 提取 URI query string 参数
+                    uri = detection.raw_result.get('uri', '') or detection.uri or ''
+                    if '?' in uri:
+                        query_string = uri.split('?', 1)[1]
+                        if query_string and len(query_string) > 4:
+                            payloads_to_decode.append(("uri_query", query_string))
+
                 for source, data in payloads_to_decode:
                     try:
                         decode_result = decoder.decode_http_payload(data)
 
-                        if decode_result.total_layers > 0 or decode_result.flags_found:
+                        if (decode_result.total_layers > 0 or decode_result.flags_found) and decode_result.is_meaningful:
                             auto_result = AutoDecodingResult(
                                 source=source,
                                 original_data=data[:500],
@@ -837,8 +864,6 @@ class StreamAnalysisWorker(QThread):
             recovered_files=recovered_files,
             analysis_time=analysis_time
         )
-
-        summary.update_confidence_counts()
 
         self._emit_progress(100, f"分析完成，耗时 {analysis_time:.2f}秒")
         return summary

@@ -1,14 +1,17 @@
 # auto_decoder.py - 自动解码器
-# 类似CyberChef的多层自动解码，base64/url/hex/rot13/gzip都能解
-# 递归解到解不动为止
+# CyberChef Magic 风格的多层自动解码引擎
+# 递归 + 迭代循环解码，直到无法继续解码为止
 
 import base64
 import binascii
+import bz2
 import gzip
+import lzma
 import zlib
 import re
 import math
 import codecs
+import logging
 from typing import List, Optional, Tuple, Dict, Any
 from dataclasses import dataclass, field
 from enum import Enum
@@ -16,12 +19,15 @@ from collections import Counter
 import uuid
 from html import unescape as html_unescape
 
+logger = logging.getLogger(__name__)
+
 
 class DecodingMethod(Enum):
     BASE64 = "base64"
     BASE64_URL = "base64url"
     BASE32 = "base32"
     BASE58 = "base58"
+    BASE85 = "base85"
     HEX = "hex"
     HEX_SPACED = "hex_spaced"
     URL = "url"
@@ -32,7 +38,10 @@ class DecodingMethod(Enum):
     MORSE = "morse"
     GZIP = "gzip"
     ZLIB = "zlib"
+    BZIP2 = "bzip2"
+    LZMA = "lzma"
     ROT13 = "rot13"
+    XOR_BRUTE = "xor_brute"
     XOR = "xor"
     REVERSE = "reverse"
     RAW = "raw"
@@ -172,11 +181,18 @@ HTML_ENTITY_PATTERN = re.compile(r'&(?:#\d{2,5}|#x[0-9A-Fa-f]{2,4}|[a-zA-Z]{2,8}
 # Base58 (Bitcoin那套)
 BASE58_PATTERN = re.compile(r'^[1-9A-HJ-NP-Za-km-z]{20,}$')
 
+# Base85 (Ascii85 / Z85)
+BASE85_PATTERN = re.compile(r'^<~[!-u\s]+~>$')  # Ascii85 带 <~ ~> 包裹
+BASE85_RAW_PATTERN = re.compile(r'^[0-9A-Za-z!#$%&()*+\-;<=>?@^_`{|}~]{20,}$')
+
 # Morse
 MORSE_PATTERN = re.compile(r'^[-.\s]+$|^[_.\s]+$', re.IGNORECASE)
 
 GZIP_MAGIC = b'\x1f\x8b\x08'
 ZLIB_HEADERS = [b'\x78\x01', b'\x78\x9c', b'\x78\xda']
+BZIP2_MAGIC = b'BZ'
+LZMA_MAGIC = b'\x5d\x00'
+XZ_MAGIC = b'\xfd7zXZ'
 
 # 常见flag格式
 FLAG_PATTERNS = [
@@ -217,7 +233,7 @@ class AutoDecoder:
 
     MAX_DEPTH = 15
     MIN_DATA_LENGTH = 4
-    GARBLED_THRESHOLD = 0.5  # 超过一半乱码就别继续了
+    GARBLED_THRESHOLD = 0.3  # 超过30%乱码就别继续了
 
     def __init__(self):
         self._checks = self._build_checks()
@@ -250,6 +266,24 @@ class AutoDecoder:
             pattern=BASE58_PATTERN,
             min_length=20,
             priority=18
+        ))
+
+        # Base85 (Ascii85 带 <~ ~> 包裹)
+        checks.append(DecodingCheck(
+            method=DecodingMethod.BASE85,
+            pattern=BASE85_PATTERN,
+            args={'variant': 'ascii85'},
+            min_length=5,
+            priority=16
+        ))
+
+        # Base85 (raw, 无包裹)
+        checks.append(DecodingCheck(
+            method=DecodingMethod.BASE85,
+            pattern=BASE85_RAW_PATTERN,
+            args={'variant': 'raw'},
+            min_length=20,
+            priority=19
         ))
 
         # Hex
@@ -334,6 +368,24 @@ class AutoDecoder:
             priority=5
         ))
 
+        # Bzip2，魔数 BZ
+        checks.append(DecodingCheck(
+            method=DecodingMethod.BZIP2,
+            pattern=None,
+            entropy_range=(7.0, 8.0),
+            min_length=10,
+            priority=5
+        ))
+
+        # LZMA，魔数 \x5d\x00
+        checks.append(DecodingCheck(
+            method=DecodingMethod.LZMA,
+            pattern=None,
+            entropy_range=(7.0, 8.0),
+            min_length=10,
+            priority=5
+        ))
+
         # ROT13
         checks.append(DecodingCheck(
             method=DecodingMethod.ROT13,
@@ -371,6 +423,12 @@ class AutoDecoder:
                     elif check.method == DecodingMethod.ZLIB:
                         if not any(data.startswith(h) for h in ZLIB_HEADERS):
                             continue
+                    elif check.method == DecodingMethod.BZIP2:
+                        if not data.startswith(BZIP2_MAGIC):
+                            continue
+                    elif check.method == DecodingMethod.LZMA:
+                        if not (data.startswith(LZMA_MAGIC) or data.startswith(XZ_MAGIC)):
+                            continue
                     else:
                         continue
 
@@ -386,6 +444,12 @@ class AutoDecoder:
                 elif check.method == DecodingMethod.ZLIB:
                     if not any(data.startswith(h) for h in ZLIB_HEADERS):
                         continue
+                elif check.method == DecodingMethod.BZIP2:
+                    if not data.startswith(BZIP2_MAGIC):
+                        continue
+                elif check.method == DecodingMethod.LZMA:
+                    if not (data.startswith(LZMA_MAGIC) or data.startswith(XZ_MAGIC)):
+                        continue
 
             matches.append(check)
 
@@ -394,12 +458,14 @@ class AutoDecoder:
     def speculative_execution(
         self,
         data: bytes,
-        depth: int = 3,
+        depth: int = None,
         crib: Optional[re.Pattern] = None,
         recipe: List[DecodingStep] = None,
         visited: set = None
     ) -> List[DecodingResult]:
         """递归尝试所有匹配解码器，解到解不动或乱码为止"""
+        if depth is None:
+            depth = self.MAX_DEPTH
         if recipe is None:
             recipe = []
         if visited is None:
@@ -562,6 +628,8 @@ class AutoDecoder:
                 step = self._decode_base32(data)
             elif check.method == DecodingMethod.BASE58:
                 step = self._decode_base58(data)
+            elif check.method == DecodingMethod.BASE85:
+                step = self._decode_base85(data, check.args)
             elif check.method in (DecodingMethod.HEX, DecodingMethod.HEX_SPACED):
                 step = self._decode_hex(data, check.args)
             elif check.method == DecodingMethod.URL:
@@ -580,6 +648,10 @@ class AutoDecoder:
                 step = self._decode_gzip(data)
             elif check.method == DecodingMethod.ZLIB:
                 step = self._decode_zlib(data)
+            elif check.method == DecodingMethod.BZIP2:
+                step = self._decode_bzip2(data)
+            elif check.method == DecodingMethod.LZMA:
+                step = self._decode_lzma(data)
             elif check.method == DecodingMethod.ROT13:
                 step = self._decode_rot13(data)
         except Exception as e:
@@ -856,6 +928,51 @@ class AutoDecoder:
             step.error = str(e)
         return step
 
+    def _decode_bzip2(self, data: bytes) -> DecodingStep:
+        step = DecodingStep(method=DecodingMethod.BZIP2, input_data=data)
+        try:
+            if data.startswith(BZIP2_MAGIC):
+                decoded = bz2.decompress(data)
+                step.output_data = decoded
+                step.success = True
+                step.confidence = 0.95
+        except Exception as e:
+            step.error = str(e)
+        return step
+
+    def _decode_lzma(self, data: bytes) -> DecodingStep:
+        step = DecodingStep(method=DecodingMethod.LZMA, input_data=data)
+        try:
+            if data.startswith(LZMA_MAGIC) or data.startswith(XZ_MAGIC):
+                decoded = lzma.decompress(data)
+                step.output_data = decoded
+                step.success = True
+                step.confidence = 0.95
+        except Exception as e:
+            step.error = str(e)
+        return step
+
+    def _decode_base85(self, data: bytes, args: Dict) -> DecodingStep:
+        step = DecodingStep(method=DecodingMethod.BASE85, input_data=data)
+        try:
+            text = data.decode('utf-8', errors='ignore').strip()
+            variant = args.get('variant', 'raw')
+
+            if variant == 'ascii85':
+                # 去掉 <~ ~> 包裹
+                if text.startswith('<~') and text.endswith('~>'):
+                    text = text[2:-2]
+                decoded = base64.a85decode(text)
+            else:
+                decoded = base64.b85decode(text)
+
+            step.output_data = decoded
+            step.success = True
+            step.confidence = 0.85
+        except Exception as e:
+            step.error = str(e)
+        return step
+
     def _decode_rot13(self, data: bytes) -> DecodingStep:
         step = DecodingStep(method=DecodingMethod.ROT13, input_data=data)
         try:
@@ -916,9 +1033,17 @@ class AutoDecoder:
             return False
 
     def _output_check_passes(self, data: bytes) -> bool:
-        """乱码太多就返回False，不继续解了"""
+        """乱码太多就返回False，不继续解了。但压缩格式除外。"""
         if not data or len(data) < self.MIN_DATA_LENGTH:
             return False
+
+        # 压缩格式的魔数检测：二进制是正常的，不能按乱码处理
+        if (data.startswith(GZIP_MAGIC) or
+            any(data.startswith(h) for h in ZLIB_HEADERS) or
+            data.startswith(BZIP2_MAGIC) or
+            data.startswith(LZMA_MAGIC) or
+            data.startswith(XZ_MAGIC)):
+            return True
 
         garbled = self._calc_garbled_ratio(data)
         if garbled > self.GARBLED_THRESHOLD:
@@ -927,7 +1052,15 @@ class AutoDecoder:
         return True
 
     def _calc_garbled_ratio(self, data: bytes) -> float:
-        """统计乱码占比，0.0=完全可读，1.0=全是乱码"""
+        """统计乱码占比，0.0=完全可读，1.0=全是乱码
+
+        增强检测：
+        - UTF-8 替换字符 (U+FFFD)
+        - 控制字符 (除 \\n\\r\\t)
+        - C1 控制字符 (0x80-0x9F)
+        - Latin-1 mojibake 模式：连续 2+ 个非 ASCII Latin 扩展字符
+          (如 àáØû 这类在非 CJK 上下文中视为乱码)
+        """
         if not data:
             return 1.0
 
@@ -940,14 +1073,27 @@ class AutoDecoder:
             return 1.0
 
         garbled = 0
+        consecutive_latin_ext = 0
+        has_cjk = any(0x4E00 <= ord(ch) <= 0x9FFF for ch in text[:200])
+
         for ch in text:
             cp = ord(ch)
             if ch == '\ufffd':
                 garbled += 1
+                consecutive_latin_ext = 0
             elif cp < 32 and ch not in '\n\r\t':
                 garbled += 1
+                consecutive_latin_ext = 0
             elif 0x80 <= cp <= 0x9f:
                 garbled += 1
+                consecutive_latin_ext = 0
+            elif not has_cjk and 0xA0 <= cp <= 0xFF:
+                # Latin-1 扩展区：在非 CJK 上下文中，连续出现视为 mojibake
+                consecutive_latin_ext += 1
+                if consecutive_latin_ext >= 2:
+                    garbled += 1
+            else:
+                consecutive_latin_ext = 0
 
         return garbled / len(text)
 
@@ -1050,38 +1196,465 @@ class AutoDecoder:
             result.confidence = 0.3
 
 
-class MultiLayerDecoder:
-    """针对HTTP流量里多层编码的场景"""
-    def __init__(self):
-        self.auto_decoder = AutoDecoder()
+class MagicDecoder:
+    """CyberChef Magic 风格解码器
+
+    核心思路:
+    1. 优先调用 CyberChef npm 的 Magic 操作（通过 Node.js 桥接器）
+    2. 如果 Node.js / CyberChef 不可用，回退到 Python AutoDecoder
+    3. Python 模式: 迭代循环调用 AutoDecoder，每轮取最优解码结果
+    可选 intensive 模式进行单字节 XOR 暴力破解。
+    """
+
+    MAX_ITERATIONS = 20   # 迭代上限，防止无限循环
+    XOR_SAMPLE_SIZE = 256  # intensive 模式 XOR 采样字节数
+
+    def __init__(self, intensive: bool = False, bridge=None):
+        self._intensive = intensive
+        self._decoder = AutoDecoder()
+        self._bridge = bridge  # CyberChefBridge 实例（外部注入或延迟初始化）
+        self._bridge_checked = bridge is not None
+
+    def decode(self, data: bytes, crib: str = None) -> DecodingResult:
+        """主入口：优先 CyberChef，回退 Python 迭代解码"""
+        if not data or len(data) < AutoDecoder.MIN_DATA_LENGTH:
+            result = DecodingResult(original_data=data, final_data=data)
+            self._decoder._analyze_result(result, None)
+            return result
+
+        # 优先尝试 CyberChef
+        cyberchef_result = self._try_cyberchef(data, crib)
+        if cyberchef_result is not None:
+            return cyberchef_result
+
+        # 回退到 Python 解码
+        return self._decode_python(data, crib)
+
+    def _get_bridge(self):
+        """延迟初始化 CyberChefBridge"""
+        if not self._bridge_checked:
+            self._bridge_checked = True
+            try:
+                from core.cyberchef_bridge import CyberChefBridge
+                bridge = CyberChefBridge()
+                if bridge.is_available():
+                    self._bridge = bridge
+                else:
+                    self._bridge = None
+            except Exception as e:
+                logger.debug(f"CyberChef bridge 初始化失败: {e}")
+                self._bridge = None
+        return self._bridge
+
+    def _try_cyberchef(self, data: bytes, crib: str = None) -> Optional[DecodingResult]:
+        """尝试用 CyberChef Magic 解码，成功返回 DecodingResult，否则 None"""
+        bridge = self._get_bridge()
+        if bridge is None:
+            return None
+
+        try:
+            # CyberChef 接受字符串输入
+            text = data.decode('utf-8', errors='replace')
+
+            response = bridge.magic(
+                data=text,
+                depth=3,
+                intensive=self._intensive,
+                crib=crib or "",
+            )
+
+            if not response.ok:
+                logger.debug(f"CyberChef Magic 失败: {response.error}")
+                return None
+
+            # 遍历所有结果，找最有意义的
+            crib_pattern = None
+            if crib:
+                try:
+                    crib_pattern = re.compile(crib, re.IGNORECASE)
+                except Exception:
+                    pass
+
+            best_candidate = None
+            best_score = float('inf')
+
+            for candidate_result in response.results:
+                if not candidate_result.recipe:
+                    continue
+
+                candidate_data = candidate_result.data
+                candidate_bytes = candidate_data.encode('utf-8', errors='replace')
+
+                # 跳过仍然是编码数据的结果（不可读或高熵）
+                candidate_garbled = self._decoder._calc_garbled_ratio(candidate_bytes)
+                if candidate_result.entropy > 7.0:
+                    continue
+                if candidate_result.entropy > 5.0 and candidate_garbled > 0.2:
+                    continue
+
+                # 计算候选质量分数（越低越好）
+                score = candidate_result.entropy
+                score += len(candidate_result.recipe)  # 短 recipe 更好
+
+                # crib 匹配：大幅降低分数
+                if crib_pattern and crib_pattern.search(candidate_data):
+                    score -= 1000
+
+                # 有 flag 模式：大幅降低分数
+                flag_match = re.search(
+                    r'(flag|ctf|key)\{[^}]+\}', candidate_data, re.IGNORECASE
+                )
+                if flag_match:
+                    score -= 500
+
+                # UTF-8 可读文本：降低分数
+                if candidate_result.is_utf8:
+                    score -= 50
+
+                # 可打印字符比例高：降低分数
+                printable_ratio = sum(
+                    1 for c in candidate_data[:200]
+                    if c.isprintable() or c in '\r\n\t'
+                ) / max(len(candidate_data[:200]), 1)
+                if printable_ratio > 0.8:
+                    score -= 100 * printable_ratio
+
+                if score < best_score:
+                    best_score = score
+                    best_candidate = candidate_result
+
+            if best_candidate is None:
+                return None
+
+            # 验证结果质量：如果输出不比输入更有意义则回退
+            final_data = best_candidate.data.encode('utf-8', errors='replace')
+            if final_data == data:
+                return None
+
+            # 检查是否还是编码数据（只解了一半）
+            final_text = best_candidate.data
+            still_encoded = (
+                # Base64 模式
+                (re.fullmatch(r'[A-Za-z0-9+/=\s]{20,}', final_text.strip())
+                 and not re.search(r'[{}\[\]()!@#$%^&*]', final_text))
+                # Hex 模式
+                or re.fullmatch(r'(?:[0-9A-Fa-f]{2}[\s:]*){10,}', final_text.strip())
+                # URL 编码残留
+                or len(re.findall(r'%[0-9A-Fa-f]{2}', final_text)) > 4
+            )
+            if still_encoded:
+                # 仍然像 base64，CyberChef 没有完全解开，回退 Python
+                return None
+
+            steps = []
+            for step_info in best_candidate.recipe:
+                op_name = step_info.get("op", "")
+                method = self._cyberchef_op_to_method(op_name)
+                step = DecodingStep(
+                    method=method,
+                    input_data=data,
+                    output_data=final_data,
+                    success=True,
+                    confidence=0.9,
+                    metadata={
+                        "cyberchef_op": op_name,
+                        "cyberchef_args": step_info.get("args", []),
+                    },
+                )
+                steps.append(step)
+
+            result = DecodingResult(
+                original_data=data,
+                final_data=final_data,
+                steps=steps,
+                total_layers=len(steps),
+            )
+            self._decoder._analyze_result(result, crib_pattern)
+            result.score = self._decoder._calculate_score(result, crib_pattern)
+
+            logger.debug(
+                f"CyberChef Magic 成功: {best_candidate.decode_chain} "
+                f"({best_candidate.total_layers} 层, score={result.score:.1f})"
+            )
+            return result
+
+        except Exception as e:
+            logger.debug(f"CyberChef Magic 异常: {e}")
+            return None
+
+    @staticmethod
+    def _cyberchef_op_to_method(op_name: str) -> DecodingMethod:
+        """将 CyberChef 操作名映射到 DecodingMethod"""
+        mapping = {
+            "From Base64": DecodingMethod.BASE64,
+            "From Base32": DecodingMethod.BASE32,
+            "From Base58": DecodingMethod.BASE58,
+            "From Base85": DecodingMethod.BASE85,
+            "From Hex": DecodingMethod.HEX,
+            "From Hexdump": DecodingMethod.HEX,
+            "URL Decode": DecodingMethod.URL,
+            "From Binary": DecodingMethod.BINARY,
+            "From Octal": DecodingMethod.OCTAL,
+            "From Decimal": DecodingMethod.DECIMAL,
+            "From HTML Entity": DecodingMethod.HTML_ENTITY,
+            "From Morse Code": DecodingMethod.MORSE,
+            "Gunzip": DecodingMethod.GZIP,
+            "Zlib Inflate": DecodingMethod.ZLIB,
+            "Bzip2 Decompress": DecodingMethod.BZIP2,
+            "ROT13": DecodingMethod.ROT13,
+            "XOR": DecodingMethod.XOR,
+        }
+        return mapping.get(op_name, DecodingMethod.RAW)
+
+    def _decode_python(self, data: bytes, crib: str = None) -> DecodingResult:
+        """Python 回退解码：迭代循环直到稳定"""
+        crib_pattern = None
+        if crib:
+            try:
+                crib_pattern = re.compile(crib, re.IGNORECASE)
+            except Exception:
+                pass
+
+        original_data = data
+        all_steps: List[DecodingStep] = []
+        visited_hashes = {hash(data)}
+
+        for iteration in range(self.MAX_ITERATIONS):
+            # 用 AutoDecoder 的 speculative_execution 做一轮解码
+            round_result = self._decoder.decode(data, crib=crib)
+
+            # 本轮没有解出新东西
+            if round_result.total_layers == 0:
+                break
+
+            # 输出跟输入一样 — 稳定了
+            if round_result.final_data == data:
+                break
+
+            # 防循环：之前见过这个输出
+            output_hash = hash(round_result.final_data)
+            if output_hash in visited_hashes:
+                break
+            visited_hashes.add(output_hash)
+
+            # 记录本轮的解码步骤
+            all_steps.extend(round_result.steps)
+            data = round_result.final_data
+
+            # 找到 flag 就可以提前结束
+            if round_result.flags_found:
+                break
+
+            logger.debug(
+                f"Magic 迭代 {iteration + 1}: "
+                f"{round_result.decode_chain} -> {len(data)} bytes"
+            )
+
+        # intensive 模式：尝试 XOR 暴力破解
+        # 仅当结果还没找到 flag 时才尝试
+        if self._intensive and len(data) <= 1024:
+            temp = DecodingResult(original_data=data, final_data=data)
+            self._decoder._analyze_result(temp, crib_pattern)
+            # 已经找到 flag 就不需要再 XOR
+            # 有 crib 但没匹配到 → 应该尝试 XOR
+            # 没有 crib 且数据不可读 → 应该尝试 XOR
+            crib_not_matched = crib_pattern and not crib_pattern.search(
+                data.decode('utf-8', errors='replace')
+            )
+            should_try_xor = (
+                not temp.flags_found
+                and (crib_not_matched or not temp.is_meaningful)
+            )
+            if should_try_xor:
+                xor_result = self._xor_brute_force(data, crib_pattern)
+                if xor_result and xor_result.total_layers > 0:
+                    all_steps.extend(xor_result.steps)
+                    data = xor_result.final_data
+
+        # 组装最终结果
+        final = DecodingResult(
+            original_data=original_data,
+            final_data=data,
+            steps=all_steps,
+            total_layers=len([s for s in all_steps if s.success]),
+        )
+        self._decoder._analyze_result(final, crib_pattern)
+        final.score = self._decoder._calculate_score(final, crib_pattern)
+        return final
+
+    def decode_text(self, text: str, crib: str = None) -> DecodingResult:
+        try:
+            data = text.encode('utf-8')
+        except UnicodeEncodeError:
+            data = text.encode('latin-1')
+        return self.decode(data, crib=crib)
 
     def decode_http_payload(self, payload: str, crib: str = None) -> DecodingResult:
-        """先URL解码一层再丢给自动解码器"""
-        from urllib.parse import unquote
-        try:
-            decoded_once = unquote(payload)
-        except:
-            decoded_once = payload
+        """解码 HTTP 载荷：先完全 URL 解码，再 Magic 循环解码
 
-        # 默认搜索flag格式
+        增强：
+        - URL 解码后检查是否已是可读明文，避免误解码
+        - 最终输出验证：乱码率过高则丢弃解码结果
+        - 检查解码结果与原文是否实质相同
+        """
+        from urllib.parse import unquote
+
+        # 循环 URL 解码直到稳定
+        current = payload
+        for _ in range(10):
+            try:
+                decoded = unquote(current)
+            except Exception:
+                break
+            if decoded == current:
+                break
+            current = decoded
+
+        # 检查 URL 解码后是否已是可读明文
+        # 如果乱码率极低且无编码模式特征，直接返回 URL 解码结果
+        url_decoded_bytes = current.encode('utf-8', errors='replace')
+        garbled_after_url = self._decoder._calc_garbled_ratio(url_decoded_bytes)
+        has_encoding_pattern = bool(
+            re.search(r'[A-Za-z0-9+/]{20,}={0,2}', current)  # Base64
+            or re.search(r'(?:[0-9A-Fa-f]{2}){10,}', current)  # Hex
+            or re.search(r'(?:%[0-9A-Fa-f]{2}){4,}', current)  # URL encoding residual
+        )
+
+        if garbled_after_url < 0.05 and not has_encoding_pattern:
+            # 已是明文，构造一个仅含 URL 解码步骤的结果
+            result = DecodingResult(
+                original_data=payload.encode('utf-8', errors='replace'),
+                final_data=url_decoded_bytes,
+                steps=[DecodingStep(
+                    method=DecodingMethod.URL,
+                    input_data=payload.encode('utf-8', errors='replace'),
+                    output_data=url_decoded_bytes,
+                    success=True if current != payload else False,
+                    confidence=0.95,
+                )] if current != payload else [],
+                total_layers=1 if current != payload else 0,
+            )
+            self._decoder._analyze_result(result, None)
+            return result
+
         if crib is None:
             crib = r'flag\{[^}]+\}'
 
-        return self.auto_decoder.decode_text(decoded_once, crib=crib)
+        result = self.decode_text(current, crib=crib)
+
+        # 最终输出验证：检查 final_data 乱码率
+        final_garbled = self._decoder._calc_garbled_ratio(result.final_data)
+        if final_garbled > 0.2 and not result.flags_found:
+            # 乱码率太高，丢弃解码结果，回退到 URL 解码后的数据
+            result = DecodingResult(
+                original_data=payload.encode('utf-8', errors='replace'),
+                final_data=url_decoded_bytes,
+                steps=[],
+                total_layers=0,
+            )
+            self._decoder._analyze_result(result, None)
+            return result
+
+        # 检查 final_text 与 URL 解码后的原文是否实质相同
+        final_text = result.final_text.strip()
+        original_text = current.strip()
+        if final_text == original_text and result.total_layers > 0:
+            # 解码前后没变化，层数归零
+            result = DecodingResult(
+                original_data=payload.encode('utf-8', errors='replace'),
+                final_data=url_decoded_bytes,
+                steps=[],
+                total_layers=0,
+            )
+            self._decoder._analyze_result(result, None)
+
+        return result
 
     def decode_webshell_param(self, param_value: str) -> DecodingResult:
-        return self.auto_decoder.decode_text(param_value, max_depth=5)
+        return self.decode_text(param_value)
+
+    def _xor_brute_force(
+        self, data: bytes, crib: Optional[re.Pattern]
+    ) -> Optional[DecodingResult]:
+        """单字节 XOR 暴力破解 (CyberChef intensive 模式)"""
+        sample = data[:self.XOR_SAMPLE_SIZE]
+        best_result = None
+        best_score = float('inf')
+
+        for key in range(1, 256):
+            xored = bytes(b ^ key for b in sample)
+
+            # 快速检查：可读字符占比
+            printable = sum(1 for b in xored if 32 <= b <= 126 or b in (9, 10, 13))
+            if printable / len(xored) < 0.7:
+                continue
+
+            # 全量 XOR
+            full_xored = bytes(b ^ key for b in data)
+
+            # 检查是否匹配 crib
+            try:
+                text = full_xored.decode('utf-8', errors='replace')
+            except Exception:
+                continue
+
+            matched_crib = crib and crib.search(text)
+
+            # 检查 flag
+            has_flag = any(p.search(text) for p in FLAG_PATTERNS)
+
+            if not matched_crib and not has_flag:
+                # 检查英文可读性
+                chi = self._decoder._chi_squared_english(text)
+                if chi > 500:
+                    continue
+
+            step = DecodingStep(
+                method=DecodingMethod.XOR_BRUTE,
+                input_data=data,
+                output_data=full_xored,
+                success=True,
+                confidence=0.7,
+                metadata={'xor_key': key, 'xor_key_hex': f'0x{key:02x}'}
+            )
+
+            candidate = DecodingResult(
+                original_data=data,
+                final_data=full_xored,
+                steps=[step],
+                total_layers=1,
+            )
+            self._decoder._analyze_result(candidate, crib)
+            candidate.score = self._decoder._calculate_score(candidate, crib)
+
+            if candidate.score < best_score:
+                best_score = candidate.score
+                best_result = candidate
+
+        return best_result
+
+
+class MultiLayerDecoder:
+    """向后兼容的包装器，内部委托给 MagicDecoder"""
+    def __init__(self):
+        self._magic = MagicDecoder()
+
+    def decode_http_payload(self, payload: str, crib: str = None) -> DecodingResult:
+        return self._magic.decode_http_payload(payload, crib=crib)
+
+    def decode_webshell_param(self, param_value: str) -> DecodingResult:
+        return self._magic.decode_webshell_param(param_value)
 
 
 # 快捷函数
 def auto_decode(data: bytes, crib: str = None) -> DecodingResult:
-    return AutoDecoder().decode(data, crib=crib)
+    return MagicDecoder().decode(data, crib=crib)
 
 
 def auto_decode_text(text: str, crib: str = None) -> DecodingResult:
-    return AutoDecoder().decode_text(text, crib=crib)
+    return MagicDecoder().decode_text(text, crib=crib)
 
 
 def find_flags(data: bytes) -> List[str]:
-    result = AutoDecoder().decode(data, crib=r'flag\{[^}]+\}|ctf\{[^}]+\}')
+    result = MagicDecoder().decode(data, crib=r'flag\{[^}]+\}|ctf\{[^}]+\}')
     return result.flags_found

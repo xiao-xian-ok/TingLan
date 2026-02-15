@@ -311,8 +311,6 @@ class AnalysisWorker(QThread):
                 analysis_time=analysis_time
             )
 
-            summary.update_confidence_counts()
-
             self.progress.emit(100, f"分析完成，耗时 {analysis_time:.2f}秒")
             self.finished.emit(summary)
 
@@ -824,14 +822,15 @@ class AnalysisWorker(QThread):
         return results
 
     def _run_auto_decoding(self, detections: List[DetectionResult]) -> List[AutoDecodingResult]:
-        from core.auto_decoder import AutoDecoder, MultiLayerDecoder
+        from core.auto_decoder import MagicDecoder
+        from core.cyberchef_bridge import CyberChefBridge
         from urllib.parse import urlparse, parse_qs, unquote
 
         results: List[AutoDecodingResult] = []
 
         try:
-            decoder = AutoDecoder()
-            multi_decoder = MultiLayerDecoder()
+            bridge = CyberChefBridge()
+            decoder = MagicDecoder(bridge=bridge if bridge.is_available() else None)
 
             total = len(detections)
             for i, detection in enumerate(detections):
@@ -862,15 +861,22 @@ class AnalysisWorker(QThread):
                     if raw_body and len(raw_body) > 10:
                         payloads_to_decode.append(("request_body", str(raw_body)))
 
+                    # 提取 URI query string 参数
+                    uri = detection.raw_result.get('uri', '') or detection.uri or ''
+                    if '?' in uri:
+                        query_string = uri.split('?', 1)[1]
+                        if query_string and len(query_string) > 4:
+                            payloads_to_decode.append(("uri_query", query_string))
+
                 # 解码
                 for source, data in payloads_to_decode:
                     if self._is_cancelled:
                         return results
 
                     try:
-                        decode_result = multi_decoder.decode_http_payload(data[:5000])
+                        decode_result = decoder.decode_http_payload(data[:5000])
 
-                        if decode_result.total_layers > 0 or decode_result.flags_found:
+                        if (decode_result.total_layers > 0 or decode_result.flags_found) and decode_result.is_meaningful:
                             auto_result = AutoDecodingResult(
                                 source=source,
                                 original_data=data[:500],

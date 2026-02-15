@@ -88,28 +88,6 @@ class DetailTable(QWidget):
         self.type_filter.currentIndexChanged.connect(self._onTypeFilterChanged)
         toolbar.addWidget(self.type_filter)
 
-        # 置信度过滤下拉框
-        self.confidence_filter = QComboBox()
-        self.confidence_filter.addItems(["全部置信度", "高置信度", "中置信度", "低置信度"])
-        self.confidence_filter.setStyleSheet("""
-            QComboBox {
-                padding: 6px 10px;
-                border: 1px solid #E0E0E0;
-                border-radius: 4px;
-                background-color: white;
-                min-width: 100px;
-            }
-            QComboBox:focus {
-                border-color: #1976D2;
-            }
-            QComboBox::drop-down {
-                border: none;
-                width: 20px;
-            }
-        """)
-        self.confidence_filter.currentIndexChanged.connect(self._onConfidenceFilterChanged)
-        toolbar.addWidget(self.confidence_filter)
-
         layout.addLayout(toolbar)
 
         # 表格视图
@@ -166,11 +144,6 @@ class DetailTable(QWidget):
         self.count_label.setStyleSheet("color: #666; font-size: 12px;")
         bottom_layout.addWidget(self.count_label)
 
-        # 置信度统计标签
-        self.stats_label = QLabel("")
-        self.stats_label.setStyleSheet("color: #666; font-size: 12px;")
-        bottom_layout.addWidget(self.stats_label)
-
         bottom_layout.addStretch()
 
         layout.addLayout(bottom_layout)
@@ -193,7 +166,6 @@ class DetailTable(QWidget):
         """
         self.source_model.setDetections(detections)
         self._updateCount()
-        self._updateStats(detections)
 
     def showDetection(self, detection: DetectionResult):
         """显示单条检测结果（高亮选中）"""
@@ -216,13 +188,6 @@ class DetailTable(QWidget):
         """从分析摘要显示检测结果"""
         self.setDetections(summary.detections)
 
-        # 更新置信度统计
-        self.stats_label.setText(
-            f"高: {summary.high_confidence_count} | "
-            f"中: {summary.medium_confidence_count} | "
-            f"低: {summary.low_confidence_count}"
-        )
-
     def addDetection(self, detection: DetectionResult):
         """添加单条检测结果"""
         self.source_model.addDetection(detection)
@@ -241,7 +206,6 @@ class DetailTable(QWidget):
         """清空表格"""
         self.source_model.clear()
         self._updateCount()
-        self.stats_label.setText("")
 
     def _onFilterTextChanged(self, text: str):
         """过滤文本变化"""
@@ -270,26 +234,6 @@ class DetailTable(QWidget):
         self.proxy_model.setFilterTypes(type_map.get(index, []))
         self._updateCount()
 
-    def _onConfidenceFilterChanged(self, index: int):
-        """
-        置信度过滤变化
-
-        参数:
-            index: 下拉框选中索引
-                0 - 全部
-                1 - 高置信度
-                2 - 中置信度
-                3 - 低置信度
-        """
-        level_map = {
-            0: [],  # 全部
-            1: ["high"],
-            2: ["medium"],
-            3: ["low"]
-        }
-        self.proxy_model.setFilterLevels(level_map.get(index, []))
-        self._updateCount()
-
     def _onSelectionChanged(self, current, previous):
         """选择变化处理"""
         if current.isValid():
@@ -307,16 +251,3 @@ class DetailTable(QWidget):
         else:
             self.count_label.setText(f"显示 {filtered}/{total} 条记录")
 
-    def _updateStats(self, detections: List[DetectionResult]):
-        """
-        更新置信度统计
-
-        参数:
-            detections: 检测结果列表
-        """
-        high_count = sum(1 for d in detections if d.confidence == "high")
-        medium_count = sum(1 for d in detections if d.confidence == "medium")
-        low_count = sum(1 for d in detections if d.confidence == "low")
-        self.stats_label.setText(
-            f"高: {high_count} | 中: {medium_count} | 低: {low_count}"
-        )

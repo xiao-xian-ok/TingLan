@@ -22,6 +22,7 @@ from gui.widgets.detail_table import DetailTable
 from gui.widgets.payload_viewer import PayloadViewer
 from gui.widgets.status_bar import StatusBar
 from gui.widgets.pie_chart import ProtocolStatsWidget
+from gui.dialogs.analysis_complete_dialog import AnalysisCompleteDialog
 
 try:  # 优先使用流式分析控制器
     from core.stream_worker import StreamAnalysisController as AnalysisController
@@ -1782,11 +1783,6 @@ class MainWindow(QMainWindow):
 
         item = self.file_panel.getFileItem(self._current_file)
         if item:
-            # 显示置信度统计
-            high_count = summary.high_confidence_count
-            medium_count = summary.medium_confidence_count
-            low_count = summary.low_confidence_count
-
             total_detections = len(summary.detections) + len(summary.attack_detections)
             display_note = ""
             if total_detections > UILimits.MAX_DISPLAY_ROWS:
@@ -1794,7 +1790,7 @@ class MainWindow(QMainWindow):
 
             item.setCompleted(
                 True,
-                f"检测到 {total_detections} 个攻击行为{display_note} (高:{high_count} 中:{medium_count} 低:{low_count})"
+                f"检测到 {total_detections} 个攻击行为{display_note}"
             )
 
         self.export_action.setEnabled(True)
@@ -1825,46 +1821,10 @@ class MainWindow(QMainWindow):
         # 自动切换到分析视图
         self.function_bar._onButtonClicked("analysis")
 
-        # 提示框显示置信度统计
-        protocol_findings_text = ""
-        if summary.protocol_findings:
-            flag_count = sum(1 for f in summary.protocol_findings if f.is_flag)
-            protocol_findings_text = (
-                f"\n协议分析发现: {len(summary.protocol_findings)} 条"
-                f"\n  - 疑似FLAG: {flag_count}"
-            )
-
-        decoding_text = ""
-        if summary.decoding_results:
-            flag_count = sum(1 for r in summary.decoding_results if r.flags_found)
-            decoding_text = (
-                f"\n自动解码结果: {len(summary.decoding_results)} 条"
-                f"\n  - 发现FLAG: {flag_count}"
-            )
-
-        recovery_text = ""
-        if summary.recovered_files:
-            recovery_text = f"\n文件还原: {len(summary.recovered_files)} 个"
-
-        extracted_text = ""
-        if summary.extracted_files:
-            extracted_text = f"\n文件提取: {len(summary.extracted_files)} 个"
-
-        total_attacks = len(summary.detections) + len(summary.attack_detections)
-        QMessageBox.information(
-            self, "分析完成",
-            f"分析完成!\n\n"
-            f"总数据包: {summary.total_packets}\n"
-            f"检测到攻击行为: {total_attacks} 条\n"
-            f"  - 高置信度: {summary.high_confidence_count}\n"
-            f"  - 中置信度: {summary.medium_confidence_count}\n"
-            f"  - 低置信度: {summary.low_confidence_count}"
-            f"{protocol_findings_text}"
-            f"{decoding_text}"
-            f"{recovery_text}"
-            f"{extracted_text}\n"
-            f"耗时: {summary.analysis_time:.2f} 秒"
-        )
+        # 自定义弹窗显示分析结果
+        dialog = AnalysisCompleteDialog(summary, parent=self)
+        dialog.exportRequested.connect(self._onExport)
+        dialog.exec()
 
     def _onAnalysisError(self, error_msg: str):
         """分析出错，恢复UI并给出提示"""
