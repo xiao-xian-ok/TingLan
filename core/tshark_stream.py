@@ -190,6 +190,7 @@ class PacketData:
     http_user_agent: str = ""
     http_request_body: bytes = b""
     http_response_code: str = ""
+    http_response_body: bytes = b""
 
     tcp_stream: int = 0
 
@@ -449,9 +450,14 @@ class PacketParser:
                 file_data = PacketParser._get_first(http, "http_http_file_data", "")
                 if file_data:
                     try:
-                        packet.http_request_body = bytes.fromhex(file_data.replace(":", ""))
+                        body_bytes = bytes.fromhex(file_data.replace(":", ""))
                     except:
-                        packet.http_request_body = file_data.encode('utf-8', errors='ignore')
+                        body_bytes = file_data.encode('utf-8', errors='ignore')
+
+                    if packet.http_response_code and not packet.http_method:
+                        packet.http_response_body = body_bytes
+                    else:
+                        packet.http_request_body = body_bytes
 
             return packet
 
@@ -704,7 +710,7 @@ def stream_http_packets(pcap_path, display_filter="http", tshark_path=None, as_p
 
 
 def get_protocol_stats(pcap_path, tshark_path=None):
-    # 跑tshark -z io,phs拿协议统计，返回(protocol_counts, total)
+    # tshark -z io,phs 协议统计，返回 (protocol_counts, total, hierarchy)
     handler = TsharkProcessHandler(tshark_path)
 
     cmd = [
@@ -729,32 +735,79 @@ def get_protocol_stats(pcap_path, tshark_path=None):
 
     protocol_counts = {}
     total = 0
+    hierarchy = []
+    stack = []
 
     for line in result.stdout.split('\n'):
-        line = line.strip()
         if not line or 'frames:' not in line:
             continue
 
-        parts = line.split()
-        if len(parts) >= 2:
-            protocol_chain = parts[0]
-            for part in parts:
-                if part.startswith('frames:'):
+        stripped = line.lstrip()
+        if not stripped:
+            continue
+
+        indent = len(line) - len(stripped)
+
+        # 协议名可含空格，按 frames: 定位切分
+        frames_pos = stripped.find('frames:')
+        if frames_pos < 0:
+            continue
+
+        proto_name = stripped[:frames_pos].strip()
+        if not proto_name:
+            continue
+
+        count = 0
+        for part in stripped[frames_pos:].split():
+            if part.startswith('frames:'):
+                try:
                     count = int(part.replace('frames:', ''))
-                    protocols = protocol_chain.split(':')
-                    top_protocol = protocols[-1].upper() if protocols else "UNKNOWN"
+                except ValueError:
+                    pass
+                break
 
-                    if total == 0 and top_protocol in ("FRAME", "ETH"):
-                        total = count
+        upper_name = proto_name.upper()
 
-                    if top_protocol not in ("FRAME", "ETH", "DATA"):
-                        protocol_counts[top_protocol] = count
-                    break
+        if total == 0 and upper_name in ("FRAME", "ETH"):
+            total = count
+
+        if upper_name in ("FRAME", "ETH"):
+            stack = [(indent, None)]
+            continue
+
+        # DATA 跳过，不重置栈
+        if upper_name == "DATA":
+            continue
+
+        protocol_counts[upper_name] = count
+
+        node = {"name": upper_name, "count": count, "children": []}
+
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+
+        if stack and stack[-1][1] is not None:
+            stack[-1][1]["children"].append(node)
+        else:
+            hierarchy.append(node)
+
+        stack.append((indent, node))
 
     if total == 0 and protocol_counts:
         total = max(protocol_counts.values())
 
-    return protocol_counts, total
+    return protocol_counts, total, hierarchy
+
+
+def build_hierarchy_stats(nodes, total):
+    """dict hierarchy → ProtocolStats 层级列表"""
+    from models.detection_result import ProtocolStats
+    result = []
+    for node in sorted(nodes, key=lambda n: -n["count"]):
+        pct = (node["count"] / total * 100) if total > 0 else 0
+        children = build_hierarchy_stats(node["children"], total) if node["children"] else []
+        result.append(ProtocolStats(node["name"], node["count"], pct, children))
+    return result
 
 
 if __name__ == "__main__":
@@ -771,7 +824,7 @@ if __name__ == "__main__":
     print(f"\n=== 流式分析 {pcap_file} ===\n")
 
     print("协议统计:")
-    stats, total = get_protocol_stats(pcap_file)
+    stats, total, hierarchy = get_protocol_stats(pcap_file)
     print(f"  总包数: {total}")
     for proto, count in sorted(stats.items(), key=lambda x: -x[1])[:10]:
         print(f"  {proto}: {count}")

@@ -34,7 +34,7 @@ from controllers.export_controller import ExportController
 
 from models.detection_result import (
     AnalysisSummary, DetectionResult, ExtractedFile, ProtocolFinding,
-    AutoDecodingResult, FileRecoveryResult, AttackDetectionInfo
+    AutoDecodingResult, FileRecoveryResult, AttackDetectionInfo, RTPStreamInfo
 )
 from models.tree_model import TreeNode
 
@@ -302,6 +302,8 @@ class KeyManagementPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._custom_keys: Dict[str, str] = {}
+        self._current_pcap: str = ""
+        self._cs_sessions: list = []
         self._loadKeys()
         self._setupUI()
 
@@ -310,16 +312,17 @@ class KeyManagementPanel(QWidget):
         layout.setContentsMargins(20, 15, 20, 15)
         layout.setSpacing(12)
 
-        # 标题
         title = QLabel("🔑 密钥管理与解密")
         title.setStyleSheet("font-size: 18px; font-weight: bold; color: #1976D2;")
         layout.addWidget(title)
 
-        # 密钥类型选择行
         type_layout = QHBoxLayout()
         type_layout.addWidget(QLabel("密钥类型:"))
         self.key_type_combo = QComboBox()
-        self.key_type_combo.addItems(["冰蝎 (Behinder)", "哥斯拉 (Godzilla)", "AES 通用"])
+        self.key_type_combo.addItems([
+            "冰蝎 (Behinder)", "哥斯拉 (Godzilla)",
+            "AES 通用", "CobaltStrike"
+        ])
         self.key_type_combo.setStyleSheet("""
             QComboBox {
                 padding: 8px 12px;
@@ -331,7 +334,6 @@ class KeyManagementPanel(QWidget):
         self.key_type_combo.currentIndexChanged.connect(self._onKeyTypeChanged)
         type_layout.addWidget(self.key_type_combo)
 
-        # 使用默认密钥按钮
         self.default_btn = QPushButton("使用默认密钥")
         self.default_btn.setStyleSheet("""
             QPushButton {
@@ -348,7 +350,6 @@ class KeyManagementPanel(QWidget):
         type_layout.addStretch()
         layout.addLayout(type_layout)
 
-        # 提示信息
         self.info_label = QLabel("冰蝎默认密钥: e45e329feb5d925b (rebeyond)\n支持格式: 16字节HEX或明文密码")
         self.info_label.setStyleSheet("""
             color: #666; padding: 8px;
@@ -359,7 +360,24 @@ class KeyManagementPanel(QWidget):
         self.info_label.setWordWrap(True)
         layout.addWidget(self.info_label)
 
-        # 密钥输入区
+        self.mode_stack = QStackedWidget()
+
+        # AES 模式面板 (index 0)
+        self.aes_panel = self._buildAesPanel()
+        self.mode_stack.addWidget(self.aes_panel)
+
+        # CS 模式面板 (index 1)
+        self.cs_panel = self._buildCsPanel()
+        self.mode_stack.addWidget(self.cs_panel)
+
+        layout.addWidget(self.mode_stack, stretch=1)
+
+    def _buildAesPanel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
         key_frame = QFrame()
         key_frame.setStyleSheet("QFrame { background-color: #FAFAFA; border-radius: 8px; }")
         key_layout = QVBoxLayout(key_frame)
@@ -387,7 +405,6 @@ class KeyManagementPanel(QWidget):
         key_layout.addWidget(self.key_input)
         layout.addWidget(key_frame)
 
-        # 密文输入区 - 占用更多空间
         cipher_label = QLabel("密文 (Ciphertext):")
         layout.addWidget(cipher_label)
 
@@ -401,9 +418,8 @@ class KeyManagementPanel(QWidget):
             font-size: 13px;
         """)
         self.cipher_input.setMinimumHeight(200)
-        layout.addWidget(self.cipher_input, stretch=1)  # 让密文区域占用剩余空间
+        layout.addWidget(self.cipher_input, stretch=1)
 
-        # 按钮行
         btn_layout = QHBoxLayout()
         decrypt_btn = QPushButton("🔓 解密")
         decrypt_btn.setStyleSheet("""
@@ -451,21 +467,214 @@ class KeyManagementPanel(QWidget):
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
 
+        return panel
+
+    def _buildCsPanel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        # 密钥文件选择
+        key_frame = QFrame()
+        key_frame.setStyleSheet("QFrame { background-color: #FAFAFA; border-radius: 8px; }")
+        kf_layout = QVBoxLayout(key_frame)
+        kf_layout.setContentsMargins(12, 10, 12, 10)
+
+        kf_row = QHBoxLayout()
+        kf_row.addWidget(QLabel("Beacon 密钥文件:"))
+        self.cs_key_path_input = QLineEdit()
+        self.cs_key_path_input.setPlaceholderText(".cobaltstrike.beacon_keys 文件路径...")
+        self.cs_key_path_input.setStyleSheet("padding: 6px; border: 1px solid #E0E0E0; border-radius: 4px;")
+        kf_row.addWidget(self.cs_key_path_input, stretch=1)
+
+        browse_btn = QPushButton("浏览...")
+        browse_btn.setStyleSheet("background-color: #1976D2; color: white; padding: 6px 12px; border-radius: 4px;")
+        browse_btn.clicked.connect(self._browseCsKeyFile)
+        kf_row.addWidget(browse_btn)
+        kf_layout.addLayout(kf_row)
+
+        # PCAP 路径提示
+        self.cs_pcap_label = QLabel("PCAP: 未选择")
+        self.cs_pcap_label.setStyleSheet("color: #999; font-size: 11px;")
+        kf_layout.addWidget(self.cs_pcap_label)
+
+        layout.addWidget(key_frame)
+
+        # 一键分析按钮
+        cs_analyze_btn = QPushButton("🔍 分析 CobaltStrike 通信")
+        cs_analyze_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #D32F2F;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 14px 40px;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover { background-color: #C62828; }
+        """)
+        cs_analyze_btn.clicked.connect(self._doCsAnalysis)
+        layout.addWidget(cs_analyze_btn)
+
+        # 流量解密区
+        traffic_label = QLabel("流量数据解密（可选）:")
+        layout.addWidget(traffic_label)
+
+        self.cs_traffic_input = QPlainTextEdit()
+        self.cs_traffic_input.setPlaceholderText("输入 CS 传输数据的 Hex 值进行解密...\n\n需先完成上方的 Beacon 分析以获取 AES/HMAC Key")
+        self.cs_traffic_input.setStyleSheet("""
+            background-color: white;
+            border: 1px solid #E0E0E0;
+            border-radius: 4px;
+            font-family: Consolas, Monaco, monospace;
+            font-size: 13px;
+        """)
+        layout.addWidget(self.cs_traffic_input, stretch=1)
+
+        traffic_btn_layout = QHBoxLayout()
+        traffic_decrypt_btn = QPushButton("🔓 解密流量")
+        traffic_decrypt_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #1976D2;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 12px 30px;
+                font-size: 13px;
+            }
+            QPushButton:hover { background-color: #1565C0; }
+        """)
+        traffic_decrypt_btn.clicked.connect(self._doCsTrafficDecrypt)
+        traffic_btn_layout.addWidget(traffic_decrypt_btn)
+        traffic_btn_layout.addStretch()
+        layout.addLayout(traffic_btn_layout)
+
+        return panel
+
     def _onKeyTypeChanged(self, index: int):
-        infos = [
-            "冰蝎默认密钥: e45e329feb5d925b (rebeyond)\n支持格式: 16字节HEX或明文密码",
-            "哥斯拉默认密钥: 3c6e0b8a9c15224a (key)\n支持格式: 16字节HEX或明文密码",
-            "输入AES密钥 (16/24/32字节)\n支持AES-128/192/256"
-        ]
-        self.info_label.setText(infos[index])
-        key_types = ["behinder", "godzilla", "aes"]
-        saved_key = self._custom_keys.get(key_types[index], "")
-        if saved_key:
-            self.key_input.setPlainText(saved_key)
+        is_cs = (index == 3)
+        self.default_btn.setVisible(not is_cs)
+
+        if is_cs:
+            self.info_label.setText(
+                "CobaltStrike Beacon 密钥分析\n"
+                "需要 .cobaltstrike.beacon_keys 密钥文件和含 CS 流量的 PCAP"
+            )
+            self.mode_stack.setCurrentIndex(1)
+        else:
+            infos = [
+                "冰蝎默认密钥: e45e329feb5d925b (rebeyond)\n支持格式: 16字节HEX或明文密码",
+                "哥斯拉默认密钥: 3c6e0b8a9c15224a (key)\n支持格式: 16字节HEX或明文密码",
+                "输入AES密钥 (16/24/32字节)\n支持AES-128/192/256"
+            ]
+            self.info_label.setText(infos[index])
+            self.mode_stack.setCurrentIndex(0)
+
+            key_types = ["behinder", "godzilla", "aes"]
+            saved_key = self._custom_keys.get(key_types[index], "")
+            if saved_key:
+                self.key_input.setPlainText(saved_key)
+
+    def _browseCsKeyFile(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "选择 CobaltStrike 密钥文件", "",
+            "Beacon Keys (*.beacon_keys);;所有文件 (*.*)"
+        )
+        if file_path:
+            self.cs_key_path_input.setText(file_path)
+
+    def _doCsAnalysis(self):
+        key_path = self.cs_key_path_input.text().strip()
+        if not key_path:
+            self.resultReady.emit("错误", "请选择 .cobaltstrike.beacon_keys 密钥文件")
+            return
+
+        if not self._current_pcap:
+            self.resultReady.emit("错误", "请先在文件面板中导入并选择 PCAP 文件")
+            return
+
+        if not os.path.exists(key_path):
+            self.resultReady.emit("错误", f"密钥文件不存在: {key_path}")
+            return
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            from core.CS_analyzer import run_full_analysis, format_metadata
+            result = run_full_analysis(self._current_pcap, key_path)
+
+            if result['error']:
+                self.resultReady.emit("CS 分析失败", result['error'])
+                return
+
+            self._cs_sessions = result['sessions']
+
+            output_lines = [f"发现 {len(result['cookies'])} 个 Cookie\n"]
+
+            for i, session in enumerate(result['sessions']):
+                output_lines.append(f"--- Session #{i + 1} ---")
+                output_lines.append(format_metadata(session))
+                output_lines.append("")
+
+            if result['keys'] and result['keys']['priv_path']:
+                output_lines.append(f"私钥已保存: {result['keys']['priv_path']}")
+
+            self.resultReady.emit(
+                f"CS 分析成功 ({len(result['sessions'])} 会话)",
+                "\n".join(output_lines)
+            )
+
+        except ImportError as e:
+            self.resultReady.emit("依赖缺失", f"CS 分析需要额外依赖:\npip install javaobj-py3 cryptography pycryptodome\n\n{e}")
+        except Exception as e:
+            self.resultReady.emit("CS 分析错误", str(e))
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def _doCsTrafficDecrypt(self):
+        hex_data = self.cs_traffic_input.toPlainText().strip()
+        if not hex_data:
+            self.resultReady.emit("提示", "请输入要解密的 Hex 数据")
+            return
+
+        if not self._cs_sessions:
+            self.resultReady.emit("提示", "请先完成 Beacon 分析以获取会话密钥")
+            return
+
+        try:
+            from core.CS_analyzer import decrypt_traffic
+
+            for i, session in enumerate(self._cs_sessions):
+                result = decrypt_traffic(hex_data, session['aes_key'], session['hmac_key'])
+                if result and result.get('hmac_ok'):
+                    output = (
+                        f"Session #{i + 1} (Beacon {session['bid']}) 匹配\n\n"
+                        f"Counter: {result['counter']}\n"
+                        f"数据长度: {result['data_length']}\n"
+                    )
+                    if 'task_type' in result:
+                        output += f"任务类型: {result['task_type']}\n"
+                    if 'text_content' in result:
+                        output += f"\n内容:\n{result['text_content']}"
+                    self.resultReady.emit("CS 流量解密成功", output)
+                    return
+
+            self.resultReady.emit("CS 流量解密失败", "所有会话密钥均未能匹配（HMAC 校验失败）")
+
+        except Exception as e:
+            self.resultReady.emit("解密错误", str(e))
+
+    def setCurrentPcap(self, pcap_path: str):
+        self._current_pcap = pcap_path
+        name = os.path.basename(pcap_path) if pcap_path else "未选择"
+        self.cs_pcap_label.setText(f"PCAP: {name}")
 
     def _useDefaultKey(self):
         defaults = ["e45e329feb5d925b", "3c6e0b8a9c15224a", ""]
-        self.key_input.setPlainText(defaults[self.key_type_combo.currentIndex()])
+        idx = self.key_type_combo.currentIndex()
+        if idx < len(defaults):
+            self.key_input.setPlainText(defaults[idx])
 
     def _generateKeyFromPassword(self):
         password = self.pass_input.text().strip()
@@ -498,7 +707,6 @@ class KeyManagementPanel(QWidget):
                     self.resultReady.emit("错误", "未安装加密库\n\n请安装 pycryptodome:\npip install pycryptodome")
                     return
 
-            # 处理密钥
             if len(key) == 32:
                 key_bytes = bytes.fromhex(key)
             elif len(key) == 16:
@@ -511,9 +719,9 @@ class KeyManagementPanel(QWidget):
 
             if len(key_bytes) < 16:
                 key_bytes = key_bytes.ljust(16, b'\x00')
-            elif len(key_bytes) > 16 and len(key_bytes) < 24:
+            elif 16 < len(key_bytes) < 24:
                 key_bytes = key_bytes[:16]
-            elif len(key_bytes) > 24 and len(key_bytes) < 32:
+            elif 24 < len(key_bytes) < 32:
                 key_bytes = key_bytes[:24]
             elif len(key_bytes) > 32:
                 key_bytes = key_bytes[:32]
@@ -524,7 +732,7 @@ class KeyManagementPanel(QWidget):
 
             try:
                 result = decrypted.decode('utf-8')
-            except:
+            except Exception:
                 result = decrypted.decode('latin-1')
 
             self.resultReady.emit("解密结果", result)
@@ -537,10 +745,12 @@ class KeyManagementPanel(QWidget):
         if not key:
             return
         key_types = ["behinder", "godzilla", "aes"]
-        key_type = key_types[self.key_type_combo.currentIndex()]
-        self._custom_keys[key_type] = key
-        self._saveKeys()
-        self.resultReady.emit("保存成功", f"密钥已保存: {key_type}")
+        idx = self.key_type_combo.currentIndex()
+        if idx < len(key_types):
+            key_type = key_types[idx]
+            self._custom_keys[key_type] = key
+            self._saveKeys()
+            self.resultReady.emit("保存成功", f"密钥已保存: {key_type}")
 
     def _clearAll(self):
         self.key_input.clear()
@@ -553,7 +763,7 @@ class KeyManagementPanel(QWidget):
         try:
             import json
             self._custom_keys = json.loads(keys_json)
-        except:
+        except Exception:
             self._custom_keys = {}
 
     def _saveKeys(self):
@@ -1205,7 +1415,7 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("TingLan 听澜 - 流量分析工具")
-        self.setMinimumSize(1200, 800)
+        self.setMinimumSize(800, 500)
 
         # 控制器（优先使用流式控制器）
         if USE_STREAM_CONTROLLER:
@@ -1567,6 +1777,7 @@ class MainWindow(QMainWindow):
                 ("协议分类", len(summary.protocol_stats)),
                 ("协议分析", len(summary.protocol_findings)),
                 ("自动解码", len(summary.decoding_results)),
+                ("音视频流", len(summary.rtp_streams)),
                 ("文件还原", len(summary.recovered_files)),
                 ("文件提取", len(summary.extracted_files)),
             ]
@@ -1602,8 +1813,8 @@ class MainWindow(QMainWindow):
         """文件被选中，更新饼图"""
         logger.debug(f"_onFileSelected: {file_path}")
 
-        # 更新当前文件
         self._current_file = file_path
+        self.keys_panel.setCurrentPcap(file_path)
 
         # 获取该文件的分析结果
         summary = self._summaries.get(file_path)
@@ -1618,6 +1829,7 @@ class MainWindow(QMainWindow):
                 ("协议分类", len(summary.protocol_stats)),
                 ("协议分析", len(summary.protocol_findings)),
                 ("自动解码", len(summary.decoding_results)),
+                ("音视频流", len(summary.rtp_streams)),
                 ("文件还原", len(summary.recovered_files)),
                 ("文件提取", len(summary.extracted_files)),
             ]
@@ -1671,51 +1883,23 @@ class MainWindow(QMainWindow):
         self.status_bar.setStatus(f"使用 {engine} 引擎分析...")
         self.analysis_controller.startAnalysis(file_path, options)
 
-    def _onAnalysisStarted(self):
-        """分析开始，重置UI状态"""
-        logger.debug("_onAnalysisStarted 被调用")
+    def _onAnalysisStarted(self, file_path: str):
+        """分析开始，初始化该文件的UI状态"""
+        logger.debug(f"_onAnalysisStarted: {file_path}")
 
-        # 重置显示计数器
-        self._display_count = 0
-        self._batch_update_pending = False
-        self._last_progress_percent = 0
-        self._last_progress_time = time.time()
-
-        # 分析期间收集的结果，完成后一次性显示
-        self._pending_detections: List[DetectionResult] = []
-
-        item = self.file_panel.getFileItem(self._current_file)
+        item = self.file_panel.getFileItem(file_path)
         if item:
             item.setAnalyzing(True)
 
-        self.analysis_panel.clear()
-        self.detail_table.clear()
-        self.payload_viewer.clear()
         self.status_bar.showProgress(True)
 
-        logger.debug("_onAnalysisStarted 完成")
+    def _onAnalysisProgress(self, file_path: str, percent: int, message: str):
+        """进度更新"""
+        item = self.file_panel.getFileItem(file_path)
+        if item:
+            item.setProgress(percent, message)
 
-    def _onAnalysisProgress(self, percent: int, message: str):
-        """进度更新，带平滑处理"""
-        logger.debug(f"_onAnalysisProgress: {percent}% - {message}")
-
-        current_time = time.time()
-
-        # 进度平滑：避免进度条跳跃
-        # 只有在进度增加或间隔超过阈值时才更新
-        should_update = (
-            percent >= 100 or
-            percent > self._last_progress_percent or
-            (current_time - self._last_progress_time) * 1000 >= UILimits.PROGRESS_SMOOTH_INTERVAL
-        )
-
-        if should_update:
-            self._last_progress_percent = percent
-            self._last_progress_time = current_time
-
-            item = self.file_panel.getFileItem(self._current_file)
-            if item:
-                item.setProgress(percent, message)
+        if file_path == self._current_file:
             self.status_bar.setProgress(percent, message)
 
     def _onDetectionFound(self, detection: DetectionResult):
@@ -1751,13 +1935,6 @@ class MainWindow(QMainWindow):
         if self._display_count % 20 == 0:
             self.status_bar.setStatus(f"已检测到 {self._display_count} 个攻击行为...")
 
-    def _batch_update_ui(self, detections: List[DetectionResult]):
-        """
-        已废弃 - 分析期间不再调用此方法
-        UI更新在 _onAnalysisFinished 中一次性完成
-        """
-        pass
-
     def _onProtocolFindingFound(self, finding: ProtocolFinding):
         """发现协议分析结果"""
         self.analysis_panel.addProtocolFinding(finding)
@@ -1774,58 +1951,55 @@ class MainWindow(QMainWindow):
         """分析完成，更新所有UI面板"""
         logger.debug(f"_onAnalysisFinished: detections={len(summary.detections)}")
 
-        # 恢复 UI 状态
+        file_path = summary.file_path
+
         self._restore_ui_state()
 
         self._current_summary = summary
-        self._summaries[self._current_file] = summary
+        self._summaries[file_path] = summary
 
-        item = self.file_panel.getFileItem(self._current_file)
+        total_attacks = len(summary.detections) + len(summary.attack_detections)
+
+        item = self.file_panel.getFileItem(file_path)
         if item:
-            # 显示置信度统计
             high_count = summary.high_confidence_count
             medium_count = summary.medium_confidence_count
             low_count = summary.low_confidence_count
 
-            total_detections = len(summary.detections) + len(summary.attack_detections)
             display_note = ""
-            if total_detections > UILimits.MAX_DISPLAY_ROWS:
+            if total_attacks > UILimits.MAX_DISPLAY_ROWS:
                 display_note = f" (显示 {UILimits.MAX_DISPLAY_ROWS})"
 
             item.setCompleted(
                 True,
-                f"检测到 {total_detections} 个攻击行为{display_note} (高:{high_count} 中:{medium_count} 低:{low_count})"
+                f"检测到 {total_attacks} 个攻击行为{display_note} (高:{high_count} 中:{medium_count} 低:{low_count})"
             )
 
         self.export_action.setEnabled(True)
-        self.status_bar.showProgress(False)
+        if not self.analysis_controller.is_running:
+            self.status_bar.showProgress(False)
 
-        # 更新饼图 - 显示三大类汇总
-        total_attacks = len(summary.detections) + len(summary.attack_detections)
         summary_data = [
             ("攻击行为检测", total_attacks),
             ("协议分类", len(summary.protocol_stats)),
             ("协议分析", len(summary.protocol_findings)),
             ("自动解码", len(summary.decoding_results)),
+            ("音视频流", len(summary.rtp_streams)),
             ("文件还原", len(summary.recovered_files)),
             ("文件提取", len(summary.extracted_files)),
         ]
         self.protocol_stats_widget.setData(summary_data)
 
-        # 更新分析面板（标签页管理）
-        self.analysis_panel.addOrUpdateFile(self._current_file, summary)
+        self.analysis_panel.addOrUpdateFile(file_path, summary)
 
         self.detail_table.showFromSummary(summary)
 
-        # 更新状态栏
         self.status_bar.setStatus("分析完成")
         self.status_bar.setPacketCount(summary.total_packets)
         self.status_bar.setThreatCount(total_attacks)
 
-        # 自动切换到分析视图
         self.function_bar._onButtonClicked("analysis")
 
-        # 提示框显示置信度统计
         protocol_findings_text = ""
         if summary.protocol_findings:
             flag_count = sum(1 for f in summary.protocol_findings if f.is_flag)
@@ -1846,13 +2020,21 @@ class MainWindow(QMainWindow):
         if summary.recovered_files:
             recovery_text = f"\n文件还原: {len(summary.recovered_files)} 个"
 
+        rtp_text = ""
+        if summary.rtp_streams:
+            audio_count = sum(1 for s in summary.rtp_streams if s.media_type == "audio")
+            video_count = sum(1 for s in summary.rtp_streams if s.media_type == "video")
+            rtp_text = f"\n音视频流: {len(summary.rtp_streams)} 条"
+            if audio_count:
+                rtp_text += f"\n  - 音频流: {audio_count}"
+            if video_count:
+                rtp_text += f"\n  - 视频流: {video_count}"
+
         extracted_text = ""
         if summary.extracted_files:
             extracted_text = f"\n文件提取: {len(summary.extracted_files)} 个"
 
-        total_attacks = len(summary.detections) + len(summary.attack_detections)
-        QMessageBox.information(
-            self, "分析完成",
+        msg = (
             f"分析完成!\n\n"
             f"总数据包: {summary.total_packets}\n"
             f"检测到攻击行为: {total_attacks} 条\n"
@@ -1862,26 +2044,28 @@ class MainWindow(QMainWindow):
             f"{protocol_findings_text}"
             f"{decoding_text}"
             f"{recovery_text}"
+            f"{rtp_text}"
             f"{extracted_text}\n"
             f"耗时: {summary.analysis_time:.2f} 秒"
         )
+        QTimer.singleShot(0, lambda m=msg: QMessageBox.information(self, "分析完成", m))
 
-    def _onAnalysisError(self, error_msg: str):
-        """分析出错，恢复UI并给出提示"""
-        # 恢复 UI 状态
+    def _onAnalysisError(self, file_path: str, error_msg: str):
+        """分析出错"""
         self._restore_ui_state()
 
-        item = self.file_panel.getFileItem(self._current_file)
+        item = self.file_panel.getFileItem(file_path)
         if item:
             item.setCompleted(False, "分析失败")
 
-        self.status_bar.showProgress(False)
+        if not self.analysis_controller.is_running:
+            self.status_bar.showProgress(False)
         self.status_bar.setStatus("分析失败")
 
         # 分析错误类型，给出详细提示
         detailed_msg = self._format_error_message(error_msg)
 
-        QMessageBox.critical(self, "分析错误", detailed_msg)
+        QTimer.singleShot(0, lambda m=detailed_msg: QMessageBox.critical(self, "分析错误", m))
 
     def _format_error_message(self, error_msg: str) -> str:
         """根据错误类型给出解决方案"""
@@ -1933,16 +2117,16 @@ class MainWindow(QMainWindow):
         # 默认
         return error_msg
 
-    def _onAnalysisCancelled(self):
-        """分析取消，恢复UI"""
-        # 恢复 UI 状态
+    def _onAnalysisCancelled(self, file_path: str):
+        """分析取消"""
         self._restore_ui_state()
 
-        item = self.file_panel.getFileItem(self._current_file)
+        item = self.file_panel.getFileItem(file_path)
         if item:
             item.setCompleted(False, "已取消")
 
-        self.status_bar.showProgress(False)
+        if not self.analysis_controller.is_running:
+            self.status_bar.showProgress(False)
         self.status_bar.setStatus("分析已取消")
 
     def _restore_ui_state(self):
@@ -2028,6 +2212,9 @@ class MainWindow(QMainWindow):
                 self.payload_viewer.showFileRecovery(node.payload)
             elif isinstance(node.payload, AttackDetectionInfo):
                 self.payload_viewer.showAttackDetection(node.payload)
+            elif isinstance(node.payload, RTPStreamInfo):
+                all_streams = self._current_summary.rtp_streams if self._current_summary else []
+                self.payload_viewer.showRTPStream(node.payload, all_streams)
 
     def _onTableItemSelected(self, detection: DetectionResult):
         """表格行选择变化"""

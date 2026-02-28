@@ -204,6 +204,7 @@ class DetectionResult:
 
     # 用于UI显示
     packet_number: int = 0
+    tcp_stream: int = -1
 
     def to_table_row(self) -> List[str]:
         # 特征摘要
@@ -506,18 +507,24 @@ class DetectionResult:
                 timestamp = attack_result.get('timestamp', '')
             if packet_number == 0:
                 packet_number = attack_result.get('frame_number', 0)
+            tcp_stream_val = attack_result.get('tcp_stream', -1)
         else:
             total_weight = getattr(attack_result, 'total_weight', 0)
             confidence = getattr(attack_result, 'confidence', 'none')
+            tcp_stream_val = -1
 
         # 原始请求信息
         raw_request = ''
         raw_headers = ''
         raw_body = ''
+        response_data_val = ''
+        response_sample_val = ''
         if is_dict:
             raw_request = attack_result.get('raw_http_request', '')
             raw_headers = attack_result.get('raw_request_headers', '')
             raw_body = attack_result.get('raw_request_body', '')
+            response_data_val = attack_result.get('response_data', '')
+            response_sample_val = attack_result.get('response_sample', '')
 
         return cls(
             detection_type=detection_type,
@@ -533,6 +540,9 @@ class DetectionResult:
             indicator=indicator_str,
             tags=tags,
             packet_number=packet_number,
+            tcp_stream=tcp_stream_val,
+            response_data=response_data_val if response_data_val else None,
+            response_sample=response_sample_val,
             raw_data=raw_request if raw_request else None,
             raw_result=dict(attack_result) if is_dict else None,
             ast_findings=attack_result.get('ast_findings', []) if is_dict else [],
@@ -546,6 +556,7 @@ class ProtocolStats:
     protocol: str
     count: int
     percentage: float = 0.0
+    children: List['ProtocolStats'] = field(default_factory=list)
 
     @property
     def display_text(self) -> str:
@@ -713,6 +724,45 @@ class FileRecoveryResult:
 
 
 @dataclass
+class RTPStreamInfo:
+    """RTP 音视频流信息"""
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    ssrc: str = ""
+    src_addr: str = ""
+    dst_addr: str = ""
+    payload_type: int = 0
+    codec_name: str = ""
+    media_type: str = ""         # "audio" | "video"
+    sample_rate: int = 0
+    packets: int = 0
+    lost: int = 0
+    max_jitter: float = 0.0
+    duration_sec: float = 0.0
+    pcap_path: str = ""
+
+    @property
+    def display_title(self) -> str:
+        duration = f"{self.duration_sec:.1f}s" if self.duration_sec > 0 else "未知时长"
+        return f"{self.codec_name} ({self.media_type}) - {duration}"
+
+    def to_dict(self) -> Dict:
+        return {
+            'id': self.id,
+            'ssrc': self.ssrc,
+            'src_addr': self.src_addr,
+            'dst_addr': self.dst_addr,
+            'payload_type': self.payload_type,
+            'codec_name': self.codec_name,
+            'media_type': self.media_type,
+            'sample_rate': self.sample_rate,
+            'packets': self.packets,
+            'lost': self.lost,
+            'max_jitter': self.max_jitter,
+            'duration_sec': self.duration_sec,
+        }
+
+
+@dataclass
 class AttackDetectionInfo:
     """攻击检测结果"""
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -833,8 +883,9 @@ class AnalysisSummary:
     extracted_files: List[ExtractedFile] = field(default_factory=list)
     protocol_findings: List[ProtocolFinding] = field(default_factory=list)  # 协议分析发现
     decoding_results: List[AutoDecodingResult] = field(default_factory=list)  # 自动解码结果
-    recovered_files: List[FileRecoveryResult] = field(default_factory=list)  # 文件还原结果
-    attack_detections: List[AttackDetectionInfo] = field(default_factory=list)  # 攻击检测结果
+    recovered_files: List[FileRecoveryResult] = field(default_factory=list)
+    rtp_streams: List[RTPStreamInfo] = field(default_factory=list)
+    attack_detections: List[AttackDetectionInfo] = field(default_factory=list)
     analysis_time: float = 0.0
 
     # 按置信度统计

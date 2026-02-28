@@ -1,6 +1,8 @@
 # payload_viewer.py
 # 数据包详情查看，支持hex/文本/格式化等多种视图
 
+import os
+import sys
 import json
 import base64
 import shutil
@@ -15,14 +17,15 @@ from PySide6.QtWidgets import (
     QTabWidget, QPushButton, QScrollArea, QFrame, QSplitter,
     QStackedWidget, QTreeWidget, QTreeWidgetItem, QButtonGroup,
     QFileDialog, QMessageBox, QMenu, QDialog, QPlainTextEdit,
-    QDialogButtonBox, QComboBox, QGridLayout
+    QDialogButtonBox, QComboBox, QGridLayout, QProgressBar
 )
-from PySide6.QtCore import Qt, QByteArray, Signal, QTimer
+from PySide6.QtCore import Qt, QByteArray, Signal, QTimer, QThread
 from PySide6.QtGui import QFont, QColor, QPixmap, QImage, QAction
 
 from models.detection_result import (
     DetectionResult, ExtractedFile, ProtocolFinding,
-    AutoDecodingResult, FileRecoveryResult, AttackDetectionInfo
+    AutoDecodingResult, FileRecoveryResult, AttackDetectionInfo,
+    RTPStreamInfo
 )
 
 
@@ -39,7 +42,7 @@ def is_binary_data(data: str, threshold: float = 0.3) -> bool:
     return ratio > threshold
 
 
-def format_binary_as_hex(data: str, max_bytes: int = 512) -> str:
+def format_binary_as_hex(data: str, max_bytes: int = 4096) -> str:
     """Wireshark风格hex dump"""
     try:
         # 尝试将字符串编码为字节
@@ -71,7 +74,7 @@ def format_binary_as_hex(data: str, max_bytes: int = 512) -> str:
         return f"[无法格式化二进制数据: {e}]"
 
 
-def safe_display_text(data, max_length: int = 1000) -> str:
+def safe_display_text(data, max_length: int = 50000) -> str:
     """安全显示文本，二进制自动转hex"""
     if data is None:
         return ""
@@ -188,6 +191,8 @@ class WiresharkStyleViewer(QFrame):
             QTreeWidgetItem(frame_item, [f"  总权重: {detection.total_weight}"])
         if hasattr(detection, 'confidence') and detection.confidence:
             QTreeWidgetItem(frame_item, [f"  置信度: {detection.confidence}"])
+        if detection.tcp_stream >= 0:
+            QTreeWidgetItem(frame_item, [f"  TCP Stream: {detection.tcp_stream}"])
 
         # IP层
         if detection.source_ip or detection.dest_ip:
@@ -219,8 +224,8 @@ class WiresharkStyleViewer(QFrame):
                 self._add_dict_items(payload_item, detection.payload)
             else:
                 payload_str = str(detection.payload)
-                for line in payload_str.split('\n')[:20]:
-                    QTreeWidgetItem(payload_item, [f"  {line[:200]}"])
+                for line in payload_str.split('\n')[:100]:
+                    QTreeWidgetItem(payload_item, [f"  {line[:500]}"])
 
         # 解码后的载荷（新格式）
         if hasattr(detection, 'payloads') and detection.payloads:
@@ -229,38 +234,58 @@ class WiresharkStyleViewer(QFrame):
             for payload in detection.payloads:
                 param_item = QTreeWidgetItem(decoded_item, [f"  {payload.param_name} ({payload.payload_type})"])
                 if payload.decoded_content:
-                    content_preview = payload.decoded_content[:150]
-                    if len(payload.decoded_content) > 150:
+                    content_preview = payload.decoded_content[:2000]
+                    if len(payload.decoded_content) > 2000:
                         content_preview += "..."
                     QTreeWidgetItem(param_item, [f"    {content_preview}"])
 
-        # Response层
+        # HTTP Response 结构化展示
         if detection.response_data:
-            resp_item = QTreeWidgetItem(self.tree, ["Response Data"])
+            resp_item = QTreeWidgetItem(self.tree, ["HTTP Response"])
             resp_item.setForeground(0, QColor("#C2185B"))
             resp_str = str(detection.response_data)
+
             if is_binary_data(resp_str):
                 QTreeWidgetItem(resp_item, ["  [Binary Data - Hex Dump]"])
-                hex_dump = format_binary_as_hex(resp_str, max_bytes=256)
-                for line in hex_dump.split('\n')[:20]:
+                hex_dump = format_binary_as_hex(resp_str, max_bytes=2048)
+                for line in hex_dump.split('\n')[:100]:
                     QTreeWidgetItem(resp_item, [f"  {line}"])
             else:
-                for line in resp_str.split('\n')[:15]:
-                    QTreeWidgetItem(resp_item, [f"  {line[:200]}"])
+                resp_lines = resp_str.split('\r\n')
+                if resp_lines:
+                    QTreeWidgetItem(resp_item, [f"  {resp_lines[0]}"])
 
-        # response_sample（新版检测结果）
-        if hasattr(detection, 'response_sample') and detection.response_sample:
+                header_end = 0
+                for i, line in enumerate(resp_lines[1:], 1):
+                    if not line.strip():
+                        header_end = i
+                        break
+                    if i <= 30:
+                        QTreeWidgetItem(resp_item, [f"  {line[:500]}"])
+
+                if header_end > 0 and header_end < len(resp_lines):
+                    body_text = '\r\n'.join(resp_lines[header_end + 1:])
+                    if body_text:
+                        body_item = QTreeWidgetItem(resp_item, ["  Response Body"])
+                        if is_binary_data(body_text):
+                            hex_dump = format_binary_as_hex(body_text, max_bytes=2048)
+                            for hl in hex_dump.split('\n')[:100]:
+                                QTreeWidgetItem(body_item, [f"    {hl}"])
+                        else:
+                            for bl in body_text.split('\n')[:100]:
+                                QTreeWidgetItem(body_item, [f"    {bl[:500]}"])
+
+        elif hasattr(detection, 'response_sample') and detection.response_sample:
             sample_item = QTreeWidgetItem(self.tree, ["Response Sample"])
             sample_item.setForeground(0, QColor("#C2185B"))
             sample_str = str(detection.response_sample)
             if is_binary_data(sample_str):
-                QTreeWidgetItem(sample_item, ["  [Binary Data - Hex Dump]"])
-                hex_dump = format_binary_as_hex(sample_str, max_bytes=256)
-                for line in hex_dump.split('\n')[:20]:
+                hex_dump = format_binary_as_hex(sample_str, max_bytes=2048)
+                for line in hex_dump.split('\n')[:100]:
                     QTreeWidgetItem(sample_item, [f"  {line}"])
             else:
-                for line in sample_str.split('\n')[:15]:
-                    QTreeWidgetItem(sample_item, [f"  {line[:200]}"])
+                for line in sample_str.split('\n')[:100]:
+                    QTreeWidgetItem(sample_item, [f"  {line[:500]}"])
 
         # Raw结果（限制显示，避免大字典导致卡死）
         if detection.raw_result:
@@ -276,8 +301,8 @@ class WiresharkStyleViewer(QFrame):
         # 底部显示原始数据摘要（截断字典后再序列化，避免大字典卡死）
         raw_summary = self._truncate_dict_for_display(detection.raw_result or {})
         raw_text = json.dumps(raw_summary, ensure_ascii=False, indent=2, default=str)
-        if len(raw_text) > 500:
-            raw_text = raw_text[:500] + "\n... (截断)"
+        if len(raw_text) > 2000:
+            raw_text = raw_text[:2000] + "\n... (截断)"
         self.hex_view.setPlainText(raw_text)
 
     def _add_dict_items(self, parent: QTreeWidgetItem, data: dict, depth: int = 0):
@@ -305,31 +330,22 @@ class WiresharkStyleViewer(QFrame):
 
     # 跳过的大块原始数据键名
     _RAW_SKIP_KEYS = {
-        'raw_request_body', 'raw_http_request', 'raw_request_headers',
-        'raw_response_body', 'raw_http_response'
+        'raw_http_request', 'raw_http_response'
     }
 
     def _add_dict_items_safe(self, parent: QTreeWidgetItem, data: dict, depth: int = 0):
-        """
-        安全版递归添加字典项 — 跳过大块原始数据，限制总节点数
-
-        与 _add_dict_items 的区别：
-        - 跳过 raw_request_body 等大块字段（只显示摘要）
-        - 限制总子节点数量不超过 50
-        - 字符串值截断到 150 字符
-        """
+        """安全版递归添加字典项"""
         if depth > 2:
             return
         node_count = 0
-        max_nodes = 50
+        max_nodes = 100
         for key, value in data.items():
             if node_count >= max_nodes:
                 QTreeWidgetItem(parent, [f"  ... 剩余 {len(data) - node_count} 项已省略"])
                 break
-            # 跳过大块原始数据，只显示长度摘要
             if key in self._RAW_SKIP_KEYS:
                 val_len = len(str(value)) if value else 0
-                QTreeWidgetItem(parent, [f"  {key}: [{val_len} chars] (展开查看Burp视图)"])
+                QTreeWidgetItem(parent, [f"  {key}: [{val_len} chars]"])
                 node_count += 1
                 continue
             if isinstance(value, dict):
@@ -339,15 +355,15 @@ class WiresharkStyleViewer(QFrame):
             elif isinstance(value, list):
                 sub_item = QTreeWidgetItem(parent, [f"  {key}: [{len(value)} items]"])
                 for i, v in enumerate(value[:5]):
-                    v_str = str(v)[:150]
+                    v_str = str(v)[:500]
                     QTreeWidgetItem(sub_item, [f"    [{i}]: {v_str}"])
                 if len(value) > 5:
                     QTreeWidgetItem(sub_item, [f"    ... 剩余 {len(value) - 5} 项"])
                 node_count += 1
             else:
                 val_str = str(value)
-                if len(val_str) > 150:
-                    val_str = val_str[:150] + "..."
+                if len(val_str) > 500:
+                    val_str = val_str[:500] + "..."
                 QTreeWidgetItem(parent, [f"  {key}: {val_str}"])
                 node_count += 1
 
@@ -775,10 +791,7 @@ class BurpStyleViewer(QFrame):
             raw_body = detection.raw_result.get('raw_request_body', '')
 
         if raw_body:
-            # 显示完整原始请求体
-            lines.append(raw_body[:2000])
-            if len(raw_body) > 2000:
-                lines.append("... (truncated)")
+            lines.append(raw_body)
         elif detection.payloads:
             # 使用新格式的载荷
             params = []
@@ -800,16 +813,14 @@ class BurpStyleViewer(QFrame):
                 lines.append("&".join(params))
             else:
                 payload_str = str(detection.payload)
-                if len(payload_str) > 2000:
-                    payload_str = payload_str[:2000] + "\n... (截断)"
+                if len(payload_str) > 50000:
+                    payload_str = payload_str[:50000] + "\n... (截断)"
                 lines.append(payload_str)
 
         # 解密内容（冰蝎/哥斯拉）
         if detection.payloads:
             lines.append("")
-            lines.append("# " + "=" * 50)
             lines.append("# Decoded Payloads")
-            lines.append("# " + "=" * 50)
             for payload in detection.payloads:
                 lines.append(f"#")
                 lines.append(f"# [{payload.param_name}]")
@@ -817,37 +828,31 @@ class BurpStyleViewer(QFrame):
                 lines.append(f"#   Method: {payload.decode_method}")
                 if payload.decoded_content:
                     lines.append(f"#   Content:")
-                    for dc_line in payload.decoded_content[:500].split('\n')[:15]:
+                    for dc_line in payload.decoded_content.split('\n'):
                         lines.append(f"#     {dc_line}")
 
         # 响应数据
         if detection.response_data:
             lines.append("")
-            lines.append("=" * 50)
-            lines.append("=== Response ===")
-            lines.append("=" * 50)
+            lines.append("HTTP Response")
             resp_str = str(detection.response_data)
             if is_binary_data(resp_str):
                 lines.append("[Binary Data - Hex Dump]")
-                lines.append(format_binary_as_hex(resp_str, max_bytes=512))
+                lines.append(format_binary_as_hex(resp_str, max_bytes=4096))
             else:
-                if len(resp_str) > 1000:
-                    resp_str = resp_str[:1000] + "\n... (截断)"
+                if len(resp_str) > 50000:
+                    resp_str = resp_str[:50000] + "\n... (截断)"
                 lines.append(resp_str)
-
-        # response_sample（新版检测结果）
-        if hasattr(detection, 'response_sample') and detection.response_sample:
+        elif hasattr(detection, 'response_sample') and detection.response_sample:
             lines.append("")
-            lines.append("=" * 50)
-            lines.append("=== Response Sample ===")
-            lines.append("=" * 50)
+            lines.append("Response Sample")
             sample_str = str(detection.response_sample)
             if is_binary_data(sample_str):
                 lines.append("[Binary Data - Hex Dump]")
-                lines.append(format_binary_as_hex(sample_str, max_bytes=512))
+                lines.append(format_binary_as_hex(sample_str, max_bytes=4096))
             else:
-                if len(sample_str) > 500:
-                    sample_str = sample_str[:500] + "\n... (截断)"
+                if len(sample_str) > 50000:
+                    sample_str = sample_str[:50000] + "\n... (截断)"
                 lines.append(sample_str)
 
         self.text_edit.setPlainText('\n'.join(lines))
@@ -1660,6 +1665,360 @@ class FileRecoveryViewer(QFrame):
         self.title_label.setText("文件还原")
 
 
+class _RTPExportWorker(QThread):
+    """RTP 导出工作线程，支持单条/批量"""
+
+    progress = Signal(int, int, str)
+    done = Signal(int, int, str)
+    error = Signal(str)
+
+    def __init__(self, streams, out_dir, tshark_path):
+        super().__init__()
+        self.streams = streams
+        self.out_dir = out_dir
+        self.tshark_path = tshark_path
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        try:
+            self._do_export()
+        except Exception as e:
+            self.error.emit(str(e))
+
+    def _do_export(self):
+        from core.rtp_analyzer import export_rtp_stream, export_rtp_streams_batch
+        total = len(self.streams)
+
+        if total > 1:
+            self._do_batch_export(export_rtp_streams_batch, total)
+        else:
+            self._do_single_export(export_rtp_stream, total)
+
+    def _do_batch_export(self, batch_fn, total):
+        pcap_path = self.streams[0].pcap_path
+        try:
+            results = batch_fn(
+                pcap_path, self.tshark_path, self.streams, self.out_dir,
+                progress_cb=lambda cur, tot, label: self.progress.emit(cur, tot, label),
+                cancel_check=lambda: self._cancel
+            )
+            self.done.emit(len(results), total, self.out_dir)
+        except Exception as e:
+            self.error.emit(str(e))
+
+    def _do_single_export(self, export_fn, total):
+        exported = 0
+        for i, stream in enumerate(self.streams):
+            if self._cancel:
+                break
+            label = f"rtp_{stream.ssrc}_{stream.codec_name}"
+            self.progress.emit(i + 1, total, label)
+            try:
+                export_fn(
+                    stream.pcap_path, self.tshark_path, stream, self.out_dir
+                )
+                exported += 1
+            except Exception as e:
+                if total == 1:
+                    self.error.emit(str(e))
+                    return
+                logger.debug(f"导出跳过 {label}: {e}")
+
+        self.done.emit(exported, total, self.out_dir)
+
+
+class RTPStreamViewer(QFrame):
+    """RTP 音视频流查看器"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._current_stream: Optional[RTPStreamInfo] = None
+        self._all_streams: list = []
+        self._worker: Optional[_RTPExportWorker] = None
+        self._setupUI()
+
+    def _setupUI(self):
+        self.setStyleSheet("""
+            RTPStreamViewer {
+                background-color: white;
+                border: 1px solid #E0E0E0;
+                border-radius: 4px;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        title_bar = QWidget()
+        title_bar.setStyleSheet("background-color: #E3F2FD; border-bottom: 1px solid #90CAF9;")
+        title_layout = QHBoxLayout(title_bar)
+        title_layout.setContentsMargins(10, 5, 10, 5)
+        self.title_label = QLabel("音视频流")
+        self.title_label.setStyleSheet("font-size: 12px; font-weight: bold; color: #1565C0;")
+        title_layout.addWidget(self.title_label)
+        title_layout.addStretch()
+        layout.addWidget(title_bar)
+
+        self.tree = QTreeWidget()
+        self.tree.setHeaderHidden(True)
+        self.tree.setIndentation(20)
+        self.tree.setAnimated(False)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setStyleSheet("""
+            QTreeWidget {
+                border: none;
+                background-color: #FAFAFA;
+                font-family: "Consolas", "Courier New", monospace;
+                font-size: 11px;
+            }
+            QTreeWidget::item { padding: 3px 0; }
+            QTreeWidget::item:hover { background-color: #E3F2FD; }
+            QTreeWidget::item:selected { background-color: #90CAF9; color: #0D47A1; }
+        """)
+        layout.addWidget(self.tree, 1)
+
+        bottom = QFrame()
+        bottom.setStyleSheet("QFrame { border-top: 1px solid #E0E0E0; }")
+        bottom_layout = QVBoxLayout(bottom)
+        bottom_layout.setContentsMargins(10, 8, 10, 8)
+        bottom_layout.setSpacing(6)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+
+        self.export_btn = QPushButton("导出当前流")
+        self.export_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #1976D2; color: white; border: none;
+                border-radius: 4px; padding: 8px 16px; font-size: 12px; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #1565C0; }
+            QPushButton:pressed { background-color: #0D47A1; }
+            QPushButton:disabled { background-color: #BDBDBD; }
+        """)
+        self.export_btn.clicked.connect(self._onExportSingle)
+        btn_row.addWidget(self.export_btn)
+
+        self.batch_btn = QPushButton("导出全部")
+        self.batch_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #388E3C; color: white; border: none;
+                border-radius: 4px; padding: 8px 16px; font-size: 12px; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #2E7D32; }
+            QPushButton:pressed { background-color: #1B5E20; }
+            QPushButton:disabled { background-color: #BDBDBD; }
+        """)
+        self.batch_btn.clicked.connect(self._onExportBatch)
+        btn_row.addWidget(self.batch_btn)
+
+        self.cancel_btn = QPushButton("取消")
+        self.cancel_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #D32F2F; color: white; border: none;
+                border-radius: 4px; padding: 8px 16px; font-size: 12px; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #C62828; }
+        """)
+        self.cancel_btn.clicked.connect(self._onCancel)
+        self.cancel_btn.hide()
+        btn_row.addWidget(self.cancel_btn)
+
+        btn_row.addStretch()
+        bottom_layout.addLayout(btn_row)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setFixedHeight(20)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("")
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #E0E0E0; border-radius: 4px;
+                background-color: #F5F5F5;
+                text-align: center; font-size: 11px; color: #333;
+            }
+            QProgressBar::chunk {
+                background-color: #42A5F5; border-radius: 3px;
+            }
+        """)
+        bottom_layout.addWidget(self.progress_bar)
+
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: #666; font-size: 11px;")
+        self.status_label.setWordWrap(True)
+        bottom_layout.addWidget(self.status_label)
+
+        layout.addWidget(bottom)
+
+    def setContent(self, stream: RTPStreamInfo, all_streams: list = None):
+        self.tree.setUpdatesEnabled(False)
+        try:
+            self._buildContent(stream)
+        finally:
+            self.tree.setUpdatesEnabled(True)
+        self._current_stream = stream
+        if all_streams is not None:
+            self._all_streams = all_streams
+        total = len(self._all_streams)
+        self.batch_btn.setText(f"导出全部 ({total})" if total > 1 else "导出全部")
+        self.batch_btn.setVisible(total > 1)
+
+    def _buildContent(self, stream: RTPStreamInfo):
+        self.tree.clear()
+        self.status_label.clear()
+
+        media_icon = "Audio" if stream.media_type == "audio" else "Video"
+        self.title_label.setText(f"RTP {media_icon} Stream - {stream.codec_name}")
+
+        info_item = QTreeWidgetItem(self.tree, [f"Stream: {stream.codec_name}"])
+        info_item.setForeground(0, QColor("#1565C0"))
+        QTreeWidgetItem(info_item, [f"  SSRC: {stream.ssrc}"])
+        QTreeWidgetItem(info_item, [f"  媒体类型: {stream.media_type}"])
+        QTreeWidgetItem(info_item, [f"  采样率: {stream.sample_rate} Hz"])
+
+        addr_item = QTreeWidgetItem(self.tree, ["Address"])
+        addr_item.setForeground(0, QColor("#E65100"))
+        QTreeWidgetItem(addr_item, [f"  源: {stream.src_addr}"])
+        QTreeWidgetItem(addr_item, [f"  目的: {stream.dst_addr}"])
+
+        stat_item = QTreeWidgetItem(self.tree, ["Statistics"])
+        stat_item.setForeground(0, QColor("#2E7D32"))
+        QTreeWidgetItem(stat_item, [f"  数据包: {stream.packets}"])
+        QTreeWidgetItem(stat_item, [f"  丢包: {stream.lost}"])
+        if stream.packets > 0:
+            loss_pct = stream.lost / stream.packets * 100
+            QTreeWidgetItem(stat_item, [f"  丢包率: {loss_pct:.1f}%"])
+        QTreeWidgetItem(stat_item, [f"  最大抖动: {stream.max_jitter:.2f} ms"])
+        if stream.duration_sec > 0:
+            QTreeWidgetItem(stat_item, [f"  估计时长: {stream.duration_sec:.1f}s"])
+
+        import shutil as _shutil
+        tools = []
+        if _shutil.which("sox"):
+            tools.append("sox")
+        if _shutil.which("ffmpeg"):
+            tools.append("ffmpeg")
+        tool_text = ", ".join(tools) if tools else "未检测到（将保存为 raw）"
+
+        tool_item = QTreeWidgetItem(self.tree, ["Export"])
+        tool_item.setForeground(0, QColor("#6A1B9A"))
+        QTreeWidgetItem(tool_item, [f"  可用工具: {tool_text}"])
+
+        for i in range(self.tree.topLevelItemCount()):
+            self.tree.topLevelItem(i).setExpanded(True)
+
+    def _get_output_dir(self) -> str:
+        import pathlib
+        return str(pathlib.Path(__file__).resolve().parent.parent.parent / "output" / "rtp")
+
+    def _find_tshark(self) -> str:
+        tshark = shutil.which("tshark")
+        if tshark:
+            return tshark
+        if sys.platform == "win32":
+            for p in [
+                r"E:\cyber_safe\wireshark\tshark.exe",
+                r"C:\Program Files\Wireshark\tshark.exe",
+                r"C:\Program Files (x86)\Wireshark\tshark.exe",
+                r"D:\Program Files\Wireshark\tshark.exe",
+                os.path.join(os.environ.get("ProgramFiles", ""), "Wireshark", "tshark.exe"),
+            ]:
+                if p and os.path.exists(p):
+                    return p
+        else:
+            for p in ["/usr/bin/tshark", "/usr/local/bin/tshark"]:
+                if os.path.exists(p):
+                    return p
+        raise FileNotFoundError("未找到 tshark，请安装 Wireshark")
+
+    def _start_export(self, streams: list):
+        try:
+            out_dir = self._get_output_dir()
+            tshark = self._find_tshark()
+        except Exception as e:
+            self.status_label.setText(f"导出失败: {e}")
+            self.status_label.setStyleSheet("color: #D32F2F; font-size: 11px;")
+            return
+
+        self._worker = _RTPExportWorker(streams, out_dir, tshark)
+        self._worker.progress.connect(self._onProgress)
+        self._worker.done.connect(self._onDone)
+        self._worker.error.connect(self._onError)
+
+        total = len(streams)
+        self.progress_bar.setRange(0, total)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat(f"0 / {total}")
+
+        self.export_btn.setEnabled(False)
+        self.batch_btn.setEnabled(False)
+        self.cancel_btn.show()
+        self.status_label.setText(f"准备导出到 {out_dir}")
+        self.status_label.setStyleSheet("color: #666; font-size: 11px;")
+
+        self._worker.start()
+
+    def _onExportSingle(self):
+        if not self._current_stream:
+            return
+        self._start_export([self._current_stream])
+
+    def _onExportBatch(self):
+        if not self._all_streams:
+            return
+        self._start_export(self._all_streams)
+
+    def _onCancel(self):
+        if self._worker:
+            self._worker.cancel()
+            self.status_label.setText("正在取消...")
+
+    def _onProgress(self, current: int, total: int, label: str):
+        self.progress_bar.setValue(current)
+        self.progress_bar.setFormat(f"{current} / {total}")
+        if label:
+            self.status_label.setText(f"正在导出 ({current}/{total}): {label}")
+
+    def _onDone(self, exported: int, total: int, out_dir: str):
+        self._reset_ui()
+        self.progress_bar.setValue(self.progress_bar.maximum())
+        self.progress_bar.setFormat(f"{exported} / {total} 完成")
+        if exported == total:
+            self.status_label.setText(f"导出完成: {exported} 个文件 → {out_dir}")
+            self.status_label.setStyleSheet("color: #2E7D32; font-size: 11px;")
+        else:
+            failed = total - exported
+            self.status_label.setText(f"导出完成: {exported} 成功, {failed} 失败 → {out_dir}")
+            self.status_label.setStyleSheet("color: #E65100; font-size: 11px;")
+
+    def _onError(self, err: str):
+        self._reset_ui()
+        self.status_label.setText(f"导出失败: {err}")
+        self.status_label.setStyleSheet("color: #D32F2F; font-size: 11px;")
+
+    def _reset_ui(self):
+        self.export_btn.setEnabled(True)
+        self.batch_btn.setEnabled(True)
+        self.cancel_btn.hide()
+        self._worker = None
+
+    def clear(self):
+        self.tree.clear()
+        self.status_label.clear()
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("")
+        self.cancel_btn.hide()
+        self.title_label.setText("音视频流")
+        self._current_stream = None
+        self._all_streams = []
+
+
 class ScoreBreakdownPanel(QFrame):
     """得分拆解面板，展示各检测维度的得分"""
 
@@ -2042,6 +2401,7 @@ class PayloadViewer(QWidget):
         self._current_decoding_result: Optional[AutoDecodingResult] = None
         self._current_file_recovery: Optional[FileRecoveryResult] = None
         self._current_attack_detection: Optional[AttackDetectionInfo] = None
+        self._current_rtp_stream: Optional[RTPStreamInfo] = None
 
         # 得分拆解缓存
         self._score_cache: dict = {}
@@ -2262,6 +2622,10 @@ class PayloadViewer(QWidget):
         # 视图8: 攻击检测结果查看器
         self.attack_detection_viewer = AttackDetectionViewer()
         self.stack.addWidget(self.attack_detection_viewer)
+
+        # 视图9: RTP 音视频流查看器
+        self.rtp_stream_viewer = RTPStreamViewer()
+        self.stack.addWidget(self.rtp_stream_viewer)
 
         # 默认显示空状态
         self.stack.setCurrentIndex(3)
@@ -2494,7 +2858,26 @@ class PayloadViewer(QWidget):
 
         # 设置内容到 AttackDetectionViewer
         self.attack_detection_viewer.setContent(attack)
-        self.stack.setCurrentIndex(8)  # 切换到 AttackDetectionViewer
+        self.stack.setCurrentIndex(8)
+
+    def showRTPStream(self, stream: RTPStreamInfo, all_streams: list = None):
+        """显示 RTP 音视频流信息"""
+        self._current_rtp_stream = stream
+        self._current_detection = None
+        self._current_extracted_file = None
+        self._current_protocol_finding = None
+        self._current_decoding_result = None
+        self._current_file_recovery = None
+        self._current_attack_detection = None
+
+        media_label = "音频" if stream.media_type == "audio" else "视频"
+        self.title_label.setText(f"RTP {media_label}流 - {stream.codec_name}")
+        self.view_btn_group.hide()
+        self.export_btn.hide()
+        self.score_breakdown_panel.hide()
+
+        self.rtp_stream_viewer.setContent(stream, all_streams)
+        self.stack.setCurrentIndex(9)
 
     def _exportFile(self):
         """导出提取的文件"""
@@ -2532,6 +2915,7 @@ class PayloadViewer(QWidget):
         self._current_decoding_result = None
         self._current_file_recovery = None
         self._current_attack_detection = None
+        self._current_rtp_stream = None
         self.title_label.setText("载荷详情")
         self.view_btn_group.hide()
         self.export_btn.hide()
@@ -2546,6 +2930,7 @@ class PayloadViewer(QWidget):
         self.decoding_result_viewer.clear()
         self.file_recovery_viewer.clear()
         self.attack_detection_viewer.clear()
+        self.rtp_stream_viewer.clear()
         self.stack.setCurrentIndex(3)
 
 

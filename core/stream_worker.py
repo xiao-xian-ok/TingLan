@@ -30,7 +30,8 @@ from core.tshark_stream import (
     TsharkNotFoundError,
     TsharkProcessError,
     TsharkPermissionError,
-    get_protocol_stats
+    get_protocol_stats,
+    build_hierarchy_stats
 )
 
 from models.detection_result import (
@@ -42,7 +43,8 @@ from models.detection_result import (
     ExtractedFile,
     ProtocolFinding,
     AutoDecodingResult,
-    FileRecoveryResult
+    FileRecoveryResult,
+    RTPStreamInfo
 )
 
 logger = logging.getLogger(__name__)
@@ -163,7 +165,7 @@ class StreamAnalysisWorker(QThread):
     protocolFindingFound = Signal(object)
     decodingResultFound = Signal(object)
     fileRecovered = Signal(object)
-    finished = Signal(object)                  # AnalysisSummary
+    analysisComplete = Signal(object)           # AnalysisSummary
     error = Signal(str)
     cancelled = Signal()
 
@@ -265,7 +267,7 @@ class StreamAnalysisWorker(QThread):
                 self.cancelled.emit()
                 return
 
-            self.finished.emit(summary)
+            self.analysisComplete.emit(summary)
 
         except TsharkNotFoundError as e:
             self.error.emit(f"未找到 TShark！\n{str(e)}")
@@ -316,56 +318,78 @@ class StreamAnalysisWorker(QThread):
         decoding_results: List[AutoDecodingResult] = []
         recovered_files: List[FileRecoveryResult] = []
         extracted_files: List[ExtractedFile] = []
+        rtp_streams: List[RTPStreamInfo] = []
 
-        # 协议统计
-        self._emit_progress(5, "【阶段1/6】协议分级统计...")
-        protocol_counts, total_packets = self._run_protocol_stats()
+        self._emit_progress(5, "协议分级统计...")
+        protocol_counts, total_packets, protocol_hierarchy = self._run_protocol_stats()
 
         if self._is_cancelled:
-            return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets)
+            return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets, rtp_streams)
 
-        # HTTP流式分析
-        self._emit_progress(15, "【阶段2/6】HTTP 流式分析...")
+        self._emit_progress(15, "HTTP 流式分析...")
         http_results = self._run_http_stream_analysis(total_packets)
         results.extend(http_results)
 
         if self._is_cancelled:
-            return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets)
+            return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets, rtp_streams)
 
-        # ICMP隐写检测
-        self._emit_progress(45, "【阶段3/6】ICMP 隐写检测...")
+        if results:
+            self._emit_progress(38, f"获取攻击响应包... ({len(results)} 条)")
+            results = self._fetch_http_responses(results)
+
+        if self._is_cancelled:
+            return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets, rtp_streams)
+
+        self._emit_progress(45, "ICMP 隐写检测...")
         icmp_findings = self._run_icmp_analysis()
         protocol_findings.extend(icmp_findings)
 
         if self._is_cancelled:
-            return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets)
+            return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets, rtp_streams)
 
-        # HTTP对象提取
-        self._emit_progress(60, "【阶段4/6】HTTP 对象提取...")
+        self._emit_progress(56, "DNS 隧道分析...")
+        dns_findings = self._run_dns_analysis()
+        protocol_findings.extend(dns_findings)
+
+        if self._is_cancelled:
+            return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets, rtp_streams)
+
+        self._emit_progress(59, "CS 通信检测...")
+        cs_findings = self._run_cs_detection()
+        protocol_findings.extend(cs_findings)
+
+        if self._is_cancelled:
+            return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets, rtp_streams)
+
+        self._emit_progress(61, "RTP 音视频流检测...")
+        rtp_streams = self._run_rtp_analysis()
+
+        if self._is_cancelled:
+            return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets, rtp_streams)
+
+        self._emit_progress(64, "HTTP 对象提取...")
         extracted_files = self._export_http_objects()
 
         if self._is_cancelled:
-            return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets)
+            return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets, rtp_streams)
 
-        # 自动解码
         if self.options.auto_decode:
-            self._emit_progress(75, f"【阶段5/6】自动解码 ({len(results)} 条结果)...")
+            self._emit_progress(75, f"自动解码 ({len(results)} 条结果)...")
             decoding_results = self._run_auto_decoding(results)
 
         if self._is_cancelled:
-            return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets)
+            return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets, rtp_streams)
 
-        # 文件还原
         if self.options.file_recovery:
-            self._emit_progress(88, f"【阶段6/6】文件还原 ({len(extracted_files)} 个文件)...")
+            self._emit_progress(88, f"文件还原 ({len(extracted_files)} 个文件)...")
             recovered_files = self._run_file_recovery(extracted_files)
 
         self._emit_progress(95, "生成分析报告...")
-        protocol_stats = self._build_protocol_stats(protocol_counts, total_packets)
+        protocol_stats = self._build_protocol_stats(protocol_counts, total_packets, protocol_hierarchy)
 
         return self._build_summary(
             results, protocol_stats, protocol_findings,
-            decoding_results, recovered_files, extracted_files, total_packets
+            decoding_results, recovered_files, extracted_files, total_packets, rtp_streams
         )
 
     def _run_protocol_stats(self) -> tuple:
@@ -373,7 +397,7 @@ class StreamAnalysisWorker(QThread):
             return get_protocol_stats(self.pcap_path, self.tshark_path)
         except Exception as e:
             logger.warning(f"协议统计失败: {e}")
-            return {}, 0
+            return {}, 0, []
 
     def _run_http_stream_analysis(self, total_packets: int) -> List[DetectionResult]:
         """HTTP流式分析，带信号节流和结果上限"""
@@ -490,11 +514,12 @@ class StreamAnalysisWorker(QThread):
                     raw_body_str = repr(body)[:1000]
 
                 detection['raw_request_headers'] = raw_headers
-                detection['raw_request_body'] = raw_body_str[:5000]
-                detection['raw_http_request'] = (raw_headers + raw_body_str)[:10000]
+                detection['raw_request_body'] = raw_body_str[:50000]
+                detection['raw_http_request'] = (raw_headers + raw_body_str)[:100000]
                 detection['frame_number'] = packet.frame_number
                 detection['src_ip'] = packet.src_ip
                 detection['dst_ip'] = packet.dst_ip
+                detection['tcp_stream'] = packet.tcp_stream
 
                 return DetectionResult.from_attack_result(detection)
 
@@ -502,6 +527,114 @@ class StreamAnalysisWorker(QThread):
             logger.debug(f"检测失败: {e}")
 
         return None
+
+    def _fetch_http_responses(self, results: List[DetectionResult]) -> List[DetectionResult]:
+        """检测完成后，按 tcp_stream 批量抓取对应的 HTTP 响应包"""
+        if not results or not self._handler:
+            return results
+
+        stream_to_indices: Dict[int, List[int]] = {}
+        for idx, det in enumerate(results):
+            tcp_stream = -1
+            if det.raw_result and isinstance(det.raw_result, dict):
+                tcp_stream = det.raw_result.get('tcp_stream', -1)
+            if tcp_stream >= 0:
+                stream_to_indices.setdefault(tcp_stream, []).append(idx)
+
+        if not stream_to_indices:
+            return results
+
+        stream_ids = list(stream_to_indices.keys())
+        response_map: Dict[int, 'PacketData'] = {}
+        BATCH_SIZE = 50
+
+        for batch_start in range(0, len(stream_ids), BATCH_SIZE):
+            if self._is_cancelled:
+                break
+
+            batch = stream_ids[batch_start:batch_start + BATCH_SIZE]
+            stream_filter = " or ".join(f"tcp.stream eq {s}" for s in batch)
+            display_filter = f"http.response and ({stream_filter})"
+
+            config = StreamConfig(
+                pcap_path=self.pcap_path,
+                display_filter=display_filter,
+                output_format=OutputFormat.EK,
+                disable_name_resolution=True,
+                line_buffered=True
+            )
+
+            try:
+                for packet in self._handler.stream_packets(config):
+                    if self._is_cancelled:
+                        break
+                    sid = packet.tcp_stream
+                    if sid not in response_map:
+                        response_map[sid] = packet
+                    else:
+                        del packet
+            except Exception as e:
+                logger.warning(f"响应包抓取失败: {e}")
+
+        for sid, resp_pkt in response_map.items():
+            status_code = resp_pkt.http_response_code or ""
+
+            body = resp_pkt.http_response_body
+            if not body:
+                body = resp_pkt.http_request_body
+
+            body_str = ""
+            if body:
+                try:
+                    body_str = body.decode('utf-8', errors='replace')
+                except Exception:
+                    body_str = repr(body)[:2000]
+
+            resp_headers = self._extract_response_headers(resp_pkt)
+            status_line = f"HTTP/1.1 {status_code}" if status_code else ""
+
+            response_text = status_line
+            if resp_headers:
+                response_text += "\r\n" + resp_headers
+            response_text += "\r\n\r\n" + body_str
+
+            for det_idx in stream_to_indices.get(sid, []):
+                det = results[det_idx]
+                if det.raw_result and isinstance(det.raw_result, dict):
+                    det.raw_result['response_data'] = response_text
+                    det.raw_result['response_sample'] = body_str[:2000]
+                    det.raw_result['response_status'] = status_code
+                det.response_data = response_text
+                det.response_sample = body_str[:2000] if body_str else ""
+
+            del resp_pkt
+
+        response_map.clear()
+        return results
+
+    def _extract_response_headers(self, packet: 'PacketData') -> str:
+        """从 EK 原始数据中提取响应头"""
+        layers = packet.raw_ek_data.get('layers', {})
+        http = layers.get('http', {})
+        if not http:
+            return ""
+
+        skip_keys = {
+            'http_http_response_code', 'http_http_response_phrase',
+            'http_http_file_data', 'http_http_response_for_uri',
+            'http_http_request_method', 'http_http_request_uri',
+            'http_http_chat', 'http_http_response_line',
+            'http_http_request_line',
+        }
+        header_lines = []
+        for key, value in http.items():
+            if key.startswith('http_http_') and key not in skip_keys:
+                field_name = key.replace('http_http_', '').replace('_', '-')
+                val = value[0] if isinstance(value, list) else value
+                if val:
+                    header_lines.append(f"{field_name}: {val}")
+
+        return "\r\n".join(header_lines)
 
     def _run_icmp_analysis(self) -> List[ProtocolFinding]:
         import re
@@ -563,11 +696,9 @@ class StreamAnalysisWorker(QThread):
                         pf = ProtocolFinding(
                             protocol="ICMP",
                             finding_type="FLAG发现" if flag_match else "隐写数据",
-                            description=f"在 {len(packet_numbers)} 个ICMP包中发现隐藏数据",
+                            description=f"在 {len(packet_numbers)} 个ICMP包中发现隐藏数据 (帧 {packet_numbers[0]}-{packet_numbers[-1]})" if packet_numbers else "ICMP隐藏数据",
                             data=text[:500],
                             confidence=0.9 if flag_match else 0.7,
-                            packet_range=(packet_numbers[0] if packet_numbers else 0,
-                                          packet_numbers[-1] if packet_numbers else 0),
                             is_flag=bool(flag_match)
                         )
                         findings.append(pf)
@@ -585,6 +716,168 @@ class StreamAnalysisWorker(QThread):
 
         return findings
 
+    def _run_dns_analysis(self) -> List[ProtocolFinding]:
+        findings: List[ProtocolFinding] = []
+
+        try:
+            from core.dns_analyzer import (
+                extract_dns_domains, try_decode_buffer, save_domain_list
+            )
+
+            config = StreamConfig(
+                pcap_path=self.pcap_path,
+                display_filter="dns",
+                output_format=OutputFormat.EK
+            )
+
+            def _packet_iter():
+                for pkt in self._handler.stream_packets(config):
+                    if self._is_cancelled:
+                        break
+                    yield pkt
+
+            all_domains, tunnel_buffers, commands = extract_dns_domains(_packet_iter())
+
+            if not all_domains:
+                self._emit_progress(58, "未发现DNS流量")
+                return findings
+
+            # TXT 指令发现
+            for frame_num, cmd in commands:
+                pf = ProtocolFinding(
+                    protocol="DNS",
+                    finding_type="TXT指令",
+                    description=f"DNS TXT 双层Base64指令 (帧 {frame_num})",
+                    data=cmd[:500],
+                    confidence=0.9,
+                    is_flag="flag{" in cmd.lower()
+                )
+                findings.append(pf)
+                self.protocolFindingFound.emit(pf)
+
+            # 隧道数据解码
+            for base_domain, buffer in tunnel_buffers.items():
+                if len(buffer) < 10:
+                    continue
+                decoded, mode_name = try_decode_buffer(buffer)
+                if decoded:
+                    import re
+                    flag_match = re.search(
+                        r'(flag\{[^}]+\}|ctf\{[^}]+\})', decoded, re.IGNORECASE
+                    )
+                    pf = ProtocolFinding(
+                        protocol="DNS",
+                        finding_type="FLAG发现" if flag_match else "隧道数据",
+                        description=f"DNS隧道 ({base_domain}), 解码: {mode_name}",
+                        data=decoded[:500],
+                        decode_chain=mode_name,
+                        confidence=0.85 if flag_match else 0.7,
+                        is_flag=bool(flag_match)
+                    )
+                    findings.append(pf)
+                    self.protocolFindingFound.emit(pf)
+
+            save_domain_list(all_domains, self.pcap_path)
+
+            self._emit_progress(58, f"DNS分析完成: {len(all_domains)} 查询, {len(findings)} 发现")
+
+        except Exception as e:
+            logger.debug(f"DNS分析异常: {e}")
+
+        return findings
+
+    def _run_cs_detection(self) -> List[ProtocolFinding]:
+        findings: List[ProtocolFinding] = []
+
+        try:
+            config = StreamConfig(
+                pcap_path=self.pcap_path,
+                display_filter="http.cookie",
+                output_format=OutputFormat.EK
+            )
+
+            import base64 as b64_mod
+
+            seen_cookies = set()
+            cs_cookies = []
+
+            for packet in self._handler.stream_packets(config):
+                if self._is_cancelled:
+                    break
+
+                layers = packet.raw_ek_data.get('layers', {})
+                http_layer = layers.get('http', {})
+
+                cookie = None
+                for key in ['http_http_cookie', 'http_cookie']:
+                    if key in http_layer:
+                        val = http_layer[key]
+                        cookie = val[0] if isinstance(val, list) else val
+                        break
+
+                del packet
+
+                if not cookie or len(cookie) <= 30:
+                    continue
+
+                if cookie in seen_cookies:
+                    continue
+                seen_cookies.add(cookie)
+
+                try:
+                    decoded = b64_mod.b64decode(cookie)
+                    if len(decoded) >= 48:
+                        cs_cookies.append(cookie)
+                except Exception:
+                    continue
+
+            if cs_cookies:
+                pf = ProtocolFinding(
+                    protocol="CS",
+                    finding_type="Beacon Cookie",
+                    description=f"检测到 {len(cs_cookies)} 个疑似 CobaltStrike Metadata Cookie",
+                    data="\n".join(c[:80] + "..." for c in cs_cookies[:5]),
+                    confidence=0.6,
+                    raw_values=cs_cookies
+                )
+                findings.append(pf)
+                self.protocolFindingFound.emit(pf)
+
+            seen_cookies.clear()
+            status = f"CS检测完成: {len(cs_cookies)} 可疑Cookie" if cs_cookies else "未发现CS特征"
+            self._emit_progress(60, status)
+
+        except Exception as e:
+            logger.debug(f"CS检测异常: {e}")
+
+        return findings
+
+    def _run_rtp_analysis(self) -> List[RTPStreamInfo]:
+        try:
+            from core.rtp_analyzer import list_rtp_streams, parse_sdp_codecs
+
+            streams = list_rtp_streams(self.pcap_path, self.tshark_path)
+            if not streams:
+                self._emit_progress(64, "未发现 RTP 音视频流")
+                return []
+
+            has_dynamic = any(s.payload_type >= 96 for s in streams)
+            if has_dynamic:
+                sdp_map = parse_sdp_codecs(self.pcap_path, self.tshark_path)
+                for s in streams:
+                    if s.payload_type >= 96 and s.payload_type in sdp_map:
+                        name, mtype, rate = sdp_map[s.payload_type]
+                        s.codec_name = name
+                        s.media_type = mtype
+                        s.sample_rate = rate
+
+            self._emit_progress(63, f"发现 {len(streams)} 条 RTP 音视频流")
+            return streams
+
+        except Exception as e:
+            logger.warning(f"RTP 分析异常: {e}")
+            return []
+
     def _export_http_objects(self) -> List[ExtractedFile]:
         """委托给AnalysisService做智能提取"""
         try:
@@ -592,7 +885,7 @@ class StreamAnalysisWorker(QThread):
             service = AnalysisService()
             service._tshark_path = self._handler.tshark_path
 
-            self._emit_progress(62, "HTTP 对象智能提取中...")
+            self._emit_progress(64, "HTTP 对象智能提取中...")
             extracted_files = service.extract_http_objects(self.pcap_path)
 
             self._emit_progress(70, f"智能提取了 {len(extracted_files)} 个HTTP对象")
@@ -807,7 +1100,9 @@ class StreamAnalysisWorker(QThread):
             lines.append(f"{offset}  {hex_part:<48}  |{ascii_part}|")
         return '\n'.join(lines)
 
-    def _build_protocol_stats(self, protocol_counts: Dict[str, int], total: int) -> List[ProtocolStats]:
+    def _build_protocol_stats(self, protocol_counts: Dict[str, int], total: int, hierarchy: list = None) -> List[ProtocolStats]:
+        if hierarchy:
+            return build_hierarchy_stats(hierarchy, total)
         stats = []
         for proto, count in sorted(protocol_counts.items(), key=lambda x: -x[1]):
             pct = (count / total * 100) if total > 0 else 0
@@ -822,7 +1117,8 @@ class StreamAnalysisWorker(QThread):
         decoding_results: List[AutoDecodingResult],
         recovered_files: List[FileRecoveryResult],
         extracted_files: List[ExtractedFile],
-        total_packets: int
+        total_packets: int,
+        rtp_streams: List[RTPStreamInfo] = None
     ) -> AnalysisSummary:
         analysis_time = time.time() - self._start_time
 
@@ -835,6 +1131,7 @@ class StreamAnalysisWorker(QThread):
             protocol_findings=protocol_findings,
             decoding_results=decoding_results,
             recovered_files=recovered_files,
+            rtp_streams=rtp_streams or [],
             analysis_time=analysis_time
         )
 
@@ -845,41 +1142,46 @@ class StreamAnalysisWorker(QThread):
 
 
 class StreamAnalysisController(QObject):
-    """分析控制器，负责批量信号转发和worker生命周期管理"""
+    """分析控制器，支持多文件并发分析"""
 
-    analysisStarted = Signal()
-    analysisProgress = Signal(int, str)
-    detectionFound = Signal(object)          # 单条(兼容)
-    batchDetectionsFound = Signal(list)      # 批量
+    analysisStarted = Signal(str)               # file_path
+    analysisProgress = Signal(str, int, str)    # file_path, 百分比, 状态消息
+    detectionFound = Signal(object)
+    batchDetectionsFound = Signal(list)
     protocolFindingFound = Signal(object)
     decodingResultFound = Signal(object)
     fileRecovered = Signal(object)
-    analysisFinished = Signal(object)
-    analysisError = Signal(str)
-    analysisCancelled = Signal()
+    analysisFinished = Signal(object)           # AnalysisSummary
+    analysisError = Signal(str, str)            # file_path, 错误消息
+    analysisCancelled = Signal(str)             # file_path
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._worker: Optional[StreamAnalysisWorker] = None
-        self._current_file: str = ""
-        self._is_running = False
+        self._workers: Dict[str, StreamAnalysisWorker] = {}
+
+    def _norm(self, path: str) -> str:
+        return os.path.normcase(os.path.abspath(path))
 
     @property
     def is_running(self) -> bool:
-        return self._is_running and self._worker is not None and self._worker.isRunning()
+        return any(w.isRunning() for w in self._workers.values())
+
+    def is_file_running(self, pcap_path: str) -> bool:
+        key = self._norm(pcap_path)
+        worker = self._workers.get(key)
+        return worker is not None and worker.isRunning()
 
     @property
     def current_file(self) -> str:
-        return self._current_file
+        for key, w in self._workers.items():
+            if w.isRunning():
+                return w.pcap_path
+        return ""
 
     def startAnalysis(self, pcap_path: str, options: Dict = None):
-        if self.is_running:
-            self.stopAnalysis()
-            if self._worker:
-                self._worker.wait(3000)
-
-        self._current_file = pcap_path
-        self._is_running = True
+        key = self._norm(pcap_path)
+        if key in self._workers:
+            self._cleanup_worker(key)
 
         analysis_options = AnalysisOptions(
             detect_webshell=options.get("detect_webshell", True) if options else True,
@@ -891,36 +1193,79 @@ class StreamAnalysisController(QObject):
             max_detections=options.get("max_detections", ResourceLimits.MAX_DETECTIONS) if options else ResourceLimits.MAX_DETECTIONS
         )
 
-        self._worker = StreamAnalysisWorker(pcap_path, analysis_options)
+        worker = StreamAnalysisWorker(pcap_path, analysis_options)
+        self._workers[key] = worker
 
-        self._worker.progress.connect(self.analysisProgress.emit)
-        self._worker.batchResultsReady.connect(self._onBatchResults)
-        self._worker.protocolFindingFound.connect(self.protocolFindingFound.emit)
-        self._worker.decodingResultFound.connect(self.decodingResultFound.emit)
-        self._worker.fileRecovered.connect(self.fileRecovered.emit)
-        self._worker.finished.connect(self._onFinished)
-        self._worker.error.connect(self._onError)
-        self._worker.cancelled.connect(self._onCancelled)
+        fp = pcap_path
+        worker.progress.connect(lambda p, m, f=fp: self.analysisProgress.emit(f, p, m))
+        worker.batchResultsReady.connect(self.batchDetectionsFound.emit)
+        worker.protocolFindingFound.connect(self.protocolFindingFound.emit)
+        worker.decodingResultFound.connect(self.decodingResultFound.emit)
+        worker.fileRecovered.connect(self.fileRecovered.emit)
+        worker.analysisComplete.connect(self._onFinished)
+        worker.error.connect(lambda msg, f=fp: self._onError(f, msg))
+        worker.cancelled.connect(lambda f=fp: self._onCancelled(f))
 
-        self.analysisStarted.emit()
-        self._worker.start()
+        self.analysisStarted.emit(pcap_path)
+        worker.start()
 
-    def _onBatchResults(self, results: List[DetectionResult]):
-        # 只发批量信号，不逐个发，避免信号风暴
-        self.batchDetectionsFound.emit(results)
+    def _cleanup_worker(self, key: str):
+        worker = self._workers.pop(key, None)
+        if not worker:
+            return
+        self._disconnect_worker_obj(worker)
+        worker.cancel()
+        if not worker.wait(500):
+            worker.finished.connect(worker.deleteLater)
+            return
+        worker.deleteLater()
 
-    def stopAnalysis(self):
-        if self._worker:
-            self._worker.cancel()
+    def _disconnect_worker_obj(self, worker):
+        if not worker:
+            return
+        for sig in (
+            worker.progress,
+            worker.batchResultsReady,
+            worker.singleResultReady,
+            worker.protocolFindingFound,
+            worker.decodingResultFound,
+            worker.fileRecovered,
+            worker.analysisComplete,
+            worker.error,
+            worker.cancelled,
+        ):
+            try:
+                sig.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+
+    def stopAnalysis(self, pcap_path: str = None):
+        if pcap_path:
+            key = self._norm(pcap_path)
+            worker = self._workers.get(key)
+            if worker:
+                worker.cancel()
+        else:
+            for worker in self._workers.values():
+                worker.cancel()
 
     def _onFinished(self, summary: AnalysisSummary):
-        self._is_running = False
+        key = self._norm(summary.file_path)
+        worker = self._workers.pop(key, None)
+        if worker:
+            worker.deleteLater()
         self.analysisFinished.emit(summary)
 
-    def _onError(self, error_msg: str):
-        self._is_running = False
-        self.analysisError.emit(error_msg)
+    def _onError(self, file_path: str, error_msg: str):
+        key = self._norm(file_path)
+        worker = self._workers.pop(key, None)
+        if worker:
+            worker.deleteLater()
+        self.analysisError.emit(file_path, error_msg)
 
-    def _onCancelled(self):
-        self._is_running = False
-        self.analysisCancelled.emit()
+    def _onCancelled(self, file_path: str):
+        key = self._norm(file_path)
+        worker = self._workers.pop(key, None)
+        if worker:
+            worker.deleteLater()
+        self.analysisCancelled.emit(file_path)

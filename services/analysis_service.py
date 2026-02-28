@@ -55,7 +55,7 @@ class AnalysisService(IAnalysisService):
             return tshark_path
 
         possible_paths = [
-            r"E:\internet_safe\wireshark\tshark.exe",
+            r"E:\wireshark\tshark.exe",
             r"C:\Program Files\Wireshark\tshark.exe",
             r"C:\Program Files (x86)\Wireshark\tshark.exe",
             r"D:\Program Files\Wireshark\tshark.exe",
@@ -93,7 +93,7 @@ class AnalysisService(IAnalysisService):
 
         # 协议统计
         emit_progress(5, "正在进行协议分级统计...")
-        protocol_counts, total = self._run_protocol_hierarchy_stats(pcap_path)
+        protocol_counts, total, hierarchy = self._run_protocol_hierarchy_stats(pcap_path)
 
         # HTTP对象提取
         emit_progress(30, "正在提取HTTP对象...")
@@ -115,9 +115,13 @@ class AnalysisService(IAnalysisService):
         emit_progress(90, "正在生成分析报告...")
 
         protocol_stats = []
-        for proto, count in sorted(protocol_counts.items(), key=lambda x: -x[1]):
-            pct = (count / total * 100) if total > 0 else 0
-            protocol_stats.append(ProtocolStats(proto, count, pct))
+        if hierarchy:
+            from core.tshark_stream import build_hierarchy_stats
+            protocol_stats = build_hierarchy_stats(hierarchy, total)
+        else:
+            for proto, count in sorted(protocol_counts.items(), key=lambda x: -x[1]):
+                pct = (count / total * 100) if total > 0 else 0
+                protocol_stats.append(ProtocolStats(proto, count, pct))
 
         analysis_time = time.time() - start_time
 
@@ -133,12 +137,12 @@ class AnalysisService(IAnalysisService):
         emit_progress(100, f"分析完成，耗时 {analysis_time:.2f}秒")
         return summary
 
-    def _run_protocol_hierarchy_stats(self, pcap_path: str) -> Tuple[Dict[str, int], int]:
+    def _run_protocol_hierarchy_stats(self, pcap_path: str) -> Tuple[Dict[str, int], int, list]:
         """用 tshark -z io,phs 做协议统计"""
         try:
             return get_protocol_stats(pcap_path, self._tshark_path)
         except Exception:
-            return {}, 0
+            return {}, 0, []
 
     def extract_http_objects(self, pcap_path: str) -> List[ExtractedFile]:
         """提取HTTP对象，区分真正的文件下载和普通HTTP流量"""

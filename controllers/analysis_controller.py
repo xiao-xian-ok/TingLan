@@ -73,7 +73,7 @@ class AnalysisWorker(QThread):
     protocolFindingFound = Signal(object) # ProtocolFinding
     decodingResultFound = Signal(object)  # AutoDecodingResult
     fileRecovered = Signal(object)        # FileRecoveryResult
-    finished = Signal(object)             # AnalysisSummary
+    analysisComplete = Signal(object)     # AnalysisSummary
     error = Signal(str)                   # 错误消息
 
     def __init__(self, pcap_path: str, options: Dict = None, service: IAnalysisService = None):
@@ -197,7 +197,7 @@ class AnalysisWorker(QThread):
             )
             self._stop_emit = True
             self._flush_queue()
-            self.finished.emit(summary)
+            self.analysisComplete.emit(summary)
         except Exception as e:
             import traceback
             self.error.emit(f"分析错误: {str(e)}\n{traceback.format_exc()}")
@@ -226,7 +226,7 @@ class AnalysisWorker(QThread):
 
             # 阶段1: 协议统计
             self.progress.emit(5, "【阶段1/8】正在进行协议分级统计...")
-            protocol_counts, total = self._run_protocol_stats(tshark_path)
+            protocol_counts, total, protocol_hierarchy = self._run_protocol_stats(tshark_path)
 
             if self._is_cancelled:
                 return
@@ -293,9 +293,13 @@ class AnalysisWorker(QThread):
             self.progress.emit(95, "【阶段8/8】正在生成分析报告...")
 
             protocol_stats = []
-            for proto, count in sorted(protocol_counts.items(), key=lambda x: -x[1]):
-                pct = (count / total * 100) if total > 0 else 0
-                protocol_stats.append(ProtocolStats(proto, count, pct))
+            if protocol_hierarchy:
+                from core.tshark_stream import build_hierarchy_stats
+                protocol_stats = build_hierarchy_stats(protocol_hierarchy, total)
+            else:
+                for proto, count in sorted(protocol_counts.items(), key=lambda x: -x[1]):
+                    pct = (count / total * 100) if total > 0 else 0
+                    protocol_stats.append(ProtocolStats(proto, count, pct))
 
             analysis_time = time.time() - start_time
 
@@ -314,7 +318,7 @@ class AnalysisWorker(QThread):
             summary.update_confidence_counts()
 
             self.progress.emit(100, f"分析完成，耗时 {analysis_time:.2f}秒")
-            self.finished.emit(summary)
+            self.analysisComplete.emit(summary)
 
         except Exception as e:
             import traceback
@@ -322,59 +326,17 @@ class AnalysisWorker(QThread):
         finally:
             self._stop_emit = True
 
-    def _run_protocol_stats(self, tshark_path: str) -> Tuple[Dict[str, int], int]:
+    def _run_protocol_stats(self, tshark_path: str) -> Tuple[Dict[str, int], int, list]:
         """tshark -z io,phs 协议统计"""
-        protocol_counts: Dict[str, int] = {}
-        total = 0
-
         try:
-            cmd = [tshark_path, "-r", self.pcap_path, "-q", "-z", "io,phs"]
-
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                timeout=120
-            )
-
-            lines = result.stdout.split('\n')
-            for line in lines:
-                line = line.strip()
-                if not line or 'frames:' not in line:
-                    continue
-
-                parts = line.split()
-                if len(parts) >= 2:
-                    protocol_chain = parts[0]
-
-                    for part in parts:
-                        if part.startswith('frames:'):
-                            count = int(part.replace('frames:', ''))
-                            protocols = protocol_chain.split(':')
-                            top_protocol = protocols[-1].upper() if protocols else "UNKNOWN"
-
-                            if total == 0 and top_protocol in ("FRAME", "ETH"):
-                                total = count
-                            elif top_protocol == "FRAME":
-                                total = count
-
-                            if top_protocol not in ("FRAME", "ETH", "DATA"):
-                                protocol_counts[top_protocol] = count
-                            break
-
-            if total == 0 and protocol_counts:
-                total = max(protocol_counts.values())
-
-            self.progress.emit(12, f"协议统计完成: {len(protocol_counts)} 种协议, {total} 个数据包")
-
+            from core.tshark_stream import get_protocol_stats
+            return get_protocol_stats(self.pcap_path, tshark_path)
         except subprocess.TimeoutExpired:
             self.progress.emit(12, "协议统计超时，继续...")
         except Exception as e:
             self.progress.emit(12, f"协议统计警告: {str(e)[:30]}")
 
-        return protocol_counts, total
+        return {}, 0, []
 
     def _export_http_objects(self, tshark_path: str) -> List[ExtractedFile]:
         """tshark 导出 HTTP 对象"""
@@ -973,16 +935,16 @@ class AnalysisWorker(QThread):
 class AnalysisController(QObject):
     """分析控制器 - 串联UI和工作线程"""
 
-    analysisStarted = Signal()
-    analysisProgress = Signal(int, str)
+    analysisStarted = Signal(str)
+    analysisProgress = Signal(str, int, str)
     detectionFound = Signal(object)
     protocolFindingFound = Signal(object)
     decodingResultFound = Signal(object)
     fileRecovered = Signal(object)
     imageExtracted = Signal(object)
     analysisFinished = Signal(object)
-    analysisError = Signal(str)
-    analysisCancelled = Signal()
+    analysisError = Signal(str, str)
+    analysisCancelled = Signal(str)
 
     def __init__(self, parent=None, service: IAnalysisService = None):
         super().__init__(parent)
@@ -1012,28 +974,28 @@ class AnalysisController(QObject):
 
         self.worker = AnalysisWorker(pcap_path, options, service=self._service)
 
-        self.worker.progress.connect(self.analysisProgress.emit)
+        self.worker.progress.connect(lambda p, m, f=pcap_path: self.analysisProgress.emit(f, p, m))
         self.worker.resultReady.connect(self.detectionFound.emit)
         self.worker.protocolFindingFound.connect(self.protocolFindingFound.emit)
         self.worker.decodingResultFound.connect(self.decodingResultFound.emit)
         self.worker.fileRecovered.connect(self.fileRecovered.emit)
         self.worker.imageExtracted.connect(self.imageExtracted.emit)
-        self.worker.finished.connect(self._onFinished)
+        self.worker.analysisComplete.connect(self._onFinished)
         self.worker.error.connect(self._onError)
 
-        self.analysisStarted.emit()
+        self.analysisStarted.emit(pcap_path)
         self.worker.start()
 
     def stopAnalysis(self):
         if self.worker:
             self.worker.cancel()
-            self.analysisCancelled.emit()
+            self.analysisCancelled.emit(self._current_file)
 
     def _onFinished(self, summary: AnalysisSummary):
         self.analysisFinished.emit(summary)
 
     def _onError(self, error_msg: str):
-        self.analysisError.emit(error_msg)
+        self.analysisError.emit(self._current_file, error_msg)
 
 
 def get_packet_hex_dump(pcap_path: str, packet_num: int = 0) -> tuple:

@@ -180,6 +180,7 @@ class TreePanel(QWidget):
         for i in range(self.proxy_model.rowCount(QModelIndex())):
             idx = self.proxy_model.index(i, 0, QModelIndex())
             self.tree_view.expand(idx)
+        self.tree_view.resizeColumnToContents(0)
         self.tree_view.setUpdatesEnabled(True)
 
         self._updateStatus(summary)
