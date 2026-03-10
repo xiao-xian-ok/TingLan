@@ -19,6 +19,9 @@ from enum import Enum
 logger = logging.getLogger(__name__)
 
 
+# ============================================================
+# 枚举定义
+# ============================================================
 
 class ProtocolType(Enum):
     ICMP = "icmp"
@@ -47,6 +50,9 @@ class FindingType(Enum):
     DEVICE_INPUT = "device_input"
 
 
+# ============================================================
+# 数据结构
+# ============================================================
 
 @dataclass
 class AnalysisFinding:
@@ -88,6 +94,9 @@ class ProtocolAnalysisResult:
         return [f.data for f in self.findings if f.is_flag and f.data]
 
 
+# ============================================================
+# 基类
+# ============================================================
 
 class ProtocolAnalyzer(ABC):
     """协议分析器基类"""
@@ -202,6 +211,9 @@ class ProtocolAnalyzer(ABC):
         return any(p in text_lower for p in patterns)
 
 
+# ============================================================
+# ICMPAnalyzer
+# ============================================================
 
 class ICMPAnalyzer(ProtocolAnalyzer):
     """ICMP隐写分析: data长度、TTL、载荷偏移、序列号"""
@@ -346,6 +358,9 @@ class ICMPAnalyzer(ProtocolAnalyzer):
         )
 
 
+# ============================================================
+# DNSCovertChannelAnalyzer
+# ============================================================
 
 class DNSCovertChannelAnalyzer(ProtocolAnalyzer):
     """DNS隐蔽通道分析: 子域名编码数据提取、TXT指令捕获、域名统计"""
@@ -572,6 +587,9 @@ class DNSCovertChannelAnalyzer(ProtocolAnalyzer):
         )
 
 
+# ============================================================
+# FTPAnalyzer
+# ============================================================
 
 class FTPAnalyzer(ProtocolAnalyzer):
     """FTP流量分析: 凭证提取、文件还原"""
@@ -719,6 +737,9 @@ class FTPAnalyzer(ProtocolAnalyzer):
         )
 
 
+# ============================================================
+# MMSAnalyzer
+# ============================================================
 
 class MMSAnalyzer(ProtocolAnalyzer):
     """MMS协议分析: InvokeID追踪、文件传输提取"""
@@ -739,56 +760,62 @@ class MMSAnalyzer(ProtocolAnalyzer):
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
 
-        # 状态追踪
+        # 核心状态追踪池
         open_inv_to_name = {}   # InvokeID -> 文件名 (72 Request)
         frsm_to_name = {}       # FRSMID -> 文件名 (72 Response)
         read_inv_to_name = {}   # InvokeID -> 文件名 (73 Request)
 
         for pkt in packets:
             try:
-                layer_names = [l.layer_name for l in pkt.layers] if hasattr(pkt, 'layers') else []
-                if 'mms' not in layer_names:
+                if 'mms' not in [l.layer_name for l in pkt.layers]:
                     continue
 
                 packet_count += 1
                 mms = pkt.mms
-                inv_id = getattr(mms, "invokeid", None)
+                pkt_num = pkt.number
+                inv_id = getattr(mms, 'invokeid', None)
 
-                # 文件打开请求 (Confirmed-RequestPDU, 72)
-                if hasattr(mms, "confirmedservicerequest") and int(mms.confirmedservicerequest) == 72:
-                    if hasattr(mms, "filename_item"):
+                # --- 阶段 1: 文件打开请求 (Confirmed-RequestPDU, 72) ---
+                if hasattr(mms, 'confirmedservicerequest') and int(mms.confirmedservicerequest) == 72:
+                    if hasattr(mms, 'filename_item'):
                         try:
                             raw_fname = mms.filename_item.fields[0].get_default_value()
                             fname = os.path.basename(str(raw_fname))
                             if inv_id:
                                 open_inv_to_name[inv_id] = fname
+                            print(f'[#Pkt:{pkt_num} | ID:{inv_id}] \u53d1\u73b0 Open \u8bf7\u6c42: {fname}')
                         except Exception:
                             pass
 
-                # 绑定FRSMID (Confirmed-ResponsePDU, 72)
-                elif hasattr(mms, "confirmedserviceresponse") and int(mms.confirmedserviceresponse) == 72:
+                # --- 阶段 2: 绑定 FRSMID (Confirmed-ResponsePDU, 72) ---
+                elif hasattr(mms, 'confirmedserviceresponse') and int(mms.confirmedserviceresponse) == 72:
                     if inv_id in open_inv_to_name:
                         fname = open_inv_to_name.pop(inv_id)
-                        if hasattr(mms, "frsmid"):
+                        if hasattr(mms, 'frsmid'):
                             f_id = str(mms.frsmid)
                             frsm_to_name[f_id] = fname
+                            print(f'[#Pkt:{pkt_num} | ID:{inv_id}] Open \u6210\u529f: {fname} (\u83b7\u5f97 FRSMID: {f_id})')
 
-                # 文件读取请求 (Confirmed-RequestPDU, 73)
-                elif hasattr(mms, "confirmedservicerequest") and int(mms.confirmedservicerequest) == 73:
-                    if hasattr(mms, "fileread"):
+                # --- 阶段 3: 文件读取请求 (Confirmed-RequestPDU, 73) ---
+                elif hasattr(mms, 'confirmedservicerequest') and int(mms.confirmedservicerequest) == 73:
+                    if hasattr(mms, 'fileread'):
                         f_id = str(mms.fileread)
                         if f_id in frsm_to_name:
                             fname = frsm_to_name[f_id]
                             if inv_id:
                                 read_inv_to_name[inv_id] = fname
+                            if 'flag' in fname.lower():
+                                print(f'\n{"="*60}')
+                                print(f'[!] [#Pkt:{pkt_num} | ID:{inv_id}] \u5173\u952e\u8bfb\u53d6: \u6b63\u5728\u8bf7\u6c42 {fname}')
+                                print(f'{"="*60}\n')
 
-                # 提取文件数据 (Confirmed-ResponsePDU, 73)
-                elif hasattr(mms, "confirmedserviceresponse") and int(mms.confirmedserviceresponse) == 73:
+                # --- 阶段 4: 提取文件数据 (Confirmed-ResponsePDU, 73) ---
+                elif hasattr(mms, 'confirmedserviceresponse') and int(mms.confirmedserviceresponse) == 73:
                     if inv_id in read_inv_to_name:
                         fname = read_inv_to_name.pop(inv_id)
 
-                        if hasattr(mms, "filedata"):
-                            raw_val = str(mms.filedata).replace(":", "").replace(" ", "")
+                        if hasattr(mms, 'filedata'):
+                            raw_val = str(mms.filedata).replace(':', '').replace(' ', '')
                             try:
                                 data_to_save = binascii.unhexlify(raw_val)
                             except Exception:
@@ -796,45 +823,69 @@ class MMSAnalyzer(ProtocolAnalyzer):
 
                             if output_dir:
                                 file_path = os.path.join(output_dir, fname)
-                                with open(file_path, "ab") as f:
+                                with open(file_path, 'ab') as f:
                                     f.write(data_to_save)
                                 extracted_files.append(file_path)
 
-                            is_flag = "flag" in fname.lower()
-                            decoded_content = data_to_save.decode(errors='ignore') if is_flag else None
+                            is_flag = 'flag' in fname.lower()
+                            if is_flag:
+                                decoded_content = data_to_save.decode(errors='ignore')
+                                print(f'\n{"="*20} FLAG FOUND {"="*20}')
+                                print(f'\u6570\u636e\u5305\u53f7: {pkt_num}')
+                                print(f'InvokeID: {inv_id} (Wireshark \u8fc7\u6ee4\u5668: mms.invokeID == {inv_id})')
+                                print(f'\u6587\u4ef6\u5185\u5bb9: {decoded_content}')
+                                print(f'{"="*52}\n')
+                                findings.append(AnalysisFinding(
+                                    finding_type=FindingType.HIDDEN_DATA,
+                                    protocol=ProtocolType.MMS,
+                                    title=f'MMS FLAG\u6587\u4ef6: {fname}',
+                                    description=f'Pkt:{pkt_num} InvokeID:{inv_id} \u6587\u4ef6: {fname} ({len(data_to_save)} bytes)',
+                                    data=decoded_content,
+                                    confidence=0.95,
+                                    is_flag=True
+                                ))
+                            else:
+                                print(f'[+] [#Pkt:{pkt_num} | ID:{inv_id}] \u5df2\u8fd8\u539f\u6570\u636e\u5230: {fname}')
+                                findings.append(AnalysisFinding(
+                                    finding_type=FindingType.FILE_EXTRACTION,
+                                    protocol=ProtocolType.MMS,
+                                    title=f'MMS\u6587\u4ef6\u63d0\u53d6: {fname}',
+                                    description=f'Pkt:{pkt_num} InvokeID:{inv_id} \u6587\u4ef6: {fname} ({len(data_to_save)} bytes)',
+                                    data=f'[{len(data_to_save)} bytes]',
+                                    confidence=0.8,
+                                    is_flag=False
+                                ))
 
-                            finding_type = FindingType.HIDDEN_DATA if is_flag else FindingType.FILE_EXTRACTION
-                            findings.append(AnalysisFinding(
-                                finding_type=finding_type,
-                                protocol=ProtocolType.MMS,
-                                title=f"MMS文件提取: {fname}",
-                                description=f"InvokeID: {inv_id}, 文件: {fname} ({len(data_to_save)} bytes)",
-                                data=decoded_content or f"[{len(data_to_save)} bytes]",
-                                confidence=0.95 if is_flag else 0.8,
-                                is_flag=is_flag
-                            ))
+                    # 容错：处理那些"孤立"但带数据的响应包
+                    elif hasattr(mms, 'filedata'):
+                        print(f'[?] [#Pkt:{pkt_num} | ID:{inv_id}] \u53d1\u73b0\u672a\u5339\u914d\u6570\u636e\u7684\u54cd\u5e94\uff0c\u8bf7\u68c0\u67e5\u8be5 ID')
 
             except Exception:
                 continue
 
+        print(f'\n>>> wireshark\u641c\u7d22 mms.invokeID == ID\u53f7 \u53ef\u8fdb\u4e00\u6b65\u67e5\u770b\u5185\u5bb9')
+
         summary_parts = []
         if extracted_files:
-            summary_parts.append(f"提取 {len(extracted_files)} 个文件")
+            summary_parts.append(f'\u63d0\u53d6 {len(extracted_files)} \u4e2a\u6587\u4ef6')
         flags = [f for f in findings if f.is_flag]
         if flags:
-            summary_parts.append(f"发现FLAG文件: {flags[0].data[:80] if flags[0].data else ''}")
-        summary_parts.append(f"共 {packet_count} 个MMS包")
+            summary_parts.append(f'\u53d1\u73b0FLAG\u6587\u4ef6: {flags[0].data[:80] if flags[0].data else ""}')
+        summary_parts.append(f'\u5171 {packet_count} \u4e2aMMS\u5305')
 
         return ProtocolAnalysisResult(
             protocol=ProtocolType.MMS,
             packet_count=packet_count,
             findings=findings,
-            summary="; ".join(summary_parts),
+            summary='; '.join(summary_parts),
             extracted_files=extracted_files,
             output_dir=output_dir
         )
 
 
+# ============================================================
+# BluetoothAnalyzer
+# ============================================================
 
 class BluetoothAnalyzer(ProtocolAnalyzer):
     """蓝牙流量分析: OBEX文件传输、L2CAP/GATT数据"""
@@ -995,6 +1046,9 @@ class BluetoothAnalyzer(ProtocolAnalyzer):
         )
 
 
+# ============================================================
+# SMTPAnalyzer
+# ============================================================
 
 class SMTPAnalyzer(ProtocolAnalyzer):
     """SMTP邮件流量分析: 认证凭证、发件人/收件人、邮件内容/附件提取"""
@@ -1204,6 +1258,9 @@ class SMTPAnalyzer(ProtocolAnalyzer):
         )
 
 
+# ============================================================
+# CobaltStrikeAnalyzer
+# ============================================================
 
 class CobaltStrikeAnalyzer(ProtocolAnalyzer):
     """Cobalt Strike流量分析: Cookie提取、RSA密钥提取、Metadata解密、流量解密"""
@@ -1619,6 +1676,9 @@ class CobaltStrikeAnalyzer(ProtocolAnalyzer):
             return {'error': str(e)}
 
 
+# ============================================================
+# USBAnalyzer
+# ============================================================
 
 class USBAnalyzer(ProtocolAnalyzer):
     """USB流量分析: 键盘还原、鼠标轨迹恢复"""
@@ -1846,6 +1906,9 @@ class USBAnalyzer(ProtocolAnalyzer):
         )
 
 
+# ============================================================
+# PcapRepairTool (不继承 ProtocolAnalyzer)
+# ============================================================
 
 class PcapRepairTool:
     """PCAP修复工具: 从损坏的cap文件重建标准PCAP"""
@@ -1940,7 +2003,9 @@ class PcapRepairTool:
             }
 
 
+# ============================================================
 # ProtocolAnalyzerManager
+# ============================================================
 
 class ProtocolAnalyzerManager:
 
@@ -2029,7 +2094,9 @@ class ProtocolAnalyzerManager:
         return results
 
 
+# ============================================================
 # 便捷函数
+# ============================================================
 
 def analyze_icmp(packets: List) -> ProtocolAnalysisResult:
     return ICMPAnalyzer().analyze(packets)
