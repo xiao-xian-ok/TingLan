@@ -4,6 +4,7 @@
 
 import re
 import base64
+import hashlib
 import logging
 from typing import Dict, List, Optional, Any, Tuple
 from urllib.parse import unquote
@@ -379,8 +380,8 @@ def try_decrypt_behinder(encrypted_data: str, custom_keys: List[bytes] = None) -
                         decrypted = cipher.decrypt(cipher_data)
                         try:
                             decrypted = unpad(decrypted, AES.block_size)
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            logger.debug("behinder unpad failed: %s", _e)
 
                         try:
                             decrypted_str = decrypted.decode('utf-8', errors='strict')
@@ -393,9 +394,12 @@ def try_decrypt_behinder(encrypted_data: str, custom_keys: List[bytes] = None) -
                                 'key': key.decode('utf-8', errors='ignore'),
                                 'method': 'AES-128-CBC'
                             }
-                    except Exception:
+                    except Exception as _e:
+                        logger.debug("behinder AES decrypt failed for iv: %s", _e)
                         continue
-            except Exception:
+            except Exception as _e:
+                logger.debug("behinder AES key fp=%s failed: %s",
+                             hashlib.sha256(key).hexdigest()[:8], _e)
                 continue
 
     except Exception as e:

@@ -901,7 +901,7 @@ class StreamAnalysisWorker(QThread):
         import subprocess
 
         extracted_files = []
-        export_dir = tempfile.mkdtemp(prefix="tinglan_http_")
+        export_dir = tempfile.mkdtemp(prefix=f"tinglan_http_{os.getpid()}_")
 
         try:
             cmd = [

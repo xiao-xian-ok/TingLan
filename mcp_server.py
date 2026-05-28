@@ -76,6 +76,184 @@ if mcp is None:
     mcp = _NoMCP()
 
 
+# ============================================================
+# 日志 / 错误 / 路径校验 / 装饰器 (Critical fixes scaffold)
+# ============================================================
+import logging
+import logging.handlers
+import uuid
+import atexit
+import functools
+import inspect
+
+LOG_DIR = os.path.join(PROJECT_ROOT, "logs")
+try:
+    os.makedirs(LOG_DIR, exist_ok=True)
+except OSError:
+    pass
+
+logger = logging.getLogger("tinglan.mcp")
+logger.setLevel(logging.DEBUG)
+logger.propagate = False
+
+if not logger.handlers:
+    try:
+        _file_h = logging.handlers.RotatingFileHandler(
+            os.path.join(LOG_DIR, "mcp.log"),
+            maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
+        _file_h.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s [%(name)s] %(message)s"))
+        logger.addHandler(_file_h)
+    except OSError as _e:
+        pass
+    _stderr_h = logging.StreamHandler(sys.stderr)
+    _stderr_h.setLevel(logging.INFO)
+    _stderr_h.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    logger.addHandler(_stderr_h)
+
+
+# 常量
+_TSHARK_DEFAULT_TIMEOUT = 300
+_MAX_FIX_PCAP_SIZE = 1024 * 1024 * 1024  # 1GB
+_ALLOWED_READ_EXTS = {".pcap", ".pcapng", ".cap"}
+_ALLOWED_WRITE_EXTS = {".pcap", ".pcapng"}
+
+
+def _safe_read_path(path: str) -> str:
+    """校验读取的 pcap 路径。拒绝符号链接、非常规文件、非法扩展名。返 realpath。"""
+    if not path or not isinstance(path, str):
+        raise ValueError("路径不能为空")
+    if os.path.islink(path):
+        raise ValueError(f"拒绝符号链接: {path}")
+    real = os.path.realpath(path)
+    if not os.path.exists(real):
+        raise FileNotFoundError(f"文件不存在: {path}")
+    if not os.path.isfile(real):
+        raise ValueError(f"不是常规文件: {path}")
+    ext = os.path.splitext(real)[1].lower()
+    if ext not in _ALLOWED_READ_EXTS:
+        raise ValueError(
+            f"不允许的扩展名 {ext!r},仅允许: {', '.join(sorted(_ALLOWED_READ_EXTS))}"
+        )
+    return real
+
+
+def _safe_write_path(path: str, base_dirs: List[str]) -> str:
+    """校验输出路径必须在 base_dirs 内,扩展名 ∈ {.pcap, .pcapng}。返 realpath。"""
+    if not path or not isinstance(path, str):
+        raise ValueError("输出路径不能为空")
+    real = os.path.realpath(path)
+    bases = [os.path.realpath(b) for b in base_dirs if b]
+    allowed = any(
+        real == b or real.startswith(b + os.sep) or real.startswith(b + "/")
+        for b in bases
+    )
+    if not allowed:
+        raise ValueError(
+            f"输出路径不在允许目录内: {real}"
+        )
+    ext = os.path.splitext(real)[1].lower()
+    if ext not in _ALLOWED_WRITE_EXTS:
+        raise ValueError(f"输出扩展名必须为 .pcap 或 .pcapng,当前: {ext!r}")
+    parent = os.path.dirname(real)
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as e:
+            raise ValueError(f"无法创建输出目录: {e}") from e
+    return real
+
+
+def _new_error_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+def _error_response(exc: Exception, error_id: str,
+                    hint: Optional[str] = None) -> Dict[str, Any]:
+    """统一错误响应。不含 traceback,客户端去 logs/mcp.log grep error_id。"""
+    msg = str(exc) or exc.__class__.__name__
+    resp: Dict[str, Any] = {"ok": False, "error": msg, "error_id": error_id}
+    if hint:
+        resp["hint"] = hint
+    return resp
+
+
+def _local_error(exc: Exception) -> Dict[str, Any]:
+    """供 tool 内部 try/except 使用的本地错误返回。日志含 traceback,响应不含。"""
+    error_id = _new_error_id()
+    logger.exception("tool internal error id=%s", error_id)
+    return {"ok": False,
+            "error": str(exc) or exc.__class__.__name__,
+            "error_id": error_id}
+
+
+def pcap_tool(*, read_paths=(), write_paths=(), requires_modules=()):
+    """MCP tool 包装器:统一处理路径校验、必需模块检查、异常包装、日志记录。
+
+    read_paths: 参数名列表,这些参数会被 _safe_read_path 校验
+    write_paths: [(参数名, base_from_param)] 列表;base 允许目录 = [PROJECT_ROOT, dirname(base_from)]
+    requires_modules: [(module_obj, 中文标签)] 列表;任一为 None 则早返 error
+    """
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            error_id = _new_error_id()
+
+            # 阶段 1:模块依赖 + 入参解析 + 路径校验
+            try:
+                for mod, label in requires_modules:
+                    if mod is None:
+                        logger.warning("tool %s 模块不可用: %s id=%s",
+                                       fn.__name__, label, error_id)
+                        return {"ok": False,
+                                "error": f"模块不可用: {label}",
+                                "error_id": error_id}
+
+                sig = inspect.signature(fn)
+                bound = sig.bind_partial(*args, **kwargs)
+                bound.apply_defaults()
+                params = dict(bound.arguments)
+
+                for p_name in read_paths:
+                    if p_name in params and params[p_name]:
+                        params[p_name] = _safe_read_path(params[p_name])
+
+                for spec in write_paths:
+                    if isinstance(spec, tuple):
+                        p_name, base_from = spec
+                    else:
+                        p_name, base_from = spec, None
+                    if p_name not in params or not params[p_name]:
+                        continue
+                    bases = [PROJECT_ROOT]
+                    if base_from and base_from in params and params[base_from]:
+                        bases.append(os.path.dirname(params[base_from]))
+                    params[p_name] = _safe_write_path(params[p_name], bases)
+
+            except (FileNotFoundError, ValueError) as e:
+                logger.warning("tool %s validation failed id=%s: %s",
+                               fn.__name__, error_id, e)
+                return _error_response(e, error_id)
+
+            # 阶段 2:执行业务逻辑(业务里的 ValueError 不再被当成路径错)
+            try:
+                return fn(**params)
+            except Exception as e:
+                logger.exception("tool %s failed id=%s", fn.__name__, error_id)
+                return _error_response(e, error_id)
+        return wrapper
+    return decorator
+
+
+# 临时目录清理(C6)
+try:
+    from core.temp_cleanup import cleanup_stale_dirs, cleanup_own_dirs
+    cleanup_stale_dirs(24)               # 启动清 24h 前残留
+    atexit.register(cleanup_own_dirs)    # 退出清自己 PID
+except Exception as _e:
+    logger.warning("temp_cleanup 初始化失败: %s", _e)
+
+
 def _jsonable(obj):
     """转换为JSON可序列化结构"""
     if obj is None: return None
@@ -239,7 +417,7 @@ def _detect_attacks_ek(pcap_path, tshark_path, max_packets=0):
                 if len(attacks) >= limit: break
             except: continue
     except Exception as e:
-        print(f"[MCP] _detect_attacks_ek error: {e}")
+        logger.warning("_detect_attacks_ek error: %s", e)
     return attacks
 
 
@@ -274,8 +452,7 @@ def _analyze_icmp(pcap_path, tshark_path):
             "possible_flags": result.get_flags(), "summary": result.summary
         }
     except Exception as e:
-        import traceback
-        return {"available": False, "error": str(e), "trace": traceback.format_exc()}
+        return {"available": False, **_local_error(e)}
 
 
 def _analyze_ftp_sub(pcap_path, tshark_path):
@@ -890,8 +1067,7 @@ def _analyze_dns_covert(pcap_path, tshark_path, decode_mode="auto", trigger_doma
             resp["auto_detected_trigger"] = auto_detected_trigger
         return resp
     except Exception as e:
-        import traceback as tb
-        return {"ok": False, "error": str(e), "trace": tb.format_exc()}
+        return _local_error(e)
 
 
 def _analyze_cobalt_strike(pcap_path, tshark_path, key_file_path=None):
@@ -1047,8 +1223,7 @@ def _analyze_cobalt_strike(pcap_path, tshark_path, key_file_path=None):
             "summary": f"提取 {len(cookies)} 个Cookie, 未提供密钥文件",
         }
     except Exception as e:
-        import traceback as tb
-        return {"ok": False, "error": str(e), "trace": tb.format_exc()}
+        return _local_error(e)
 
 
 def _auto_decode_suspicious_data(data_list):
@@ -1068,6 +1243,7 @@ def _auto_decode_suspicious_data(data_list):
 
 
 @mcp.tool()
+@pcap_tool(read_paths=["pcap_path"])
 def analyze_pcap(pcap_path: str, tshark_path: Optional[str] = None, max_packets: int = 0) -> Dict[str, Any]:
     """
     分析pcap文件,自动检测Webshell、攻击、ICMP隐写、FTP/SMTP/USB/蓝牙流量。
@@ -1084,7 +1260,7 @@ def analyze_pcap(pcap_path: str, tshark_path: Optional[str] = None, max_packets:
     try:
         tshark = _find_tshark(tshark_path)
     except Exception as e:
-        return {"ok": False, "error": str(e), "traceback": traceback.format_exc()}
+        return _local_error(e)
 
     # 1. 协议统计（使用快速方法，与 GUI 对齐）
     proto_counts = {}
@@ -1368,6 +1544,7 @@ def analyze_pcap(pcap_path: str, tshark_path: Optional[str] = None, max_packets:
 
 
 @mcp.tool()
+@pcap_tool(requires_modules=[(AutoDecoder, "auto_decoder"), (auto_decode_text, "auto_decoder")])
 def auto_decode(data: str, crib: Optional[str] = None, max_depth: int = 10) -> Dict[str, Any]:
     """自动解码数据，支持Base64/Hex/URL/Gzip等多层嵌套"""
     if AutoDecoder is None or auto_decode_text is None:
@@ -1386,10 +1563,11 @@ def auto_decode(data: str, crib: Optional[str] = None, max_depth: int = 10) -> D
             "detected_content_type": result.detected_content_type,
         }
     except Exception as e:
-        return {"ok": False, "error": str(e), "traceback": traceback.format_exc()}
+        return _local_error(e)
 
 
 @mcp.tool()
+@pcap_tool(requires_modules=[(AttackDetector, "attack_detector")])
 def detect_attack(data: str, attack_type: Optional[str] = None) -> Dict[str, Any]:
     """检测OWASP攻击签名：SQLi/XSS/XXE/RCE/SSRF/目录穿越等"""
     if AttackDetector is None:
@@ -1419,10 +1597,11 @@ def detect_attack(data: str, attack_type: Optional[str] = None) -> Dict[str, Any
             "matches": matches_brief,
         }
     except Exception as e:
-        return {"ok": False, "error": str(e), "traceback": traceback.format_exc()}
+        return _local_error(e)
 
 
 @mcp.tool()
+@pcap_tool(requires_modules=[(EntropyAnalyzer, "entropy_analyzer"), (MeaningfulnessAnalyzer, "entropy_analyzer")])
 def analyze_entropy(data: str, include_details: bool = True) -> Dict[str, Any]:
     """分析数据的信息熵，检测加密/混淆数据"""
     if EntropyAnalyzer is None or MeaningfulnessAnalyzer is None:
@@ -1459,10 +1638,11 @@ def analyze_entropy(data: str, include_details: bool = True) -> Dict[str, Any]:
             "is_meaningful": result.get("is_meaningful", False),
         }
     except Exception as e:
-        return {"ok": False, "error": str(e), "traceback": traceback.format_exc()}
+        return _local_error(e)
 
 
 @mcp.tool()
+@pcap_tool(requires_modules=[(FileRestorer, "file_restorer")])
 def identify_file_type(data_hex: str) -> Dict[str, Any]:
     """识别文件类型（Magic Number），支持200+格式"""
     if FileRestorer is None:
@@ -1491,10 +1671,11 @@ def identify_file_type(data_hex: str) -> Dict[str, Any]:
             "category": sig.category,
         }
     except Exception as e:
-        return {"ok": False, "error": str(e), "traceback": traceback.format_exc()}
+        return _local_error(e)
 
 
 @mcp.tool()
+@pcap_tool(requires_modules=[(PHPASTEngine, "ast_engine")])
 def analyze_php_ast(code: str) -> Dict[str, Any]:
     """PHP AST语义分析，污点追踪检测Webshell"""
     if PHPASTEngine is None:
@@ -1533,10 +1714,11 @@ def analyze_php_ast(code: str) -> Dict[str, Any]:
             "findings": findings_brief,
         }
     except Exception as e:
-        return {"ok": False, "error": str(e), "traceback": traceback.format_exc()}
+        return _local_error(e)
 
 
 @mcp.tool()
+@pcap_tool(read_paths=["pcap_path"])
 def analyze_ftp(pcap_path: str, tshark_path: Optional[str] = None) -> Dict[str, Any]:
     """分析FTP流量,提取凭据和文件传输信息。返回登录凭据(用户名/密码)、传输文件列表(文件名/上传或下载)和FTP命令记录"""
     try:
@@ -1555,10 +1737,11 @@ def analyze_ftp(pcap_path: str, tshark_path: Optional[str] = None) -> Dict[str, 
             "total_commands": result.get("total_commands", 0),
         }
     except Exception as e:
-        return {"ok": False, "error": str(e), "traceback": traceback.format_exc()}
+        return _local_error(e)
 
 
 @mcp.tool()
+@pcap_tool(read_paths=["pcap_path"])
 def analyze_smtp(pcap_path: str, tshark_path: Optional[str] = None) -> Dict[str, Any]:
     """分析SMTP邮件流量,提取认证和邮件内容。返回认证凭据(用户名/密码)、邮件列表(发件人/收件人/主题)"""
     try:
@@ -1576,10 +1759,11 @@ def analyze_smtp(pcap_path: str, tshark_path: Optional[str] = None) -> Dict[str,
             "mail_count": result["mail_count"],
         }
     except Exception as e:
-        return {"ok": False, "error": str(e), "traceback": traceback.format_exc()}
+        return _local_error(e)
 
 
 @mcp.tool()
+@pcap_tool(read_paths=["pcap_path"], requires_modules=[(analyze_usb_traffic, "usb_analyzer")])
 def analyze_usb(pcap_path: str, tshark_path: Optional[str] = None) -> Dict[str, Any]:
     """分析USB流量，还原键盘输入和鼠标轨迹"""
     if analyze_usb_traffic is None:
@@ -1599,10 +1783,11 @@ def analyze_usb(pcap_path: str, tshark_path: Optional[str] = None) -> Dict[str, 
             "mouse_point_count": len(mouse_trace) if mouse_trace else 0,
         }
     except Exception as e:
-        return {"ok": False, "error": str(e), "traceback": traceback.format_exc()}
+        return _local_error(e)
 
 
 @mcp.tool()
+@pcap_tool(read_paths=["pcap_path"])
 def analyze_bluetooth(pcap_path: str, tshark_path: Optional[str] = None) -> Dict[str, Any]:
     """分析蓝牙流量,提取OBEX/L2CAP/GATT数据。能识别OBEX文件传输(文件名+会话),统计L2CAP和GATT交互次数"""
     try:
@@ -1620,10 +1805,11 @@ def analyze_bluetooth(pcap_path: str, tshark_path: Optional[str] = None) -> Dict
             "gatt_count": result["gatt_count"],
         }
     except Exception as e:
-        return {"ok": False, "error": str(e), "traceback": traceback.format_exc()}
+        return _local_error(e)
 
 
 @mcp.tool()
+@pcap_tool(read_paths=["pcap_path"])
 def analyze_mms(pcap_path: str, tshark_path: Optional[str] = None) -> Dict[str, Any]:
     """分析MMS协议流量,追踪InvokeID提取文件传输数据。适用于工控/SCADA流量,提取文件内容预览和文件名"""
     try:
@@ -1705,10 +1891,11 @@ def analyze_mms(pcap_path: str, tshark_path: Optional[str] = None) -> Dict[str, 
             "file_count": len(extracted_files),
         }
     except Exception as e:
-        return {"ok": False, "error": str(e), "traceback": traceback.format_exc()}
+        return _local_error(e)
 
 
 @mcp.tool()
+@pcap_tool(read_paths=["pcap_path"], requires_modules=[(list_rtp_streams, "rtp_analyzer")])
 def analyze_rtp(pcap_path: str, tshark_path: Optional[str] = None, export: bool = False) -> Dict[str, Any]:
     """分析RTP音视频流量,列出所有RTP流(SSRC/编码/媒体类型/时长)。当export=True时导出音频为WAV文件。
     RTP分析使用tshark,支持PCMU/PCMA/G722/G729等编码的自动转码。
@@ -1776,10 +1963,11 @@ def analyze_rtp(pcap_path: str, tshark_path: Optional[str] = None, export: bool 
         return result
 
     except Exception as e:
-        return {"ok": False, "error": str(e), "traceback": traceback.format_exc()}
+        return _local_error(e)
 
 
 @mcp.tool()
+@pcap_tool(read_paths=["pcap_path"], requires_modules=[(DNSCovertChannelAnalyzer, "protocol_analyzer")])
 def analyze_dns_covert(pcap_path: str, tshark_path: Optional[str] = None,
                        decode_mode: str = "auto", trigger_domain: str = "auto") -> Dict[str, Any]:
     """分析DNS隐蔽通道流量,提取子域名编码数据、TXT指令和域名统计。
@@ -1805,10 +1993,11 @@ def analyze_dns_covert(pcap_path: str, tshark_path: Optional[str] = None,
         return result
 
     except Exception as e:
-        return {"ok": False, "error": str(e), "traceback": traceback.format_exc()}
+        return _local_error(e)
 
 
 @mcp.tool()
+@pcap_tool(read_paths=["pcap_path"], requires_modules=[(CobaltStrikeAnalyzer, "protocol_analyzer")])
 def analyze_cobalt_strike(pcap_path: str, tshark_path: Optional[str] = None,
                           key_file_path: Optional[str] = None) -> Dict[str, Any]:
     """分析Cobalt Strike C2流量,提取HTTP Cookie中的Metadata。
@@ -1831,10 +2020,11 @@ def analyze_cobalt_strike(pcap_path: str, tshark_path: Optional[str] = None,
         return result
 
     except Exception as e:
-        return {"ok": False, "error": str(e), "traceback": traceback.format_exc()}
+        return _local_error(e)
 
 
 @mcp.tool()
+@pcap_tool()
 def decrypt_webshell(encrypted_data: str, shell_type: str = "auto", custom_key: Optional[str] = None) -> Dict[str, Any]:
     """解密冰蝎/哥斯拉加密流量"""
     try:
@@ -1906,10 +2096,11 @@ def decrypt_webshell(encrypted_data: str, shell_type: str = "auto", custom_key: 
     except ImportError:
         return {"ok": False, "error": "缺少 pycryptodome 依赖，请执行: pip install pycryptodome"}
     except Exception as e:
-        return {"ok": False, "error": str(e), "traceback": traceback.format_exc()}
+        return _local_error(e)
 
 
 @mcp.tool()
+@pcap_tool(read_paths=["pcap_path"], write_paths=[("output_path", "pcap_path")], requires_modules=[(fix_cap_to_pcap, "fix_pcap")])
 def fix_pcap(pcap_path: str, output_path: Optional[str] = None) -> Dict[str, Any]:
     """修复损坏的PCAP文件"""
     if fix_cap_to_pcap is None:
@@ -1924,8 +2115,17 @@ def fix_pcap(pcap_path: str, output_path: Optional[str] = None) -> Dict[str, Any
         # 标准 PCAP 全局头
         PCAP_GLOBAL_HEADER = b'\xd4\xc3\xb2\xa1\x02\x00\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\x00\x00\x01\x00\x00\x00'
 
+        # C4: 拒收超过 1GB 的文件,避免一次性 read 撑爆内存
+        try:
+            file_size = os.path.getsize(pcap_path)
+        except OSError as e:
+            return {"ok": False, "error": f"无法读取文件大小: {e}"}
+        if file_size > _MAX_FIX_PCAP_SIZE:
+            return {"ok": False,
+                    "error": f"文件超过 1GB 上限 ({file_size/1024/1024:.0f} MB),请用 Wireshark 先拆分"}
+
         with open(pcap_path, 'rb') as f:
-            raw_data = f.read(500 * 1024 * 1024)  # 最大读取 500MB
+            raw_data = f.read()
 
         # 查找第一个 IPv4 包
         first_packet_pos = raw_data.find(b'\x08\x00\x45')
@@ -1996,10 +2196,11 @@ def fix_pcap(pcap_path: str, output_path: Optional[str] = None) -> Dict[str, Any
             }
 
     except Exception as e:
-        return {"ok": False, "error": str(e), "traceback": traceback.format_exc()}
+        return _local_error(e)
 
 
 @mcp.tool()
+@pcap_tool(read_paths=["pcap_path"])
 def extract_files(pcap_path: str, tshark_path: Optional[str] = None, protocol: str = "http") -> Dict[str, Any]:
     """从流量提取文件(HTTP/IMF/SMB/TFTP)。可用 protocol 参数指定协议类型(http/imf/smb/tftp/dicom)。当 analyze_pcap 的 recommended_actions 提示时应调用此工具"""
     try:
@@ -2021,9 +2222,15 @@ def extract_files(pcap_path: str, tshark_path: Optional[str] = None, protocol: s
         output_dir = os.path.join(PROJECT_ROOT, "output", "extracted_files", base_name, protocol)
         os.makedirs(output_dir, exist_ok=True)
 
-        # 执行 tshark 提取
+        # 执行 tshark 提取 (C5: 加超时,防止恶意 pcap 挂死)
         cmd = [tshark, '-r', pcap_path, '--export-objects', f'{protocol},{output_dir}']
-        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='ignore')
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True,
+                                    encoding='utf-8', errors='ignore',
+                                    timeout=_TSHARK_DEFAULT_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return {"ok": False,
+                    "error": f"tshark 超时 ({_TSHARK_DEFAULT_TIMEOUT}s),文件可能损坏或过大"}
 
         # 列出提取的文件
         files = []
@@ -2045,7 +2252,7 @@ def extract_files(pcap_path: str, tshark_path: Optional[str] = None, protocol: s
         }
 
     except Exception as e:
-        return {"ok": False, "error": str(e), "traceback": traceback.format_exc()}
+        return _local_error(e)
 
 
 def main():

@@ -153,7 +153,7 @@ class AnalysisService(IAnalysisService):
         seen_hashes = set()  # 用于去重
 
         # 创建输出目录
-        export_dir = tempfile.mkdtemp(prefix="tinglan_http_")
+        export_dir = tempfile.mkdtemp(prefix=f"tinglan_http_{os.getpid()}_")
 
         print("[*] 分析 HTTP 响应元数据...")
         http_metadata = self._get_http_response_metadata(pcap_path)
