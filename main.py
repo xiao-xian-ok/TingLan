@@ -34,7 +34,7 @@ try:
         font = QFont("Microsoft YaHei", 10)
         app.setFont(font)
 
-        # --mock 走假数据，方便调UI
+
         service = None
         if "--mock" in sys.argv:
             from services.mock_service import MockAnalysisService
