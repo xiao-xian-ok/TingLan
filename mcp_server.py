@@ -13,6 +13,7 @@ import json
 import time
 import traceback
 import shutil
+import importlib
 from dataclasses import asdict, is_dataclass
 from typing import Any, Dict, List, Optional
 
@@ -41,10 +42,12 @@ def _import(name, *attrs):
         except: pass
     return (None,) * len(attrs) if attrs else None
 # Models
-try:
-    from models.detection_result import DetectionResult, DetectionType, ProtocolStats, AnalysisSummary, ExtractedFile
-except:
-    from detection_result import DetectionResult, DetectionType, ProtocolStats, AnalysisSummary, ExtractedFile
+_detection_models = importlib.import_module("models.detection_result")
+DetectionResult = _detection_models.DetectionResult
+DetectionType = _detection_models.DetectionType
+ProtocolStats = _detection_models.ProtocolStats
+AnalysisSummary = _detection_models.AnalysisSummary
+ExtractedFile = _detection_models.ExtractedFile
 
 # Core modules
 WebShellDetector = _import('webshell_detect', 'WebShellDetector')[0]
