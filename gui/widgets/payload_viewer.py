@@ -832,7 +832,22 @@ class BurpStyleViewer(QFrame):
                         lines.append(f"#     {dc_line}")
 
         # 响应数据
-        if detection.response_data:
+        restored_response = ""
+        if detection.raw_result and isinstance(detection.raw_result, dict):
+            try:
+                from core.http_reassembly import reconstruct_http_response_from_fields
+                if any(k in detection.raw_result for k in ("chunk-data", "chunk_data", "http.chunk_data")):
+                    restored_response = reconstruct_http_response_from_fields(detection.raw_result)
+            except Exception:
+                restored_response = ""
+
+        if restored_response:
+            lines.append("")
+            lines.append("HTTP Response")
+            if len(restored_response) > 50000:
+                restored_response = restored_response[:50000] + "\n... (截断)"
+            lines.append(restored_response)
+        elif detection.response_data:
             lines.append("")
             lines.append("HTTP Response")
             resp_str = str(detection.response_data)

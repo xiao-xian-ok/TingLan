@@ -13,7 +13,11 @@ DEFAULT_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "output")
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
-from utils import picture, hex_to_string, create_folder_if_not_exists
+from utils import picture, create_folder_if_not_exists
+try:
+    from core.http_reassembly import decode_http_body_text, reconstruct_http_response
+except ImportError:
+    from http_reassembly import decode_http_body_text, reconstruct_http_response
 
 logger = logging.getLogger(__name__)
 
@@ -71,10 +75,8 @@ def burp_format_request(packet, http_layer, output_folder: str = None, save_to_f
 
         body = ""
         if method in ('POST', 'PUT', 'PATCH'):
-            if hasattr(http_layer, 'file_data'):
-                body_data = http_layer.file_data
-                body = hex_to_string(body_data) if body_data else ""
-            elif hasattr(http_layer, 'request_body'):
+            body = decode_http_body_text(http_layer)
+            if not body and hasattr(http_layer, 'request_body'):
                 body = getattr(http_layer, 'request_body', '')
 
         request_str += "\n"
@@ -197,9 +199,9 @@ def extract_request_info(packet, http_layer) -> Dict[str, Any]:
         "body": None
     }
 
-    if hasattr(http_layer, 'file_data'):
-        body_data = http_layer.file_data
-        info["body"] = hex_to_string(body_data) if body_data else None
+    body = decode_http_body_text(http_layer)
+    if body:
+        info["body"] = body
     elif hasattr(http_layer, 'request_body'):
         info["body"] = getattr(http_layer, 'request_body', None)
 
@@ -218,8 +220,9 @@ def extract_response_info(packet, http_layer) -> Dict[str, Any]:
         "body": None
     }
 
-    if hasattr(http_layer, 'file_data'):
-        body_data = http_layer.file_data
-        info["body"] = hex_to_string(body_data) if body_data else None
+    body = decode_http_body_text(http_layer)
+    if body:
+        info["body"] = body
+        info["raw_response"] = reconstruct_http_response(http_layer)
 
     return info

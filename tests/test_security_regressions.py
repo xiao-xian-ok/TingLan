@@ -16,6 +16,12 @@ from core.safe_paths import (
     safe_unique_path,
     sanitize_filename,
 )
+from core.http_reassembly import (
+    decode_http_body_bytes,
+    decode_http_body_text,
+    reconstruct_http_response_from_fields,
+)
+from core.tshark_stream import PacketParser
 from core.tshark_fields import FIELD_SEPARATOR, parse_quoted_fields, split_fields
 
 
@@ -66,6 +72,67 @@ def test_tshark_quoted_field_parser_handles_complex_payload():
     line = FIELD_SEPARATOR.join(["1", f'"{escaped_payload}"', "3"])
 
     assert parse_quoted_fields(line, expected=3) == ["1", payload, "3"]
+
+
+class _FakeHttpLayer:
+    def __init__(self, **fields):
+        self._data = fields
+
+
+def test_http_reassembly_decodes_colon_separated_chunk_data():
+    layer = _FakeHttpLayer(
+        **{
+            "response-version": "HTTP/1.1",
+            "response-code": "200",
+            "chunk-data": "0a:0a:0a:3c:21:44:4f:43:54:59:50:45:20:68:74:6d:6c:3e",
+        }
+    )
+
+    assert decode_http_body_bytes(layer).startswith(b"\n\n\n<!DOCTYPE html>")
+    assert decode_http_body_text(layer).startswith("\n\n\n<!DOCTYPE html>")
+
+
+def test_http_reassembly_concatenates_multiple_chunk_fields():
+    layer = _FakeHttpLayer(
+        http_http_chunk_data=[
+            "3c:68:74:6d:6c:3e",
+            "3c:62:6f:64:79:3e",
+            "54:6f:6d:63:61:74",
+        ]
+    )
+
+    assert decode_http_body_text(layer) == "<html><body>Tomcat"
+
+
+def test_http_response_reconstruction_from_burp_style_fields():
+    restored = reconstruct_http_response_from_fields(
+        {
+            "response-version": "HTTP/1.1",
+            "response-code": "200",
+            "content-type": "text/html; charset=UTF-8",
+            "chunk-data": "3c:21:44:4f:43:54:59:50:45:20:68:74:6d:6c:3e",
+        }
+    )
+
+    assert restored.startswith("HTTP/1.1 200")
+    assert "Content-Type: text/html; charset=UTF-8" in restored
+    assert "<!DOCTYPE html>" in restored
+
+
+def test_tshark_ek_parser_uses_chunk_data_when_file_data_is_absent():
+    line = (
+        '{"layers":{"frame":{"frame_frame_number":["7"],"frame_frame_len":["128"],'
+        '"frame_frame_protocols":["eth:ip:tcp:http"]},'
+        '"ip":{"ip_ip_src":["10.0.0.2"],"ip_ip_dst":["10.0.0.1"]},'
+        '"tcp":{"tcp_tcp_srcport":["8080"],"tcp_tcp_dstport":["50000"],"tcp_tcp_stream":["3"]},'
+        '"http":{"http_http_response_code":["200"],'
+        '"http_http_chunk_data":["3c:68:31:3e:4f:4b:3c:2f:68:31:3e"]}}}'
+    )
+
+    packet = PacketParser.parse_ek_line(line)
+
+    assert packet is not None
+    assert packet.http_response_body == b"<h1>OK</h1>"
 
 
 def test_php_ast_detects_direct_tainted_sink():

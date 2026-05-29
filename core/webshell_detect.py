@@ -11,6 +11,10 @@ from urllib.parse import unquote
 
 from http_formatter import burp_format_request, hex_to_string
 from statistical_analyzer import StatisticalAnalyzer, StatisticalConfig
+try:
+    from core.http_reassembly import decode_http_body_text
+except ImportError:
+    from http_reassembly import decode_http_body_text
 
 logger = logging.getLogger(__name__)
 
@@ -853,15 +857,8 @@ def pair_http_requests_responses(packets: List) -> List[Dict]:
 
 def _get_request_body(http_layer) -> Optional[str]:
     """从HTTP层取请求体"""
-    if not hasattr(http_layer, 'file_data'):
-        return None
-
-    request_body = safe_decode(http_layer.file_data)
-    hex_converted = safe_hex_to_string(http_layer.file_data)
-    if hex_converted:
-        request_body = hex_converted
-
-    return request_body
+    body = decode_http_body_text(http_layer)
+    return body if body else None
 
 
 def _get_response_body(response_packet) -> Optional[str]:
@@ -870,15 +867,8 @@ def _get_response_body(response_packet) -> Optional[str]:
         return None
 
     http_layer = response_packet.http
-    if not hasattr(http_layer, 'file_data'):
-        return None
-
-    response_body = safe_decode(http_layer.file_data)
-    hex_converted = safe_hex_to_string(http_layer.file_data)
-    if hex_converted:
-        response_body = hex_converted
-
-    return response_body
+    body = decode_http_body_text(http_layer)
+    return body if body else None
 
 
 def _is_readable_text(text: str) -> bool:

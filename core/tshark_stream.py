@@ -19,8 +19,10 @@ from contextlib import contextmanager
 
 try:
     from core.tshark_fields import separator_arg
+    from core.http_reassembly import decode_http_body_bytes
 except ImportError:
     from tshark_fields import separator_arg
+    from http_reassembly import decode_http_body_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -86,9 +88,9 @@ class LayerWrapper:
                     return value[0]
                 return value
 
-        if name == 'file_data':
+        if name in ('file_data', 'chunk_data'):
             for key in self._data:
-                if 'file_data' in key.lower():
+                if name in key.lower():
                     value = self._data[key]
                     if isinstance(value, list) and len(value) > 0:
                         return value[0]
@@ -452,13 +454,8 @@ class PacketParser:
                 packet.http_user_agent = PacketParser._get_first(http, "http_http_user_agent", "")
                 packet.http_response_code = PacketParser._get_first(http, "http_http_response_code", "")
 
-                file_data = PacketParser._get_first(http, "http_http_file_data", "")
-                if file_data:
-                    try:
-                        body_bytes = bytes.fromhex(file_data.replace(":", ""))
-                    except:
-                        body_bytes = file_data.encode('utf-8', errors='ignore')
-
+                body_bytes = decode_http_body_bytes(LayerWrapper("http", http))
+                if body_bytes:
                     if packet.http_response_code and not packet.http_method:
                         packet.http_response_body = body_bytes
                     else:
