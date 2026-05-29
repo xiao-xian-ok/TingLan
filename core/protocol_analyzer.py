@@ -11,13 +11,56 @@ import hmac as hmac_mod
 import subprocess
 import tempfile
 import pathlib
+import sys
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field
 from collections import Counter, defaultdict
 from enum import Enum
 
+try:
+    from core.tshark_fields import separator_arg, split_fields
+    from core.safe_paths import iter_safe_child_files, safe_unique_path
+except ImportError:
+    from tshark_fields import separator_arg, split_fields
+    from safe_paths import iter_safe_child_files, safe_unique_path
+
 logger = logging.getLogger(__name__)
+
+
+def _prepare_tshark_args(args: List[str]) -> List[str]:
+    safe_args = list(args)
+    has_fields_output = any(
+        safe_args[i] == "-T" and safe_args[i + 1] == "fields"
+        for i in range(len(safe_args) - 1)
+    )
+    has_separator = any(str(arg).startswith("separator=") for arg in safe_args)
+    if has_fields_output and not has_separator:
+        safe_args.extend(["-E", separator_arg()])
+    return safe_args
+
+
+def _run_tshark_text(tshark_path: str, args: List[str], timeout: int = 180) -> str:
+    """统一执行 tshark，超时由 subprocess.run 负责回收，避免异常路径泄露子进程。"""
+    cmd = [tshark_path] + _prepare_tshark_args(args)
+    kwargs = {
+        "capture_output": True,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "timeout": timeout,
+    }
+    if sys.platform == "win32":
+        kwargs["creationflags"] = 0x08000000
+    try:
+        return subprocess.run(cmd, **kwargs).stdout or ""
+    except FileNotFoundError:
+        print(f"[!] 无法找到tshark: {tshark_path}")
+    except subprocess.TimeoutExpired:
+        logger.warning("tshark 执行超时: %s", " ".join(cmd[:8]))
+    except Exception as exc:
+        logger.warning("tshark 执行失败: %s", exc)
+    return ""
 
 
 # ============================================================
@@ -121,9 +164,10 @@ class ProtocolAnalyzer(ABC):
         USB/CS等需要文件路径的分析器可重写此方法。"""
         from utils import read_pcap
         cap = read_pcap(pcap_path)
-        packets = list(cap)
-        cap.close()
-        return self.analyze(packets, **kwargs)
+        try:
+            return self.analyze(cap, **kwargs)
+        finally:
+            cap.close()
 
     @staticmethod
     def bytes_to_ascii(values: List[int], replace_char: str = ".") -> str:
@@ -1435,10 +1479,10 @@ class CobaltStrikeAnalyzer(ProtocolAnalyzer):
         # ---- Stage 1: 提取 Cookie ----
         print(f"\n[*] [步骤1] 正在分析 PCAP: {os.path.basename(pcap_path)}")
         cap = read_pcap(pcap_path)
-        packets = list(cap)
-        cap.close()
-
-        stage1_result = self.analyze(packets)
+        try:
+            stage1_result = self.analyze(cap)
+        finally:
+            cap.close()
         findings.extend(stage1_result.findings)
         cookies_list = stage1_result.metadata.get('cookies', [])
         packet_count = stage1_result.packet_count
@@ -1757,11 +1801,15 @@ class USBAnalyzer(ProtocolAnalyzer):
         ]
 
         try:
-            process = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding='utf-8'
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=180,
             )
-            stdout, stderr = process.communicate()
+            stdout, stderr = result.stdout, result.stderr
         except FileNotFoundError:
             return ProtocolAnalysisResult(
                 protocol=ProtocolType.USB,
@@ -1956,17 +2004,7 @@ class TLSAnalyzer(ProtocolAnalyzer):
 
     @staticmethod
     def _run_tshark(tshark_path, args):
-        cmd = [tshark_path] + args
-        try:
-            process = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding='utf-8'
-            )
-            stdout, stderr = process.communicate()
-            return stdout
-        except FileNotFoundError:
-            print(f'[!] 无法找到tshark: {tshark_path}')
-            return ''
+        return _run_tshark_text(tshark_path, args)
 
     def extract_tls_handshake(self, pcap_file, tshark_path):
         """提取 TLS 握手信息: 版本、密码套件、SNI、证书"""
@@ -2266,15 +2304,26 @@ class TLSAnalyzer(ProtocolAnalyzer):
 
         cmd = [tshark_path, '-r', pcap_file] + extra_args + ['--export-objects', f'http,{output_dir}']
         try:
-            process = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding='utf-8'
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=180,
             )
-            _, stderr = process.communicate()
+            stderr = result.stderr
         except FileNotFoundError:
             return []
 
-        exported = [f for f in os.listdir(output_dir) if os.path.isfile(os.path.join(output_dir, f))]
+        exported = []
+        for fpath, fname in iter_safe_child_files(output_dir):
+            current_name = os.path.basename(fpath)
+            if current_name != fname:
+                target, fname = safe_unique_path(output_dir, fname)
+                os.replace(fpath, target)
+                fpath = target
+            exported.append(fname)
         if exported:
             print(f'[+] 解密后导出 {len(exported)} 个 HTTP 文件 -> {output_dir}')
             for fname in exported:
@@ -2652,18 +2701,7 @@ class RDPAnalyzer(ProtocolAnalyzer):
 
     @staticmethod
     def _run_tshark(tshark_path, args):
-        """执行 tshark 命令并返回 stdout"""
-        cmd = [tshark_path] + args
-        try:
-            process = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding='utf-8'
-            )
-            stdout, stderr = process.communicate()
-            return stdout
-        except FileNotFoundError:
-            print(f"[!] 无法找到tshark: {tshark_path}")
-            return ""
+        return _run_tshark_text(tshark_path, args)
 
     def extract_rdp_sessions(self, pcap_file, tshark_path):
         """提取 RDP 会话元数据: IP、端口、Cookie (含用户名)"""
@@ -3214,18 +3252,7 @@ class RedisAnalyzer(ProtocolAnalyzer):
 
     @staticmethod
     def _run_tshark(tshark_path, args):
-        """执行 tshark 命令并返回 stdout"""
-        cmd = [tshark_path] + args
-        try:
-            process = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding='utf-8'
-            )
-            stdout, stderr = process.communicate()
-            return stdout
-        except FileNotFoundError:
-            print(f"[!] 无法找到tshark: {tshark_path}")
-            return ""
+        return _run_tshark_text(tshark_path, args)
 
     @staticmethod
     def _parse_resp(data):
@@ -3739,18 +3766,7 @@ class SMBAnalyzer(ProtocolAnalyzer):
 
     @staticmethod
     def _run_tshark(tshark_path, args):
-        """执行 tshark 命令并返回 stdout"""
-        cmd = [tshark_path] + args
-        try:
-            process = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding='utf-8'
-            )
-            stdout, stderr = process.communicate()
-            return stdout
-        except FileNotFoundError:
-            print(f"[!] 无法找到tshark: {tshark_path}")
-            return ""
+        return _run_tshark_text(tshark_path, args)
 
     def extract_smb_credentials(self, pcap_file, tshark_path):
         """提取 NTLMSSP 凭证，区分 NTLMv1 和 NTLMv2
@@ -3879,17 +3895,28 @@ class SMBAnalyzer(ProtocolAnalyzer):
 
             cmd = [tshark_path, "-r", pcap_file, "--export-objects", f"{proto},{proto_dir}"]
             try:
-                process = subprocess.Popen(
-                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True, encoding='utf-8'
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                    timeout=180,
                 )
-                _, stderr = process.communicate()
+                stderr = result.stderr
             except FileNotFoundError:
                 print(f"[!] 无法找到tshark: {tshark_path}")
                 continue
 
             # 列出导出的文件
-            exported = [f for f in os.listdir(proto_dir) if os.path.isfile(os.path.join(proto_dir, f))]
+            exported = []
+            for fpath, fname in iter_safe_child_files(proto_dir):
+                current_name = os.path.basename(fpath)
+                if current_name != fname:
+                    target, fname = safe_unique_path(proto_dir, fname)
+                    os.replace(fpath, target)
+                    fpath = target
+                exported.append(fname)
             if exported:
                 print(f"[+] {proto.upper()} 导出 {len(exported)} 个文件 -> {proto_dir}")
                 for fname in exported:
@@ -4049,18 +4076,7 @@ class SSHAnalyzer(ProtocolAnalyzer):
 
     @staticmethod
     def _run_tshark(tshark_path, args):
-        """执行 tshark 命令并返回 stdout"""
-        cmd = [tshark_path] + args
-        try:
-            process = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding='utf-8'
-            )
-            stdout, stderr = process.communicate()
-            return stdout
-        except FileNotFoundError:
-            print(f"[!] 无法找到tshark: {tshark_path}")
-            return ""
+        return _run_tshark_text(tshark_path, args)
 
     def extract_ssh_sessions(self, pcap_file, tshark_path):
         """提取 SSH 会话元数据: banner、IP、端口、算法协商"""
@@ -4668,42 +4684,11 @@ class ProtocolAnalyzerManager:
         return results
 
     def analyze_all_pcap(self, pcap_path: str, **kwargs) -> Dict[ProtocolType, ProtocolAnalysisResult]:
-        """对pcap文件运行所有注册分析器（只读取一次pcap）"""
-        from utils import read_pcap
-
-        # 读取一次 pcap，共享给所有分析器
-        cap = read_pcap(pcap_path)
-        packets = list(cap)
-        cap.close()
-
+        """对pcap文件运行所有注册分析器，避免一次性物化全部数据包。"""
         results = {}
         for protocol, analyzer in self._analyzers.items():
             try:
-                if protocol == ProtocolType.USB:
-                    # USB 需要 tshark，必须走 analyze_pcap
-                    result = analyzer.analyze_pcap(pcap_path, **kwargs)
-                elif protocol == ProtocolType.COBALT_STRIKE:
-                    # CS analyze_pcap 有完整4阶段，优先使用
-                    result = analyzer.analyze_pcap(pcap_path, **kwargs)
-                elif protocol == ProtocolType.TLS:
-                    # TLS 需要 tshark，必须走 analyze_pcap
-                    result = analyzer.analyze_pcap(pcap_path, **kwargs)
-                elif protocol == ProtocolType.RDP:
-                    # RDP 需要 tshark，必须走 analyze_pcap
-                    result = analyzer.analyze_pcap(pcap_path, **kwargs)
-                elif protocol == ProtocolType.REDIS:
-                    # Redis 需要 tshark，必须走 analyze_pcap
-                    result = analyzer.analyze_pcap(pcap_path, **kwargs)
-                elif protocol == ProtocolType.SMB:
-                    # SMB 需要 tshark，必须走 analyze_pcap
-                    result = analyzer.analyze_pcap(pcap_path, **kwargs)
-                elif protocol == ProtocolType.SSH:
-                    # SSH 需要 tshark，必须走 analyze_pcap
-                    result = analyzer.analyze_pcap(pcap_path, **kwargs)
-                else:
-                    # 其余分析器复用已加载的 packets
-                    result = analyzer.analyze(packets, **kwargs)
-
+                result = analyzer.analyze_pcap(pcap_path, **kwargs)
                 if result and result.packet_count > 0:
                     results[protocol] = result
             except NotImplementedError:
@@ -4762,18 +4747,12 @@ def analyze_ssh_pcap(pcap_path: str, **kwargs) -> ProtocolAnalysisResult:
 
 
 if __name__ == '__main__':
-    from utils import read_pcap
-
     file_path = input("请输入pcap文件路径: ").strip('"')
     print(f"[*] 正在分析: {file_path}，请稍候...")
 
     try:
-        cap = read_pcap(file_path)
-        pkts = list(cap)
-        cap.close()
-
         print("\n" + "=" * 20 + " ICMP 自动化综合分析 " + "=" * 20)
-        result = analyze_icmp(pkts)
+        result = ICMPAnalyzer().analyze_pcap(file_path)
 
         print(f"\n分析完成，共处理 {result.packet_count} 个ICMP包")
         print(f"摘要: {result.summary}")

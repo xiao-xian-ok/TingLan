@@ -41,6 +41,8 @@ from core.tshark_stream import (
 )
 
 from core.attack_detector import AttackDetector
+from core.safe_paths import iter_safe_child_files, safe_unique_path
+from core.tshark_fields import separator_arg, split_fields
 
 
 class AnalysisService(IAnalysisService):
@@ -189,10 +191,12 @@ class AnalysisService(IAnalysisService):
                 files = os.listdir(export_dir)
                 print(f"[*] tshark 导出了 {len(files)} 个原始对象")
 
-                for filename in files:
-                    filepath = os.path.join(export_dir, filename)
-                    if not os.path.isfile(filepath):
-                        continue
+                for filepath, filename in iter_safe_child_files(export_dir):
+                    current_name = os.path.basename(filepath)
+                    if current_name != filename:
+                        target, filename = safe_unique_path(export_dir, filename)
+                        os.replace(filepath, target)
+                        filepath = target
 
                     # 使用智能清洗过滤
                     ef = self._smart_filter_file(filepath, filename, pcap_path, real_file_downloads)
@@ -250,7 +254,7 @@ class AnalysisService(IAnalysisService):
                 "-e", "http.content_disposition",
                 "-e", "http.request.uri",
                 "-e", "http.host",
-                "-E", "separator=|||",
+                "-E", separator_arg(),
                 "-E", "quote=n"
             ]
 
@@ -266,7 +270,7 @@ class AnalysisService(IAnalysisService):
             for line in result.stdout.strip().split('\n'):
                 if not line:
                     continue
-                parts = line.split('|||')
+                parts = split_fields(line, expected=7)
                 if len(parts) >= 4:
                     metadata_list.append({
                         "frame_number": int(parts[0]) if parts[0].isdigit() else 0,
@@ -836,7 +840,7 @@ class AnalysisService(IAnalysisService):
                 ext = self._get_extension_from_content_type(ct)
                 filename = f"frame_{frame_num}.{ext}"
 
-            filepath = os.path.join(output_dir, filename)
+            filepath, filename = safe_unique_path(output_dir, filename, fallback=f"frame_{frame_num}.bin")
 
             with open(filepath, 'wb') as f:
                 f.write(file_data)

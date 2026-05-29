@@ -893,6 +893,28 @@ class AnalysisSummary:
         return len(self.detections)
 
     @property
+    def high_confidence_count(self) -> int:
+        return self._confidence_count("high")
+
+    @property
+    def medium_confidence_count(self) -> int:
+        return self._confidence_count("medium")
+
+    @property
+    def low_confidence_count(self) -> int:
+        return self._confidence_count("low")
+
+    def _confidence_count(self, level: str) -> int:
+        count = 0
+        for detection in self.detections:
+            if str(getattr(detection, "confidence", "")).lower() == level:
+                count += 1
+        for detection in self.attack_detections:
+            if str(getattr(detection, "confidence", "")).lower() == level:
+                count += 1
+        return count
+
+    @property
     def detection_by_type(self) -> Dict[DetectionType, List[DetectionResult]]:
         grouped = {}
         for det in self.detections:

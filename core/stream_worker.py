@@ -988,10 +988,8 @@ class StreamAnalysisWorker(QThread):
 
         try:
             from core.auto_decoder import MagicDecoder
-            from core.cyberchef_bridge import CyberChefBridge
 
-            bridge = CyberChefBridge()
-            decoder = MagicDecoder(bridge=bridge if bridge.is_available() else None)
+            decoder = MagicDecoder()
 
             total = len(detections)
             for i, detection in enumerate(detections):

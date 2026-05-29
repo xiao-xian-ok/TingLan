@@ -85,6 +85,8 @@ import uuid
 import atexit
 import functools
 import inspect
+from core.safe_paths import iter_safe_child_files, safe_unique_path
+from core.tshark_fields import parse_quoted_fields, separator_arg
 
 LOG_DIR = os.path.join(PROJECT_ROOT, "logs")
 try:
@@ -376,7 +378,7 @@ def _detect_attacks_ek(pcap_path, tshark_path, max_packets=0):
                "-e", "frame.number", "-e", "http.request.method", "-e", "http.request.uri",
                "-e", "http.host", "-e", "http.content_type", "-e", "http.user_agent",
                "-e", "http.file_data", "-e", "ip.src", "-e", "ip.dst",
-               "-E", "separator=\t", "-E", "quote=d"]
+               "-E", separator_arg(), "-E", "quote=d"]
 
         result = subprocess.run(cmd, capture_output=True, text=True,
                                 encoding='utf-8', errors='replace', timeout=300)
@@ -388,7 +390,7 @@ def _detect_attacks_ek(pcap_path, tshark_path, max_packets=0):
         for line in result.stdout.strip().split('\n'):
             if not line.strip(): continue
             try:
-                fields = next(csv.reader(io.StringIO(line), delimiter='\t', quotechar='"'))
+                fields = parse_quoted_fields(line)
                 if len(fields) < 7: continue
 
                 frame, method, uri = fields[0].strip(), fields[1].strip(), fields[2].strip()
@@ -1115,7 +1117,7 @@ def _analyze_cobalt_strike(pcap_path, tshark_path, key_file_path=None):
             }
 
         # Stage 2-4: 仅当提供 key_file_path 时执行完整解密
-        # 注意：不能调用 analyzer.analyze_pcap()，因为它内部调用 list(cap) 会触发事件循环冲突
+            # 注意：这里保持当前线程内逐包处理，避免 pyshark 事件循环冲突。
         if key_file_path and os.path.exists(key_file_path):
             base_name = os.path.splitext(os.path.basename(pcap_path))[0]
             output_dir = os.path.join(PROJECT_ROOT, "output", "cs_analysis", base_name)
@@ -2235,14 +2237,20 @@ def extract_files(pcap_path: str, tshark_path: Optional[str] = None, protocol: s
         # 列出提取的文件
         files = []
         if os.path.exists(output_dir):
-            for filename in os.listdir(output_dir):
-                filepath = os.path.join(output_dir, filename)
-                if os.path.isfile(filepath):
+            for filepath, safe_name in iter_safe_child_files(output_dir):
+                try:
+                    current_name = os.path.basename(filepath)
+                    if current_name != safe_name:
+                        target, safe_name = safe_unique_path(output_dir, safe_name)
+                        os.replace(filepath, target)
+                        filepath = target
                     files.append({
-                        "filename": filename,
+                        "filename": safe_name,
                         "size": os.path.getsize(filepath),
                         "path": filepath,
                     })
+                except Exception as e:
+                    logger.warning("skip unsafe extracted file %s: %s", filepath, e)
 
         return {
             "ok": True,

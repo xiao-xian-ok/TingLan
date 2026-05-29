@@ -17,6 +17,11 @@ from enum import Enum
 from queue import Queue, Empty
 from contextlib import contextmanager
 
+try:
+    from core.tshark_fields import separator_arg
+except ImportError:
+    from tshark_fields import separator_arg
+
 logger = logging.getLogger(__name__)
 
 
@@ -542,7 +547,7 @@ class TsharkProcessHandler:
             cmd.extend(["-T", "fields"])
             for field in config.fields:
                 cmd.extend(["-e", field])
-            cmd.extend(["-E", "separator=|"])
+            cmd.extend(["-E", separator_arg()])
 
         for port, protocol in config.decode_as.items():
             cmd.extend(["-d", f"tcp.port=={port},{protocol}"])

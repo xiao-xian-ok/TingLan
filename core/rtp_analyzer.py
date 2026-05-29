@@ -9,6 +9,11 @@ import logging
 import subprocess
 from typing import List, Dict, Optional, Tuple
 
+try:
+    from core.tshark_fields import separator_arg, split_fields
+except ImportError:
+    from tshark_fields import separator_arg, split_fields
+
 logger = logging.getLogger(__name__)
 
 _working_heuristic: Optional[List[str]] = None
@@ -139,6 +144,7 @@ def _stream_tshark_payload(cmd: List[str], timeout: int = 300) -> bytes:
         popen_kwargs["creationflags"] = 0x08000000
 
     buf = bytearray()
+    proc = None
     try:
         proc = subprocess.Popen(cmd, **popen_kwargs)
         try:
@@ -150,9 +156,19 @@ def _stream_tshark_payload(cmd: List[str], timeout: int = 300) -> bytes:
                     except ValueError:
                         pass
         finally:
-            proc.stdout.close()
-            proc.wait(timeout=10)
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=10)
     except Exception as e:
+        if proc and proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
         raise RuntimeError(f"tshark 流式读取失败: {e}")
 
     return bytes(buf)
@@ -393,7 +409,7 @@ def export_rtp_streams_batch(
         cmd = [tshark_path, "-r", pcap_path,
                "-Y", ssrc_filter,
                "-T", "fields", "-e", "rtp.ssrc", "-e", "rtp.payload",
-               "-E", "separator=\t"] + heuristic
+               "-E", separator_arg()] + heuristic
 
         if progress_cb:
             est = min((batch_idx + 1) * total_streams // total_batches, total_streams)
@@ -408,10 +424,11 @@ def export_rtp_streams_batch(
                         break
 
                     line = raw_line.decode("utf-8", errors="replace").strip()
-                    if not line or '\t' not in line:
+                    if not line:
                         continue
 
-                    ssrc_val, hex_payload = line.split('\t', 1)
+                    fields = split_fields(line, expected=2)
+                    ssrc_val, hex_payload = fields[0], fields[1]
                     norm_ssrc = _normalize_ssrc(ssrc_val)
                     hex_str = hex_payload.strip().replace(":", "")
 
@@ -421,8 +438,15 @@ def export_rtp_streams_batch(
                         except ValueError:
                             pass
             finally:
-                proc.stdout.close()
-                proc.wait(timeout=30)
+                if proc.stdout:
+                    proc.stdout.close()
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=10)
                 if proc.returncode:
                     logger.debug(f"tshark batch {batch_idx} rc={proc.returncode}")
         except Exception as e:

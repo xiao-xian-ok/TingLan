@@ -33,12 +33,16 @@ def _extract_base64_images(pcap_file, output_dir):
         "-e", "mms.filedata",
     ]
     try:
-        process = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding='utf-8'
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            timeout=120,
         )
-        stdout, _ = process.communicate()
-    except FileNotFoundError:
+        stdout = result.stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired):
         return []
 
     # 把所有 filedata hex 拼接, 转为字节再解码为文本

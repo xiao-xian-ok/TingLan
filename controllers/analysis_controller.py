@@ -38,6 +38,8 @@ from models.detection_result import (
 )
 
 from services.interfaces import IAnalysisService
+from core.safe_paths import iter_safe_child_files, safe_unique_path
+from core.tshark_fields import parse_quoted_fields, separator_arg, split_fields
 
 
 @dataclass
@@ -352,10 +354,14 @@ class AnalysisWorker(QThread):
             subprocess.run(cmd, capture_output=True, timeout=60)
 
             if os.path.exists(export_dir):
-                for filename in os.listdir(export_dir):
-                    filepath = os.path.join(export_dir, filename)
-                    if os.path.isfile(filepath):
-                        ext = os.path.splitext(filename)[1].lower()
+                for filepath, safe_name in iter_safe_child_files(export_dir):
+                    try:
+                        current_name = os.path.basename(filepath)
+                        if current_name != safe_name:
+                            target, safe_name = safe_unique_path(export_dir, safe_name)
+                            os.replace(filepath, target)
+                            filepath = target
+                        ext = os.path.splitext(safe_name)[1].lower()
                         content_type = self._guess_content_type(ext)
 
                         if content_type == "text/html":
@@ -363,7 +369,7 @@ class AnalysisWorker(QThread):
 
                         ef = ExtractedFile(
                             file_path=filepath,
-                            file_name=filename,
+                            file_name=safe_name,
                             file_type=self._get_file_type(ext),
                             file_size=os.path.getsize(filepath),
                             source_packet=0,
@@ -374,6 +380,8 @@ class AnalysisWorker(QThread):
 
                         if len(extracted_files) >= 100:
                             break
+                    except Exception as e:
+                        logger.warning("skip unsafe HTTP export %s: %s", filepath, e)
 
             self.progress.emit(22, f"提取了 {len(extracted_files)} 个HTTP对象")
 
@@ -421,7 +429,7 @@ class AnalysisWorker(QThread):
                 "-e", "data.data",
                 "-e", "ip.src",
                 "-e", "ip.dst",
-                "-E", "separator=|"
+                "-E", separator_arg()
             ]
 
             result = subprocess.run(
@@ -447,7 +455,7 @@ class AnalysisWorker(QThread):
                     self.progress.emit(25 + int((i / max(len(lines), 1)) * 12),
                                        f"ICMP分析中... ({i}/{len(lines)})")
 
-                parts = line.split('|')
+                parts = split_fields(line)
                 if len(parts) >= 4:
                     try:
                         icmp_data = ICMPPacketData(
@@ -543,7 +551,7 @@ class AnalysisWorker(QThread):
                 "-e", "http.file_data",
                 "-e", "ip.src",
                 "-e", "ip.dst",
-                "-E", "separator=|",
+                "-E", separator_arg(),
                 "-E", "quote=d"
             ]
 
@@ -653,8 +661,7 @@ class AnalysisWorker(QThread):
 
         try:
             # 使用 CSV reader 处理带引号的字段
-            reader = csv.reader(io.StringIO(line), delimiter='|', quotechar='"')
-            fields = next(reader)
+            fields = parse_quoted_fields(line)
 
             if len(fields) < 7:
                 return None
@@ -698,7 +705,7 @@ class AnalysisWorker(QThread):
                 "-e", "http.host",
                 "-e", "http.content_type",
                 "-e", "http.file_data",
-                "-E", "separator=|"
+                "-E", separator_arg()
             ]
 
             self.progress.emit(67, "正在提取POST请求进行Webshell检测...")
@@ -733,7 +740,7 @@ class AnalysisWorker(QThread):
                                        f"Webshell检测中... ({i}/{len(lines)})")
 
                 try:
-                    parts = line.split('|')
+                    parts = split_fields(line)
                     if len(parts) < 6:
                         continue
 
@@ -785,14 +792,12 @@ class AnalysisWorker(QThread):
 
     def _run_auto_decoding(self, detections: List[DetectionResult]) -> List[AutoDecodingResult]:
         from core.auto_decoder import MagicDecoder
-        from core.cyberchef_bridge import CyberChefBridge
         from urllib.parse import urlparse, parse_qs, unquote
 
         results: List[AutoDecodingResult] = []
 
         try:
-            bridge = CyberChefBridge()
-            decoder = MagicDecoder(bridge=bridge if bridge.is_available() else None)
+            decoder = MagicDecoder()
 
             total = len(detections)
             for i, detection in enumerate(detections):

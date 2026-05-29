@@ -20,9 +20,7 @@ def analyze_icmp_interactive():
     print(f"[*] 正在分析: {file_path}，请稍候...")
 
     try:
-        cap = read_pcap(file_path)
-        pkts = list(cap)
-        cap.close()
+        pkts = read_pcap(file_path)
 
         print("\n" + "=" * 20 + " ICMP 自动化综合分析 " + "=" * 20)
         result = analyze_icmp(pkts)
