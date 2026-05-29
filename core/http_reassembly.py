@@ -137,12 +137,104 @@ def decode_http_body_text(http_layer: Any) -> str:
     body = decode_http_body_bytes(http_layer)
     if not body:
         return ""
-    content_type = ""
-    try:
-        content_type = getattr(http_layer, "content_type", "") or ""
-    except Exception:
-        content_type = ""
+    content_type = _first_text(http_layer, "content_type")
     return body.decode(_charset_from_content_type(content_type), errors="replace")
+
+
+def restore_visible_escapes(text: str) -> str:
+    """Convert visible ``\\n``/``\\t`` sequences to real control characters for display."""
+    if not text:
+        return text
+
+    escaped_count = sum(text.count(seq) for seq in ("\\r\\n", "\\n", "\\r", "\\t"))
+    if escaped_count == 0:
+        return text
+
+    actual_breaks = text.count("\n") + text.count("\r") + text.count("\t")
+    looks_like_dumped_text = actual_breaks == 0 or text.lstrip().startswith(("\\n", "\\r\\n"))
+    looks_like_html = bool(re.search(r"\\n\s*<|<!DOCTYPE|<html\b", text, re.IGNORECASE))
+    if not (looks_like_dumped_text or looks_like_html):
+        return text
+
+    return (
+        text.replace("\\r\\n", "\n")
+        .replace("\\n", "\n")
+        .replace("\\r", "\n")
+        .replace("\\t", "    ")
+    )
+
+
+_VOID_HTML_TAGS = {
+    "area", "base", "br", "col", "embed", "hr", "img", "input",
+    "link", "meta", "param", "source", "track", "wbr",
+}
+
+
+def _html_tag_name(tag: str) -> str:
+    match = re.match(r"</?\s*([a-zA-Z0-9:-]+)", tag)
+    return match.group(1).lower() if match else ""
+
+
+def _looks_like_html(text: str, content_type: str = "") -> bool:
+    if "html" in (content_type or "").lower():
+        return True
+    return bool(re.search(r"<!DOCTYPE\s+html|<html\b|<body\b", text, re.IGNORECASE))
+
+
+def _pretty_print_html(text: str) -> str:
+    text = text.strip()
+    if not text:
+        return text
+
+    # Split adjacent tags even when the server sent minified HTML.
+    text = re.sub(r">\s*<", ">\n<", text)
+    tokens = [token for token in re.split(r"(<[^>]+>)", text) if token and token.strip()]
+
+    lines: List[str] = []
+    indent = 0
+    for token in tokens:
+        stripped = token.strip()
+        if not stripped:
+            continue
+
+        if stripped.startswith("<"):
+            tag_name = _html_tag_name(stripped)
+            is_close = stripped.startswith("</")
+            is_comment_or_decl = stripped.startswith(("<!--", "<!", "<?"))
+            is_self_closing = (
+                stripped.endswith("/>")
+                or tag_name in _VOID_HTML_TAGS
+                or is_comment_or_decl
+            )
+
+            if is_close:
+                indent = max(indent - 1, 0)
+
+            lines.append(f"{'  ' * indent}{stripped}")
+
+            if not is_close and not is_self_closing:
+                indent += 1
+        else:
+            for part in stripped.splitlines():
+                part = part.strip()
+                if part:
+                    lines.append(f"{'  ' * indent}{part}")
+
+    return "\n".join(lines)
+
+
+def format_http_body_for_display(text: str, content_type: str = "") -> str:
+    """Make decoded HTTP bodies readable without changing detection semantics."""
+    if not text:
+        return text
+
+    text = restore_visible_escapes(text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    if _looks_like_html(text, content_type):
+        return _pretty_print_html(text)
+
+    return text
 
 
 def reconstruct_http_response(http_layer: Any, include_body: bool = True) -> str:
@@ -169,7 +261,7 @@ def reconstruct_http_response(http_layer: Any, include_body: bool = True) -> str
     if include_body:
         body = decode_http_body_text(http_layer)
         if body:
-            lines.append(body)
+            lines.append(format_http_body_for_display(body, headers.get("Content-Type", "")))
 
     return "\r\n".join(lines)
 

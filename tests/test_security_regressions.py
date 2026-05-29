@@ -19,6 +19,7 @@ from core.safe_paths import (
 from core.http_reassembly import (
     decode_http_body_bytes,
     decode_http_body_text,
+    format_http_body_for_display,
     reconstruct_http_response_from_fields,
 )
 from core.tshark_stream import PacketParser
@@ -117,6 +118,28 @@ def test_http_response_reconstruction_from_burp_style_fields():
     assert restored.startswith("HTTP/1.1 200")
     assert "Content-Type: text/html; charset=UTF-8" in restored
     assert "<!DOCTYPE html>" in restored
+
+
+def test_http_display_restores_visible_newline_and_tab_escapes():
+    display = format_http_body_for_display("\\n\\t<!DOCTYPE html>\\n<html><body>OK</body></html>")
+
+    assert "\\n" not in display
+    assert display.startswith("<!DOCTYPE html>\n<html>")
+    assert "\n  <body>" in display
+
+
+def test_http_display_pretty_prints_minified_html():
+    display = format_http_body_for_display("<html><body><h1>Tomcat</h1></body></html>", "text/html")
+
+    assert display.splitlines() == [
+        "<html>",
+        "  <body>",
+        "    <h1>",
+        "      Tomcat",
+        "    </h1>",
+        "  </body>",
+        "</html>",
+    ]
 
 
 def test_tshark_ek_parser_uses_chunk_data_when_file_data_is_absent():

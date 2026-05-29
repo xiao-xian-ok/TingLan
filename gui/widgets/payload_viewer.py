@@ -855,6 +855,11 @@ class BurpStyleViewer(QFrame):
                 lines.append("[Binary Data - Hex Dump]")
                 lines.append(format_binary_as_hex(resp_str, max_bytes=4096))
             else:
+                try:
+                    from core.http_reassembly import format_http_body_for_display
+                    resp_str = format_http_body_for_display(resp_str)
+                except Exception:
+                    pass
                 if len(resp_str) > 50000:
                     resp_str = resp_str[:50000] + "\n... (截断)"
                 lines.append(resp_str)
@@ -866,6 +871,11 @@ class BurpStyleViewer(QFrame):
                 lines.append("[Binary Data - Hex Dump]")
                 lines.append(format_binary_as_hex(sample_str, max_bytes=4096))
             else:
+                try:
+                    from core.http_reassembly import format_http_body_for_display
+                    sample_str = format_http_body_for_display(sample_str)
+                except Exception:
+                    pass
                 if len(sample_str) > 50000:
                     sample_str = sample_str[:50000] + "\n... (截断)"
                 lines.append(sample_str)
