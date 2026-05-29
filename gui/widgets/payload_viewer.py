@@ -856,8 +856,11 @@ class BurpStyleViewer(QFrame):
                 lines.append(format_binary_as_hex(resp_str, max_bytes=4096))
             else:
                 try:
-                    from core.http_reassembly import format_http_body_for_display
-                    resp_str = format_http_body_for_display(resp_str)
+                    from core.http_reassembly import (
+                        format_http_body_for_display,
+                        reconstruct_http_response_from_text_dump,
+                    )
+                    resp_str = reconstruct_http_response_from_text_dump(resp_str) or format_http_body_for_display(resp_str)
                 except Exception:
                     pass
                 if len(resp_str) > 50000:
@@ -872,8 +875,11 @@ class BurpStyleViewer(QFrame):
                 lines.append(format_binary_as_hex(sample_str, max_bytes=4096))
             else:
                 try:
-                    from core.http_reassembly import format_http_body_for_display
-                    sample_str = format_http_body_for_display(sample_str)
+                    from core.http_reassembly import (
+                        format_http_body_for_display,
+                        reconstruct_http_response_from_text_dump,
+                    )
+                    sample_str = reconstruct_http_response_from_text_dump(sample_str) or format_http_body_for_display(sample_str)
                 except Exception:
                     pass
                 if len(sample_str) > 50000:

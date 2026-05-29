@@ -250,6 +250,7 @@ def reconstruct_http_response(http_layer: Any, include_body: bool = True) -> str
         "Content-Type": _first_text(http_layer, "content_type"),
         "Content-Length": _first_text(http_layer, "content_length"),
         "Transfer-Encoding": _first_text(http_layer, "transfer_encoding"),
+        "Date": _first_text(http_layer, "date"),
         "Server": _first_text(http_layer, "server"),
         "Set-Cookie": _first_text(http_layer, "set_cookie"),
     }
@@ -273,3 +274,49 @@ def reconstruct_http_response_from_fields(fields: dict, include_body: bool = Tru
             self._data = data
 
     return reconstruct_http_response(_MappingLayer(fields or {}), include_body=include_body)
+
+
+def parse_http_field_dump(text: str) -> dict:
+    """Parse Wireshark-style HTTP field dump text into a field dictionary."""
+    fields = {}
+    if not text:
+        return fields
+
+    for raw_line in str(text).splitlines():
+        line = raw_line.strip()
+        if not line or line.lower() == "http response":
+            continue
+
+        status_match = re.match(r"^(HTTP/\d(?:\.\d)?)\s+(\d{3})(?:\s+(.*))?$", line)
+        if status_match:
+            fields.setdefault("response-version", status_match.group(1))
+            fields.setdefault("response-code", status_match.group(2))
+            if status_match.group(3):
+                fields.setdefault("response-code-desc", status_match.group(3))
+            continue
+
+        match = re.match(r"^([A-Za-z0-9_.-]+):\s*(.*)$", line)
+        if not match:
+            continue
+
+        key, value = match.group(1), match.group(2)
+        # Keep repeated chunk-data fields in order; tshark may emit one per chunk.
+        if key in fields:
+            if isinstance(fields[key], list):
+                fields[key].append(value)
+            else:
+                fields[key] = [fields[key], value]
+        else:
+            fields[key] = value
+
+    return fields
+
+
+def reconstruct_http_response_from_text_dump(text: str, include_body: bool = True) -> str:
+    """Reconstruct HTTP response from text containing lines like ``chunk-data: 0a:3c``."""
+    fields = parse_http_field_dump(text)
+    if not fields:
+        return ""
+    if not any(_normalized_field(key).endswith("chunkdata") for key in fields):
+        return ""
+    return reconstruct_http_response_from_fields(fields, include_body=include_body)

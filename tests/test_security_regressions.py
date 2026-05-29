@@ -21,6 +21,7 @@ from core.http_reassembly import (
     decode_http_body_text,
     format_http_body_for_display,
     reconstruct_http_response_from_fields,
+    reconstruct_http_response_from_text_dump,
 )
 from core.tshark_stream import PacketParser
 from core.tshark_fields import FIELD_SEPARATOR, parse_quoted_fields, split_fields
@@ -118,6 +119,32 @@ def test_http_response_reconstruction_from_burp_style_fields():
     assert restored.startswith("HTTP/1.1 200")
     assert "Content-Type: text/html; charset=UTF-8" in restored
     assert "<!DOCTYPE html>" in restored
+
+
+def test_http_response_reconstruction_from_wireshark_field_dump_text():
+    dump = "\n".join([
+        "HTTP Response",
+        "HTTP/1.1 200",
+        "time: 0.002177000",
+        "response-code-desc: OK",
+        "request-in: 132430",
+        "chunk-boundary: 0d:0a",
+        "transfer-encoding: chunked",
+        "date: Sat, 22 Feb 2025 07:47:13 GMT",
+        "response-number: 1",
+        "response-version: HTTP/1.1",
+        "chunk-data: 0a:0a:0a:3c:21:44:4f:43:54:59:50:45:20:68:74:6d:6c:3e:0a:3c:68:74:6d:6c:3e:3c:62:6f:64:79:3e:54:6f:6d:63:61:74:3c:2f:62:6f:64:79:3e:3c:2f:68:74:6d:6c:3e",
+    ])
+
+    restored = reconstruct_http_response_from_text_dump(dump)
+
+    assert restored.startswith("HTTP/1.1 200 OK")
+    assert "Transfer-Encoding: chunked" in restored
+    assert "Date: Sat, 22 Feb 2025 07:47:13 GMT" in restored
+    assert "chunk-data:" not in restored
+    assert "<!DOCTYPE html>" in restored
+    assert "\n<html>" in restored
+    assert "\n  <body>" in restored
 
 
 def test_http_display_restores_visible_newline_and_tab_escapes():
