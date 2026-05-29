@@ -32,6 +32,7 @@ from core.display_safety import (
     is_binary_or_corrupt_text,
     safe_display_text as _safe_display_text,
 )
+from core.protocol_display import format_protocol_raw_values
 
 
 def is_binary_data(data: str, threshold: float = 0.3) -> bool:
@@ -1291,56 +1292,7 @@ class ProtocolFindingViewer(QFrame):
             lines.append("")
 
         if finding.raw_values:
-            # 检测是否为二进制序列（全是0和1）
-            is_binary = all(v in (0, 1) for v in finding.raw_values)
-
-            if is_binary:
-                lines.append(f"=== 二进制位序列 ({len(finding.raw_values)} bits) ===")
-                # 每行显示32位（4字节）
-                for i in range(0, len(finding.raw_values), 32):
-                    chunk = finding.raw_values[i:i+32]
-                    # 分组显示（每8位一组）
-                    groups = []
-                    for j in range(0, len(chunk), 8):
-                        group = chunk[j:j+8]
-                        groups.append("".join(str(b) for b in group))
-                    lines.append(f"  [{i:04d}]  {' '.join(groups)}")
-
-                lines.append("")
-                lines.append("=== 二进制转文本 ===")
-                # 将二进制位转换为字节再转ASCII
-                usable_bits = (len(finding.raw_values) // 8) * 8
-                text_result = []
-                for i in range(0, usable_bits, 8):
-                    byte_bits = finding.raw_values[i:i+8]
-                    byte_val = 0
-                    for bit in byte_bits:
-                        byte_val = (byte_val << 1) | bit
-                    if 32 <= byte_val <= 126:
-                        text_result.append(chr(byte_val))
-                    elif byte_val == 0:
-                        text_result.append('\\0')
-                    else:
-                        text_result.append('.')
-                lines.append("  " + "".join(text_result))
-            else:
-                lines.append(f"=== 原始值序列 ({len(finding.raw_values)} 值) ===")
-                # 每行显示16个值
-                for i in range(0, len(finding.raw_values), 16):
-                    chunk = finding.raw_values[i:i+16]
-                    # 数值行
-                    num_str = " ".join(f"{v:>3}" for v in chunk)
-                    lines.append(f"  [{i:04d}]  {num_str}")
-
-                lines.append("")
-                lines.append("=== ASCII转换 ===")
-                ascii_result = []
-                for v in finding.raw_values:
-                    if isinstance(v, int) and 32 <= v <= 126:
-                        ascii_result.append(chr(v))
-                    else:
-                        ascii_result.append(".")
-                lines.append("  " + "".join(ascii_result))
+            lines.extend(format_protocol_raw_values(finding.raw_values))
 
         self.data_view.setPlainText("\n".join(lines))
 

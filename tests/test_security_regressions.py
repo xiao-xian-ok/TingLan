@@ -37,6 +37,7 @@ from core.http_reassembly import (
 )
 from core.protocol_analyzer import CobaltStrikeAnalyzer
 from core.CS_analyzer import decrypt_traffic as decrypt_cs_traffic
+from core.protocol_display import format_protocol_raw_values
 from core.tshark_stream import PacketParser
 from core.tshark_fields import FIELD_SEPARATOR, parse_quoted_fields, split_fields
 
@@ -297,6 +298,45 @@ def test_binary_cs_http_body_is_not_misclassified_as_rce_or_sqli():
     assert result["is_binary_payload"] is True
     assert result["protocol_hint"] == "cobalt_strike_encrypted_http"
     assert not any(ind["name"].startswith(("rce:", "sqli:")) for ind in result["indicators"])
+
+
+def test_protocol_display_formats_structured_cs_raw_values_without_crashing():
+    raw_values = [
+        {
+            "kind": "encrypted_http_body",
+            "frame_number": 70737,
+            "tcp_stream": 394,
+            "method": "POST",
+            "uri": "/submit.php?id=1603726794",
+            "declared_length": 768,
+            "encrypted_length": 752,
+            "hmac_length": 16,
+            "entropy": 7.73,
+            "content_type": "application/octet-stream",
+        },
+        {
+            "cookie": "A" * 180,
+            "source": "__cfduid",
+            "decoded_length": 128,
+            "confidence": 0.85,
+        },
+    ]
+
+    lines = format_protocol_raw_values(raw_values)
+    rendered = "\n".join(lines)
+
+    assert "结构化原始值" in rendered
+    assert "Encrypted HTTP Body" in rendered
+    assert "Metadata Cookie" in rendered
+    assert "dict.__format__" not in rendered
+
+
+def test_protocol_display_limits_large_raw_values_to_prevent_ui_freeze():
+    lines = format_protocol_raw_values([{"idx": i, "value": "x" * 200} for i in range(2000)], max_items=50)
+    rendered = "\n".join(lines)
+
+    assert "仅显示前 50 项" in rendered
+    assert len(rendered) < 30000
 
 
 def test_http_response_reconstruction_from_burp_style_fields():
