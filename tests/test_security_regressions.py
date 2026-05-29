@@ -2,6 +2,7 @@ import base64
 import gzip
 import hashlib
 import hmac
+import json
 import zlib
 from dataclasses import dataclass
 from urllib.parse import quote
@@ -37,6 +38,10 @@ from core.http_reassembly import (
 )
 from core.protocol_analyzer import CobaltStrikeAnalyzer
 from core.CS_analyzer import decrypt_traffic as decrypt_cs_traffic
+from core.cs_payload_export import (
+    export_cs_payload_report,
+    write_cs_payload_artifact,
+)
 from core.protocol_display import format_protocol_raw_values
 from core.tshark_stream import PacketParser
 from core.tshark_fields import FIELD_SEPARATOR, parse_quoted_fields, split_fields
@@ -359,6 +364,63 @@ def test_protocol_display_limits_large_raw_values_to_prevent_ui_freeze():
 
     assert "仅显示前 50 项" in rendered
     assert len(rendered) < 30000
+
+
+def test_cobaltstrike_payload_artifact_writes_complete_frame(tmp_path):
+    body = _build_cs_like_http_body()
+    candidate = CobaltStrikeAnalyzer.detect_encrypted_http_payload(
+        body,
+        method="POST",
+        content_type="application/octet-stream",
+        uri="/submit.php?id=1603726794",
+    )
+    candidate.update({"frame_number": 70737, "tcp_stream": 394})
+
+    write_cs_payload_artifact(candidate, body, str(tmp_path), index=0)
+
+    assert candidate["artifact_frame_bytes"] == len(body)
+    assert candidate["artifact_json_path"].endswith(".json")
+    assert candidate["artifact_bin_path"].endswith(".bin")
+    with open(candidate["artifact_bin_path"], "rb") as fp:
+        assert fp.read() == body
+    with open(candidate["artifact_json_path"], "r", encoding="utf-8") as fp:
+        exported = json.load(fp)
+    assert exported["frame_hex"] == body.hex()
+    assert exported["encrypted_hex"] == body[4:-16].hex()
+    assert exported["hmac_hex"] == body[-16:].hex()
+
+
+def test_cobaltstrike_payload_report_exports_full_html_and_json(tmp_path):
+    body = _build_cs_like_http_body()
+    raw_values = [{
+        "kind": "encrypted_http_body",
+        "frame_number": 70737,
+        "tcp_stream": 394,
+        "method": "POST",
+        "uri": "/submit.php?id=1603726794",
+        "declared_length": len(body) - 4,
+        "frame_length": len(body),
+        "encrypted_length": len(body) - 20,
+        "hmac_length": 16,
+        "entropy": 7.73,
+        "content_type": "application/octet-stream",
+        "length_prefix_hex": body[:4].hex(),
+        "frame_hex": body.hex(),
+        "encrypted_hex": body[4:-16].hex(),
+        "hmac_hex": body[-16:].hex(),
+    }]
+    html_path = tmp_path / "payload.html"
+    json_path = tmp_path / "payload.json"
+
+    assert export_cs_payload_report(raw_values, str(html_path)) == 1
+    assert export_cs_payload_report(raw_values, str(json_path)) == 1
+
+    html_text = html_path.read_text(encoding="utf-8")
+    json_data = json.loads(json_path.read_text(encoding="utf-8"))
+    assert "Cobalt Strike 加密 HTTP Payload 取证导出" in html_text
+    assert "00 00 03 00" in html_text
+    assert json_data["records"][0]["frame_hex"] == body.hex()
+    assert json_data["records"][0]["encrypted_hex"] == body[4:-16].hex()
 
 
 def test_http_response_reconstruction_from_burp_style_fields():

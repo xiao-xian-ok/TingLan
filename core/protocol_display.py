@@ -71,6 +71,10 @@ def _format_structured_value(value: Any) -> str:
                 )
             if value.get("hmac_hex"):
                 details.append(f"    hmac_hex={value.get('hmac_hex')}")
+            if value.get("artifact_json_path"):
+                details.append(f"    full_export_json={value.get('artifact_json_path')}")
+            if value.get("artifact_bin_path"):
+                details.append(f"    full_export_bin={value.get('artifact_bin_path')}")
             if value.get("decode_note"):
                 details.append(f"    note={value.get('decode_note')}")
             return "\n".join(details)

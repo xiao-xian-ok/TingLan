@@ -1333,6 +1333,16 @@ class ProtocolFindingViewer(QFrame):
             ])
             QTreeWidgetItem(item, [f"    length_prefix_hex: {record.get('length_prefix_hex', '')}"])
             QTreeWidgetItem(item, [f"    hmac_hex: {record.get('hmac_hex', '')}"])
+            if record.get("artifact_json_path"):
+                QTreeWidgetItem(item, [
+                    "    full_export_json: "
+                    + self._short_tree_text(record.get("artifact_json_path"), 240)
+                ])
+            if record.get("artifact_bin_path"):
+                QTreeWidgetItem(item, [
+                    "    full_export_bin: "
+                    + self._short_tree_text(record.get("artifact_bin_path"), 240)
+                ])
             if record.get("encrypted_hex_preview"):
                 QTreeWidgetItem(item, [
                     "    encrypted_hex_preview: "
@@ -2783,6 +2793,7 @@ class PayloadViewer(QWidget):
 
         self.title_label.setText(f"流量包详情 - {ef.file_name}")
         self.view_btn_group.hide()
+        self.export_btn.setText("导出文件")
         self.export_btn.show()  # 显示导出按钮
         self.score_breakdown_panel.hide()
 
@@ -2799,7 +2810,11 @@ class PayloadViewer(QWidget):
         flag_mark = " [FLAG]" if finding.is_flag else ""
         self.title_label.setText(f"协议分析 - {finding.protocol} - {finding.title}{flag_mark}")
         self.view_btn_group.hide()
-        self.export_btn.hide()
+        if self._has_exportable_protocol_payload(finding):
+            self.export_btn.setText("导出Payload")
+            self.export_btn.show()
+        else:
+            self.export_btn.hide()
         self.score_breakdown_panel.hide()
 
         # 设置内容到 ProtocolFindingViewer
@@ -2835,6 +2850,7 @@ class PayloadViewer(QWidget):
 
         self.title_label.setText(f"文件还原 - {recovery.description}")
         self.view_btn_group.hide()
+        self.export_btn.setText("导出文件")
         self.export_btn.show() if recovery.saved_path else self.export_btn.hide()
         self.score_breakdown_panel.hide()
 
@@ -2880,7 +2896,11 @@ class PayloadViewer(QWidget):
         self.stack.setCurrentIndex(9)
 
     def _exportFile(self):
-        """导出提取的文件"""
+        """导出提取的文件或协议载荷证据。"""
+        if self._current_protocol_finding and self._has_exportable_protocol_payload(self._current_protocol_finding):
+            self._exportProtocolPayload()
+            return
+
         if not self._current_extracted_file:
             return
 
@@ -2906,6 +2926,48 @@ class PayloadViewer(QWidget):
                 QMessageBox.information(self, "导出成功", f"文件已保存到:\n{save_path}")
             except Exception as e:
                 QMessageBox.critical(self, "导出失败", f"保存文件时出错:\n{str(e)}")
+
+    @staticmethod
+    def _has_exportable_protocol_payload(finding: ProtocolFinding) -> bool:
+        return any(
+            isinstance(value, dict) and value.get("kind") == "encrypted_http_body"
+            for value in (finding.raw_values or [])
+        )
+
+    def _exportProtocolPayload(self):
+        finding = self._current_protocol_finding
+        if not finding:
+            return
+
+        default_name = "cs_payload_evidence.html"
+        save_path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "导出 Cobalt Strike Payload",
+            default_name,
+            "HTML Report (*.html);;JSON Report (*.json)"
+        )
+        if not save_path:
+            return
+
+        lower_path = save_path.lower()
+        if "." not in os.path.basename(save_path):
+            save_path += ".json" if "json" in selected_filter.lower() else ".html"
+        elif "json" in selected_filter.lower() and not lower_path.endswith(".json"):
+            save_path += ".json"
+        elif "html" in selected_filter.lower() and not lower_path.endswith((".html", ".htm")):
+            save_path += ".html"
+
+        try:
+            from core.cs_payload_export import export_cs_payload_report
+
+            count = export_cs_payload_report(finding.raw_values, save_path)
+            QMessageBox.information(
+                self,
+                "导出成功",
+                f"已导出 {count} 条 Cobalt Strike 加密 Payload 证据:\n{save_path}"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", f"导出 Payload 证据时出错:\n{str(e)}")
 
     def clear(self):
         """清空显示"""

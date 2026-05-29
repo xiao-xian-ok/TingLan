@@ -841,6 +841,11 @@ class StreamAnalysisWorker(QThread):
                             'dst_ip': packet.dst_ip,
                             'tcp_stream': packet.tcp_stream,
                         })
+                        self._write_cs_payload_artifact(
+                            body_candidate,
+                            packet.http_request_body,
+                            len(body_records)
+                        )
                         body_records.append(body_candidate)
 
                 del packet
@@ -893,6 +898,16 @@ class StreamAnalysisWorker(QThread):
             logger.debug(f"CS检测异常: {e}")
 
         return findings
+
+    def _write_cs_payload_artifact(self, record: Dict[str, Any], body: bytes, index: int) -> None:
+        """把完整 CS 加密帧落盘，GUI 只加载路径和预览，避免大 payload 卡死。"""
+        try:
+            from core.cs_payload_export import default_cs_payload_output_dir, write_cs_payload_artifact
+
+            output_dir = default_cs_payload_output_dir(self.pcap_path)
+            write_cs_payload_artifact(record, body, output_dir, index=index)
+        except Exception as e:
+            logger.debug(f"CS Payload 导出附件写入失败: {e}")
 
     def _run_rtp_analysis(self) -> List[RTPStreamInfo]:
         try:
