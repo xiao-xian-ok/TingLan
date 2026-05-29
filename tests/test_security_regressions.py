@@ -1,4 +1,6 @@
 import base64
+import gzip
+import zlib
 from dataclasses import dataclass
 
 import pytest
@@ -106,6 +108,54 @@ def test_http_reassembly_concatenates_multiple_chunk_fields():
     assert decode_http_body_text(layer) == "<html><body>Tomcat"
 
 
+def test_http_reassembly_decodes_gzip_content_encoding():
+    html = b"<!DOCTYPE html>\n<html><body>Tomcat Native</body></html>"
+    layer = _FakeHttpLayer(
+        **{
+            "content-encoding": "gzip",
+            "content-type": "text/html; charset=UTF-8",
+            "chunk-data": gzip.compress(html).hex(":"),
+        }
+    )
+
+    assert decode_http_body_bytes(layer) != html
+    assert decode_http_body_text(layer) == html.decode("utf-8")
+
+
+def test_http_reassembly_sniffs_gzip_when_header_is_missing():
+    body = b"hidden gzip response body"
+    layer = _FakeHttpLayer(**{"chunk-data": gzip.compress(body).hex(":")})
+
+    assert decode_http_body_text(layer) == "hidden gzip response body"
+
+
+def test_http_reassembly_decodes_zlib_and_raw_deflate_content():
+    body = b"deflate response body"
+    zlib_layer = _FakeHttpLayer(
+        **{
+            "content-encoding": "deflate",
+            "chunk-data": zlib.compress(body).hex(":"),
+        }
+    )
+    raw_layer = _FakeHttpLayer(
+        **{
+            "content-encoding": "deflate",
+            "chunk-data": zlib.compress(body)[2:-4].hex(":"),
+        }
+    )
+
+    assert decode_http_body_text(zlib_layer) == "deflate response body"
+    assert decode_http_body_text(raw_layer) == "deflate response body"
+
+
+def test_http_reassembly_does_not_force_binary_garbage_to_text():
+    binary_body = b"\x00\x01\x02\x03\xff\xfe\xfd" * 20
+    layer = _FakeHttpLayer(**{"chunk-data": binary_body.hex(":")})
+
+    assert decode_http_body_text(layer) == ""
+    assert "\ufffd" in decode_http_body_text(layer, allow_binary_text=True)
+
+
 def test_http_response_reconstruction_from_burp_style_fields():
     restored = reconstruct_http_response_from_fields(
         {
@@ -119,6 +169,23 @@ def test_http_response_reconstruction_from_burp_style_fields():
     assert restored.startswith("HTTP/1.1 200")
     assert "Content-Type: text/html; charset=UTF-8" in restored
     assert "<!DOCTYPE html>" in restored
+
+
+def test_http_response_reconstruction_decodes_compressed_field_dump():
+    html = b"<html><body><h1>Tomcat Connectors</h1></body></html>"
+    dump = "\n".join([
+        "HTTP Response",
+        "HTTP/1.1 200 OK",
+        "content-type: text/html; charset=UTF-8",
+        "content-encoding: gzip",
+        f"chunk-data: {gzip.compress(html).hex(':')}",
+    ])
+
+    restored = reconstruct_http_response_from_text_dump(dump)
+
+    assert "Content-Encoding: gzip" in restored
+    assert "Tomcat Connectors" in restored
+    assert "\ufffd" not in restored
 
 
 def test_http_response_reconstruction_from_wireshark_field_dump_text():

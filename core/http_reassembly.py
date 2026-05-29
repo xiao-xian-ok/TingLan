@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import gzip
 import re
+import zlib
 from typing import Any, Iterable, List, Optional
 
 
@@ -124,6 +126,119 @@ def _charset_from_content_type(content_type: str) -> str:
     return match.group(1) if match else "utf-8"
 
 
+def _content_encoding_tokens(content_encoding: str) -> List[str]:
+    if not content_encoding:
+        return []
+    tokens = []
+    for item in re.split(r"[,;]", str(content_encoding)):
+        token = item.strip().lower()
+        if token:
+            tokens.append(token)
+    return tokens
+
+
+def _gzip_decode(body: bytes) -> Optional[bytes]:
+    try:
+        return gzip.decompress(body)
+    except (OSError, EOFError, zlib.error):
+        try:
+            return zlib.decompress(body, 16 + zlib.MAX_WBITS)
+        except zlib.error:
+            return None
+
+
+def _deflate_decode(body: bytes) -> Optional[bytes]:
+    try:
+        return zlib.decompress(body)
+    except zlib.error:
+        try:
+            return zlib.decompress(body, -zlib.MAX_WBITS)
+        except zlib.error:
+            return None
+
+
+def _brotli_decode(body: bytes) -> Optional[bytes]:
+    try:
+        import brotli  # type: ignore
+    except ImportError:
+        try:
+            import brotlicffi as brotli  # type: ignore
+        except ImportError:
+            return None
+
+    try:
+        return brotli.decompress(body)
+    except Exception:
+        return None
+
+
+def decode_http_content_bytes(body: bytes, content_encoding: str = "") -> bytes:
+    """Decode HTTP Content-Encoding while preserving raw bytes on failure."""
+    if not body:
+        return b""
+
+    tokens = _content_encoding_tokens(content_encoding)
+    if not tokens:
+        # 有些 tshark 字段转储缺少 Content-Encoding，按魔数做保守嗅探。
+        if body.startswith(b"\x1f\x8b\x08"):
+            decoded = _gzip_decode(body)
+            return decoded if decoded is not None else body
+        if len(body) > 2 and body[0] == 0x78:
+            decoded = _deflate_decode(body)
+            return decoded if decoded is not None else body
+        return body
+
+    decoded_body = body
+    for encoding in reversed(tokens):
+        if encoding in {"identity", "none"}:
+            continue
+        if encoding in {"gzip", "x-gzip"}:
+            decoded = _gzip_decode(decoded_body)
+        elif encoding == "deflate":
+            decoded = _deflate_decode(decoded_body)
+        elif encoding == "br":
+            decoded = _brotli_decode(decoded_body)
+        else:
+            decoded = None
+
+        if decoded is None:
+            return body
+        decoded_body = decoded
+
+    return decoded_body
+
+
+def _is_probably_text_body(text: str, content_type: str = "") -> bool:
+    if not text:
+        return False
+
+    content_type_lower = (content_type or "").lower()
+    explicitly_textual = (
+        "charset=" in content_type_lower
+        or content_type_lower.startswith("text/")
+        or any(token in content_type_lower for token in (
+            "html", "json", "xml", "javascript", "ecmascript",
+            "x-www-form-urlencoded", "css", "csv",
+        ))
+    )
+
+    sample = text[:4096]
+    if not sample:
+        return False
+
+    replacement_ratio = sample.count("\ufffd") / len(sample)
+    control_count = sum(1 for ch in sample if ord(ch) < 32 and ch not in "\r\n\t")
+    control_ratio = control_count / len(sample)
+
+    if explicitly_textual:
+        return replacement_ratio < 0.10 and control_ratio < 0.05
+
+    if re.search(r"<!DOCTYPE\s+html|<html\b|<body\b|^\s*[\[{]", sample, re.IGNORECASE):
+        return replacement_ratio < 0.05 and control_ratio < 0.05
+
+    return replacement_ratio < 0.02 and control_ratio < 0.02
+
+
 def _first_text(http_layer: Any, *names: str) -> str:
     for value in get_http_field_values(http_layer, *names):
         if value is not None:
@@ -133,12 +248,17 @@ def _first_text(http_layer: Any, *names: str) -> str:
     return ""
 
 
-def decode_http_body_text(http_layer: Any) -> str:
+def decode_http_body_text(http_layer: Any, *, allow_binary_text: bool = False) -> str:
     body = decode_http_body_bytes(http_layer)
     if not body:
         return ""
     content_type = _first_text(http_layer, "content_type")
-    return body.decode(_charset_from_content_type(content_type), errors="replace")
+    content_encoding = _first_text(http_layer, "content_encoding")
+    body = decode_http_content_bytes(body, content_encoding)
+    text = body.decode(_charset_from_content_type(content_type), errors="replace")
+    if allow_binary_text or _is_probably_text_body(text, content_type):
+        return text
+    return ""
 
 
 def restore_visible_escapes(text: str) -> str:
@@ -248,6 +368,7 @@ def reconstruct_http_response(http_layer: Any, include_body: bool = True) -> str
 
     headers = {
         "Content-Type": _first_text(http_layer, "content_type"),
+        "Content-Encoding": _first_text(http_layer, "content_encoding"),
         "Content-Length": _first_text(http_layer, "content_length"),
         "Transfer-Encoding": _first_text(http_layer, "transfer_encoding"),
         "Date": _first_text(http_layer, "date"),
