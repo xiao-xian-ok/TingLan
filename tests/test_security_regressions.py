@@ -280,6 +280,11 @@ def test_cobaltstrike_detects_length_prefixed_encrypted_http_body():
     assert candidate["declared_length"] == 768
     assert candidate["encrypted_length"] == 752
     assert candidate["entropy"] >= 7.0
+    assert candidate["length_prefix_hex"] == "00000300"
+    assert candidate["frame_hex_preview"].startswith("00000300")
+    assert candidate["hmac_hex"] == bytes(reversed(range(16))).hex()
+    assert candidate["frame_hex_truncated"] is False
+    assert candidate["encrypted_hex_truncated"] is True
 
 
 def test_binary_cs_http_body_is_not_misclassified_as_rce_or_sqli():
@@ -313,6 +318,19 @@ def test_protocol_display_formats_structured_cs_raw_values_without_crashing():
             "hmac_length": 16,
             "entropy": 7.73,
             "content_type": "application/octet-stream",
+            "length_prefix_hex": "00000300",
+            "frame_length": 772,
+            "trailing_length": 0,
+            "cipher_offset": 4,
+            "hmac_offset": 756,
+            "frame_hex_preview": "00000300" + "41" * 32,
+            "frame_hex_preview_bytes": 36,
+            "frame_hex_truncated": True,
+            "encrypted_hex_preview": "41" * 32,
+            "encrypted_hex_preview_bytes": 32,
+            "encrypted_hex_truncated": True,
+            "hmac_hex": "0f0e0d0c0b0a09080706050403020100",
+            "decode_note": "未提供 Beacon 会话密钥时无法还原明文命令。",
         },
         {
             "cookie": "A" * 180,
@@ -327,6 +345,10 @@ def test_protocol_display_formats_structured_cs_raw_values_without_crashing():
 
     assert "结构化原始值" in rendered
     assert "Encrypted HTTP Body" in rendered
+    assert "length_prefix_hex=00000300" in rendered
+    assert "frame_hex_preview=00000300" in rendered
+    assert "encrypted_hex_preview=" in rendered
+    assert "hmac_hex=0f0e0d0c0b0a09080706050403020100" in rendered
     assert "Metadata Cookie" in rendered
     assert "dict.__format__" not in rendered
 

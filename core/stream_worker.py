@@ -861,14 +861,20 @@ class StreamAnalysisWorker(QThread):
                             f"{record['method']} {record['uri']} len={record['declared_length']} "
                             f"entropy={record['entropy']:.2f}"
                         )
+                        if record.get('encrypted_hex_preview'):
+                            preview = record['encrypted_hex_preview'][:128]
+                            suffix = "..." if len(record['encrypted_hex_preview']) > 128 else ""
+                            data_lines.append(f"encrypted_hex={preview}{suffix}")
                 pf = ProtocolFinding(
                     protocol="CS",
                     finding_type="Beacon Traffic",
+                    title="Cobalt Strike Beacon Traffic",
                     description=(
                         f"检测到 {len(cs_cookies)} 个疑似 CobaltStrike Metadata Cookie, "
                         f"{len(body_records)} 个疑似加密 Beacon HTTP Body"
                     ),
                     data="\n".join(data_lines),
+                    decode_chain="CS length-prefixed encrypted HTTP body",
                     confidence=confidence,
                     raw_values=cookie_records + body_records
                 )

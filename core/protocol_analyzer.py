@@ -1322,6 +1322,8 @@ class CobaltStrikeAnalyzer(ProtocolAnalyzer):
     _BASE64_TOKEN_RE = re.compile(r"^[A-Za-z0-9+/_=-]+$")
     _RSA_CIPHERTEXT_LENGTHS = {128, 256, 512}
     _MAX_COOKIE_TOKEN_LEN = 4096
+    _MAX_FRAME_HEX_PREVIEW_BYTES = 4096
+    _MAX_ENCRYPTED_HEX_PREVIEW_BYTES = 512
     _BINARY_CONTENT_TYPES = (
         "application/octet-stream",
         "application/x-binary",
@@ -1460,17 +1462,34 @@ class CobaltStrikeAnalyzer(ProtocolAnalyzer):
             return None
 
         confidence = 0.88 if binary_content_type and entropy >= 7.0 else 0.70
+        frame = body[:4 + declared_length]
+        frame_preview = frame[:cls._MAX_FRAME_HEX_PREVIEW_BYTES]
+        encrypted_preview = encrypted[:cls._MAX_ENCRYPTED_HEX_PREVIEW_BYTES]
         return {
             "kind": "encrypted_http_body",
             "method": method,
             "uri": uri,
             "declared_length": declared_length,
             "actual_length": len(body),
+            "frame_length": len(frame),
+            "trailing_length": max(len(body) - len(frame), 0),
             "encrypted_length": len(encrypted),
             "hmac_length": len(signature),
             "entropy": entropy,
             "content_type": content_type,
             "confidence": confidence,
+            # 只保留受控长度的证据预览，避免大 PCAP 把 UI 和 JSON 序列化拖死。
+            "length_prefix_hex": body[:4].hex(),
+            "frame_hex_preview": frame_preview.hex(),
+            "frame_hex_preview_bytes": len(frame_preview),
+            "frame_hex_truncated": len(frame_preview) < len(frame),
+            "encrypted_hex_preview": encrypted_preview.hex(),
+            "encrypted_hex_preview_bytes": len(encrypted_preview),
+            "encrypted_hex_truncated": len(encrypted_preview) < len(encrypted),
+            "hmac_hex": signature.hex(),
+            "cipher_offset": 4,
+            "hmac_offset": 4 + len(encrypted),
+            "decode_note": "未提供 Beacon 会话密钥时无法还原明文命令；此处展示长度前缀、密文预览和 HMAC 作为取证证据。",
         }
 
     @staticmethod

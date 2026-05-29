@@ -1223,7 +1223,8 @@ class ProtocolFindingViewer(QFrame):
         self.data_view.clear()
 
         # 更新标题
-        self.title_label.setText(f"协议分析 - {finding.protocol}")
+        title_suffix = f" - {finding.title}" if finding.title else ""
+        self.title_label.setText(f"协议分析 - {finding.protocol}{title_suffix}")
 
         # 协议信息
         proto_item = QTreeWidgetItem(self.tree, [f"Protocol: {finding.protocol}"])
@@ -1232,7 +1233,7 @@ class ProtocolFindingViewer(QFrame):
         QTreeWidgetItem(proto_item, [f"  置信度: {finding.confidence_display} ({finding.confidence:.0%})"])
 
         # 发现详情
-        detail_item = QTreeWidgetItem(self.tree, [f"Finding: {finding.title}"])
+        detail_item = QTreeWidgetItem(self.tree, [f"Finding: {finding.title or finding.finding_type}"])
         if finding.is_flag:
             detail_item.setForeground(0, QColor("#D32F2F"))
         else:
@@ -1271,6 +1272,8 @@ class ProtocolFindingViewer(QFrame):
             else:
                 QTreeWidgetItem(decoded_item, [f"  {finding.decoded_data}"])
 
+        self._add_cs_evidence_tree(finding)
+
         # 只展开前两级，不 expandAll()
         for i in range(self.tree.topLevelItemCount()):
             self.tree.topLevelItem(i).setExpanded(True)
@@ -1295,6 +1298,61 @@ class ProtocolFindingViewer(QFrame):
             lines.extend(format_protocol_raw_values(finding.raw_values))
 
         self.data_view.setPlainText("\n".join(lines))
+
+    @staticmethod
+    def _short_tree_text(value, limit: int = 180) -> str:
+        text = str(value or "")
+        if len(text) <= limit:
+            return text
+        return text[:limit] + "... (截断)"
+
+    def _add_cs_evidence_tree(self, finding: ProtocolFinding):
+        """在树视图里展示 CS 加密载荷证据，避免用户只看到摘要。"""
+        records = [
+            item for item in (finding.raw_values or [])
+            if isinstance(item, dict) and item.get("kind") == "encrypted_http_body"
+        ]
+        if not records:
+            return
+
+        root = QTreeWidgetItem(self.tree, [f"Cobalt Strike 加密 HTTP Body ({len(records)})"])
+        root.setForeground(0, QColor("#C62828"))
+        QTreeWidgetItem(root, ["  明文命令需要 Beacon AES/HMAC 会话密钥；下方展示密文帧、密文预览与 HMAC 取证证据"])
+
+        for idx, record in enumerate(records[:20]):
+            item = QTreeWidgetItem(root, [
+                (
+                    f"  [{idx:04d}] frame={record.get('frame_number', '?')} "
+                    f"stream={record.get('tcp_stream', '?')} "
+                    f"{record.get('method', '')} {record.get('uri', '')} "
+                    f"declared={record.get('declared_length', '?')} "
+                    f"encrypted={record.get('encrypted_length', '?')} "
+                    f"hmac={record.get('hmac_length', '?')} "
+                    f"entropy={float(record.get('entropy', 0.0)):.2f}"
+                )
+            ])
+            QTreeWidgetItem(item, [f"    length_prefix_hex: {record.get('length_prefix_hex', '')}"])
+            QTreeWidgetItem(item, [f"    hmac_hex: {record.get('hmac_hex', '')}"])
+            if record.get("encrypted_hex_preview"):
+                QTreeWidgetItem(item, [
+                    "    encrypted_hex_preview: "
+                    + self._short_tree_text(record.get("encrypted_hex_preview"))
+                ])
+            if record.get("frame_hex_preview"):
+                suffix = ""
+                if record.get("frame_hex_truncated"):
+                    suffix = (
+                        f" ... (截断, 原始 {record.get('frame_length', '?')} bytes, "
+                        f"显示前 {record.get('frame_hex_preview_bytes', '?')} bytes)"
+                    )
+                QTreeWidgetItem(item, [
+                    "    frame_hex_preview: "
+                    + self._short_tree_text(record.get("frame_hex_preview"), 220)
+                    + suffix
+                ])
+
+        if len(records) > 20:
+            QTreeWidgetItem(root, [f"  ... 剩余 {len(records) - 20} 个加密 Body 已省略，完整摘要见下方文本区"])
 
     def clear(self):
         self.tree.clear()

@@ -12,19 +12,68 @@ def _truncate_text(text: str, limit: int = 1000) -> str:
     return text[:limit] + "... (截断)"
 
 
+def _format_hex_preview(value: dict, key: str, byte_key: str, total_key: str, truncated_key: str) -> str:
+    preview = str(value.get(key) or "")
+    shown_bytes = value.get(byte_key, 0)
+    total_bytes = value.get(total_key, shown_bytes)
+    suffix = ""
+    if value.get(truncated_key):
+        suffix = f" ... (截断, 原始 {total_bytes} bytes, 显示前 {shown_bytes} bytes)"
+    return f"{preview}{suffix}"
+
+
 def _format_structured_value(value: Any) -> str:
     if isinstance(value, dict):
         kind = value.get("kind", "")
         if kind == "encrypted_http_body":
-            return (
+            summary = (
                 f"Encrypted HTTP Body: frame={value.get('frame_number', '?')} "
                 f"stream={value.get('tcp_stream', '?')} {value.get('method', '')} "
                 f"{value.get('uri', '')} declared={value.get('declared_length', '?')} "
+                f"frame_len={value.get('frame_length', '?')} "
                 f"encrypted={value.get('encrypted_length', '?')} "
                 f"hmac={value.get('hmac_length', '?')} "
                 f"entropy={float(value.get('entropy', 0.0)):.2f} "
                 f"content_type={value.get('content_type', '')}"
             )
+            details = [
+                summary,
+                (
+                    f"    length_prefix_hex={value.get('length_prefix_hex', '')} "
+                    f"cipher_offset={value.get('cipher_offset', '?')} "
+                    f"hmac_offset={value.get('hmac_offset', '?')} "
+                    f"trailing={value.get('trailing_length', 0)}"
+                ),
+            ]
+            frame_hex = value.get("frame_hex_preview")
+            if frame_hex:
+                details.append(
+                    "    frame_hex_preview="
+                    + _format_hex_preview(
+                        value,
+                        "frame_hex_preview",
+                        "frame_hex_preview_bytes",
+                        "frame_length",
+                        "frame_hex_truncated",
+                    )
+                )
+            encrypted_hex = value.get("encrypted_hex_preview")
+            if encrypted_hex:
+                details.append(
+                    "    encrypted_hex_preview="
+                    + _format_hex_preview(
+                        value,
+                        "encrypted_hex_preview",
+                        "encrypted_hex_preview_bytes",
+                        "encrypted_length",
+                        "encrypted_hex_truncated",
+                    )
+                )
+            if value.get("hmac_hex"):
+                details.append(f"    hmac_hex={value.get('hmac_hex')}")
+            if value.get("decode_note"):
+                details.append(f"    note={value.get('decode_note')}")
+            return "\n".join(details)
         if "cookie" in value:
             cookie = str(value.get("cookie", ""))
             return (
