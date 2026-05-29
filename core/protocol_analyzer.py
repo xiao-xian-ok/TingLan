@@ -17,13 +17,16 @@ from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field
 from collections import Counter, defaultdict
 from enum import Enum
+from urllib.parse import unquote
 
 try:
     from core.tshark_fields import separator_arg, split_fields
     from core.safe_paths import iter_safe_child_files, safe_unique_path
+    from core.display_safety import format_binary_as_hex, is_binary_or_corrupt_text
 except ImportError:
     from tshark_fields import separator_arg, split_fields
     from safe_paths import iter_safe_child_files, safe_unique_path
+    from display_safety import format_binary_as_hex, is_binary_or_corrupt_text
 
 logger = logging.getLogger(__name__)
 
@@ -1315,6 +1318,10 @@ class SMTPAnalyzer(ProtocolAnalyzer):
 class CobaltStrikeAnalyzer(ProtocolAnalyzer):
     """Cobalt Strike流量分析: Cookie提取、RSA密钥提取、Metadata解密、流量解密"""
 
+    _BASE64_TOKEN_RE = re.compile(r"^[A-Za-z0-9+/_=-]+$")
+    _RSA_CIPHERTEXT_LENGTHS = {128, 256, 512}
+    _MAX_COOKIE_TOKEN_LEN = 4096
+
     def __init__(self, key_file_path: Optional[str] = None, output_dir: Optional[str] = None):
         self.key_file_path = key_file_path
         self.output_dir = output_dir
@@ -1328,12 +1335,92 @@ class CobaltStrikeAnalyzer(ProtocolAnalyzer):
     def sessions(self) -> List[Dict]:
         return self._sessions
 
+    @classmethod
+    def _normalize_base64_cookie_value(cls, value: str) -> Optional[str]:
+        if not value:
+            return None
+
+        token = unquote(str(value).strip().strip('"\''))
+        token = re.sub(r"\s+", "", token)
+        if not token or len(token) > cls._MAX_COOKIE_TOKEN_LEN or len(token) < 40:
+            return None
+        if not cls._BASE64_TOKEN_RE.fullmatch(token):
+            return None
+        return token
+
+    @classmethod
+    def _decode_base64_cookie_value(cls, value: str) -> Optional[bytes]:
+        """严格解码 Cookie 候选值，避免把普通业务 Cookie 误判为 CS Metadata。"""
+        token = cls._normalize_base64_cookie_value(value)
+        if not token:
+            return None
+        padded = token + ("=" * ((4 - len(token) % 4) % 4))
+        decoders = (
+            lambda s: base64.b64decode(s, validate=True),
+            lambda s: base64.urlsafe_b64decode(s),
+        )
+        for decoder in decoders:
+            try:
+                decoded = decoder(padded)
+            except (binascii.Error, ValueError):
+                continue
+            if 64 <= len(decoded) <= cls._MAX_COOKIE_TOKEN_LEN and len(decoded) % 16 == 0:
+                return decoded
+        return None
+
+    @staticmethod
+    def _iter_cookie_parts(cookie_header: str) -> List[Tuple[str, str]]:
+        parts: List[Tuple[str, str]] = []
+        seen = set()
+        for raw_part in str(cookie_header or "").split(";"):
+            part = raw_part.strip()
+            if not part:
+                continue
+            if "=" in part:
+                name, value = part.split("=", 1)
+                source = name.strip()
+                candidate = value.strip()
+            else:
+                source = "cookie"
+                candidate = part
+            if candidate and candidate not in seen:
+                seen.add(candidate)
+                parts.append((source, candidate))
+        return parts
+
+    @classmethod
+    def extract_metadata_cookie_candidates(cls, cookie_header: str) -> List[Dict[str, Any]]:
+        """从完整 Cookie 头中提取可能的 CS RSA Metadata 密文。"""
+        candidates = []
+        seen = set()
+        for source, candidate in cls._iter_cookie_parts(cookie_header):
+            token = cls._normalize_base64_cookie_value(candidate)
+            if not token:
+                continue
+            decoded = cls._decode_base64_cookie_value(candidate)
+            if not decoded or token in seen:
+                continue
+            decoded_len = len(decoded)
+            confidence = 0.85 if decoded_len in cls._RSA_CIPHERTEXT_LENGTHS else 0.60
+            candidates.append({
+                'cookie': token,
+                'raw_cookie': candidate,
+                'source': source,
+                'decoded_length': decoded_len,
+                'confidence': confidence,
+            })
+            seen.add(token)
+        return candidates
+
     @staticmethod
     def _parse_metadata(data: bytes) -> Optional[Dict]:
         """解析解密后的Metadata二进制数据"""
         try:
+            if len(data) < 59:
+                logger.debug("CS Metadata 长度不足: %d", len(data))
+                return None
             if data[0:4] != b'\x00\x00\xbe\xef':
-                print("[-] 非标准 CS Metadata 格式")
+                logger.debug("非标准 CS Metadata magic: %s", data[0:4].hex())
                 return None
 
             raw_master_key = data[8:24]
@@ -1356,25 +1443,15 @@ class CobaltStrikeAnalyzer(ProtocolAnalyzer):
             ip_bytes = data[55:59]
             internal_ip = ".".join(map(str, ip_bytes[::-1]))
 
-            strings = data[59:].decode('utf-8', errors='ignore').split('\t')
+            strings = data[59:].decode('utf-8', errors='replace').split('\t')
             pc_name = strings[0] if len(strings) > 0 else "Unknown"
             user_name = strings[1] if len(strings) > 1 else "Unknown"
             process_name = strings[2] if len(strings) > 2 else "Unknown"
 
-            print(f"Beacon id:{bid}")
-            print(f"pid:{pid}")
-            print(f"port:{port}")
-            print(f"barch:{barch}")
-            print(f"is64:{is64}")
-            print(f"bypass:False")
-            print(f"windows var:{win_major/10}.{win_minor}")
-            print(f"windows build:{win_build}")
-            print(f"host:{internal_ip}")
-            print(f"PC name:{pc_name}")
-            print(f"username:{user_name}")
-            print(f"process name:{process_name}")
-            print(f"AES key:{aes_key.hex()}")
-            print(f"HMAC key:{hmac_key.hex()}")
+            logger.info(
+                "CS Metadata: beacon=%s pid=%s host=%s user=%s pc=%s process=%s",
+                bid, pid, internal_ip, user_name, pc_name, process_name,
+            )
 
             return {
                 'bid': bid,
@@ -1395,7 +1472,7 @@ class CobaltStrikeAnalyzer(ProtocolAnalyzer):
                 'info': f"{user_name}@{internal_ip} ({bid})"
             }
         except Exception as e:
-            print(f"[!] Metadata 解析失败: {e}")
+            logger.warning(f"Metadata 解析失败: {e}", exc_info=True)
             return None
 
     @staticmethod
@@ -1430,39 +1507,49 @@ class CobaltStrikeAnalyzer(ProtocolAnalyzer):
 
         seen_cookies = set()
         cookies_list = []
+        cookie_records = []
 
         for pkt in packets:
             if hasattr(pkt, 'http'):
                 packet_count += 1
                 try:
-                    cookie = getattr(pkt.http, 'cookie', '')
-                    if cookie and len(cookie) > 30 and cookie not in seen_cookies:
-                        print(f"[+] 捕获新 Cookie: {cookie}")
+                    cookie_header = getattr(pkt.http, 'cookie', '')
+                    for candidate in self.extract_metadata_cookie_candidates(cookie_header):
+                        cookie = candidate['cookie']
+                        if cookie in seen_cookies:
+                            continue
+                        logger.debug(
+                            "捕获疑似 CS Metadata Cookie: source=%s len=%s",
+                            candidate['source'], candidate['decoded_length'],
+                        )
                         seen_cookies.add(cookie)
                         cookies_list.append(cookie)
+                        cookie_records.append(candidate)
                 except AttributeError:
                     continue
 
         if cookies_list:
+            confidence = max(c.get('confidence', 0.60) for c in cookie_records) if cookie_records else 0.60
             findings.append(AnalysisFinding(
                 finding_type=FindingType.C2_COMMUNICATION,
                 protocol=ProtocolType.COBALT_STRIKE,
                 title="CS Metadata Cookie",
                 description=f"捕获 {len(cookies_list)} 个潜在的Cobalt Strike Metadata Cookie",
                 data="\n".join(cookies_list),
-                confidence=0.7,
+                raw_values=cookie_records,
+                confidence=confidence,
                 is_flag=False
             ))
 
         summary = f"提取 {len(cookies_list)} 个CS Cookie; 共 {packet_count} 个HTTP包"
-        print(f"[OK] 共找到 {len(cookies_list)} 个潜在的 Metadata Cookie。\n")
+        logger.info("共找到 %d 个潜在的 CS Metadata Cookie", len(cookies_list))
 
         return ProtocolAnalysisResult(
             protocol=ProtocolType.COBALT_STRIKE,
             packet_count=packet_count,
             findings=findings,
             summary=summary,
-            metadata={'cookies': cookies_list}
+            metadata={'cookies': cookies_list, 'cookie_candidates': cookie_records}
         )
 
     def analyze_pcap(self, pcap_path: str, **kwargs) -> ProtocolAnalysisResult:
@@ -1601,7 +1688,9 @@ class CobaltStrikeAnalyzer(ProtocolAnalyzer):
         for idx, cookie_b64 in enumerate(cookies_list):
             print(f"\n--- 分析第 {idx+1} 个 Cookie ---")
             try:
-                ciphertext = base64.b64decode(cookie_b64)
+                ciphertext = self._decode_base64_cookie_value(cookie_b64)
+                if not ciphertext:
+                    raise ValueError("Cookie不是合法的CS Metadata base64密文")
                 plaintext = private_key.decrypt(ciphertext, padding.PKCS1v15())
                 session_info = self._parse_metadata(plaintext)
 
@@ -1651,6 +1740,38 @@ class CobaltStrikeAnalyzer(ProtocolAnalyzer):
             ]}
         )
 
+    @staticmethod
+    def _clean_hex_payload(hex_data: str) -> Optional[bytes]:
+        text = str(hex_data or "").strip()
+        if not text:
+            return None
+        text = re.sub(r"(?i)0x", "", text)
+        text = re.sub(r"[\s:,\-]+", "", text)
+        if len(text) < 2 or len(text) % 2:
+            return None
+        if not re.fullmatch(r"[0-9a-fA-F]+", text):
+            return None
+        try:
+            return binascii.unhexlify(text)
+        except (binascii.Error, ValueError):
+            return None
+
+    @staticmethod
+    def _render_decrypted_content(raw_content: bytes) -> Tuple[str, str, bool]:
+        """生成安全预览；CS 返回值可能是二进制，不能强制 UTF-8。"""
+        if not raw_content:
+            return "", "empty", False
+
+        for encoding in ("utf-8", "gb18030"):
+            try:
+                text = raw_content.decode(encoding, errors="strict")
+            except UnicodeDecodeError:
+                continue
+            if not is_binary_or_corrupt_text(text):
+                return text, encoding, False
+
+        return format_binary_as_hex(raw_content), "hex", True
+
     def decrypt_traffic(self, hex_data: str, session_index: int = 0) -> Optional[Dict]:
         """使用已解密的session密钥解密CS传输数据"""
         if not self._sessions or session_index >= len(self._sessions):
@@ -1667,62 +1788,69 @@ class CobaltStrikeAnalyzer(ProtocolAnalyzer):
         iv_bytes = b"abcdefghijklmnop"
 
         try:
-            encrypt_data = binascii.unhexlify(hex_data.strip())
+            encrypt_data = self._clean_hex_payload(hex_data)
+            if not encrypt_data:
+                return {'error': 'Hex数据格式无效', 'session_bid': session.get('bid')}
 
+            if len(encrypt_data) < 20:
+                return {'error': '数据长度不足，缺少长度头或HMAC', 'session_bid': session.get('bid')}
             encrypt_data_length = int.from_bytes(encrypt_data[0:4], byteorder='big')
             encrypt_data_l = encrypt_data[4:]
 
-            if len(encrypt_data_l) < encrypt_data_length:
-                print("[-] 数据长度不足，可能截断")
-                return {'error': '数据长度不足，可能截断'}
+            if encrypt_data_length < 16 or len(encrypt_data_l) < encrypt_data_length:
+                logger.debug("CS 数据长度不足: declared=%d actual=%d", encrypt_data_length, len(encrypt_data_l))
+                return {'error': '数据长度不足，可能截断', 'session_bid': session.get('bid')}
 
             data1 = encrypt_data_l[0:encrypt_data_length - 16]
             signature = encrypt_data_l[encrypt_data_length - 16:encrypt_data_length]
+            if not data1 or len(data1) % 16:
+                return {'error': '密文长度不是AES块大小的整数倍', 'session_bid': session.get('bid')}
 
             calculated_mac = hmac_mod.new(hmac_key_bytes, data1, hashlib.sha256).digest()[:16]
-
-            print(f"收到签名: {signature.hex()}")
-            print(f"计算签名: {calculated_mac.hex()}")
 
             hmac_valid = hmac_mod.compare_digest(calculated_mac, signature)
 
             if not hmac_valid:
-                print("[-] HMAC 校验失败！Key 不匹配。")
-                return {'error': 'HMAC校验失败, Key不匹配', 'session_bid': session['bid']}
+                logger.debug("CS HMAC 校验失败: recv=%s calc=%s", signature.hex(), calculated_mac.hex())
+                return {'error': 'HMAC校验失败, Key不匹配', 'session_bid': session.get('bid')}
 
-            print("[+] HMAC 校验成功！Key 匹配。")
             cypher = AES.new(aes_key_bytes, AES.MODE_CBC, iv_bytes)
             dec = cypher.decrypt(data1)
+            if len(dec) < 8:
+                return {'error': '解密结果长度不足', 'session_bid': session.get('bid')}
 
             counter = int.from_bytes(dec[0:4], byteorder='big')
             dec_length = int.from_bytes(dec[4:8], byteorder='big')
 
-            print(f"Counter: {counter}")
-            print(f"任务返回长度: {dec_length}")
-
             de_data = dec[8:]
-            task_type = int.from_bytes(de_data[0:4], byteorder='big') if len(de_data) >= 4 else None
-            raw_content = de_data[4:dec_length + 4] if len(de_data) >= 4 else de_data
+            payload_end = min(dec_length, len(de_data))
+            payload_truncated = dec_length > len(de_data)
+            payload = de_data[:payload_end]
+            task_type = int.from_bytes(payload[0:4], byteorder='big') if len(payload) >= 4 else None
+            raw_content = payload[4:] if len(payload) >= 4 else payload
+            display_content, content_encoding, content_is_binary = self._render_decrypted_content(raw_content)
 
             if task_type is not None:
-                print(f"任务输出类型: {task_type}")
-            print(f"结果内容(Raw): {raw_content}")
-            try:
-                print(f"结果内容(Text): \n{raw_content.decode('utf-8', errors='ignore')}")
-            except:
-                pass
+                logger.debug("CS 任务输出类型: %s", task_type)
 
             return {
-                'session_bid': session['bid'],
+                'session_bid': session.get('bid'),
                 'hmac_valid': True,
+                'hmac_ok': True,
                 'counter': counter,
                 'task_length': dec_length,
+                'data_length': dec_length,
                 'task_type': task_type,
                 'raw_content': raw_content,
-                'text_content': raw_content.decode('utf-8', errors='ignore')
+                'raw_content_hex': raw_content.hex(),
+                'text_content': "" if content_is_binary else display_content,
+                'display_content': display_content,
+                'content_encoding': content_encoding,
+                'content_is_binary': content_is_binary,
+                'payload_truncated': payload_truncated,
             }
         except Exception as e:
-            print(f"[-] 任务解密过程出错: {e}")
+            logger.warning(f"CS 任务解密过程出错: {e}", exc_info=True)
             return {'error': str(e)}
 
 

@@ -12,6 +12,78 @@ sys.path.append(str(root_dir))
 from core.protocol_analyzer import CobaltStrikeAnalyzer
 
 
+def _coerce_key(key):
+    if isinstance(key, bytes):
+        return key
+    text = str(key or "").strip()
+    compact = text.replace(":", "").replace(" ", "")
+    try:
+        if compact and len(compact) % 2 == 0:
+            return bytes.fromhex(compact)
+    except ValueError:
+        pass
+    return text.encode("utf-8")
+
+
+def format_metadata(session):
+    """格式化 Beacon Metadata，供 GUI/CLI 复用。"""
+    if not session:
+        return ""
+    lines = [
+        f"Beacon ID: {session.get('bid', 'Unknown')}",
+        f"PID: {session.get('pid', 'Unknown')}",
+        f"Host: {session.get('host', 'Unknown')}",
+        f"PC: {session.get('pc_name', 'Unknown')}",
+        f"User: {session.get('username', 'Unknown')}",
+        f"Process: {session.get('process_name', 'Unknown')}",
+        f"Arch: {session.get('barch', 'Unknown')}",
+        f"OS: {session.get('win_major', '?')}.{session.get('win_minor', '?')} build {session.get('win_build', '?')}",
+        f"AES Key: {session.get('aes_key_hex', '')}",
+        f"HMAC Key: {session.get('hmac_key_hex', '')}",
+    ]
+    return "\n".join(lines)
+
+
+def run_full_analysis(pcap_path, key_file_path, output_dir=None):
+    """GUI 兼容入口：返回 Cookie、Session 和导出密钥路径。"""
+    try:
+        analyzer = CobaltStrikeAnalyzer(key_file_path=key_file_path, output_dir=output_dir)
+        result = analyzer.analyze_pcap(pcap_path, key_file_path=key_file_path, output_dir=output_dir)
+        priv_path = ""
+        if result.extracted_files:
+            priv_path = next((p for p in result.extracted_files if str(p).endswith("cs_private.pem")), "")
+        return {
+            'error': None,
+            'cookies': result.metadata.get('cookies', []),
+            'sessions': analyzer.sessions,
+            'keys': {'priv_path': priv_path},
+            'summary': result.summary,
+        }
+    except Exception as exc:
+        return {
+            'error': str(exc),
+            'cookies': [],
+            'sessions': [],
+            'keys': {'priv_path': ""},
+            'summary': "",
+        }
+
+
+def decrypt_traffic(hex_data, aes_key, hmac_key, bid="manual"):
+    """GUI 兼容入口：使用指定 AES/HMAC key 解密单段 CS 回传数据。"""
+    analyzer = CobaltStrikeAnalyzer()
+    aes_key_bytes = _coerce_key(aes_key)
+    hmac_key_bytes = _coerce_key(hmac_key)
+    analyzer._sessions = [{
+        'bid': bid,
+        'aes_key': aes_key_bytes,
+        'hmac_key': hmac_key_bytes,
+        'aes_key_hex': aes_key_bytes.hex(),
+        'hmac_key_hex': hmac_key_bytes.hex(),
+    }]
+    return analyzer.decrypt_traffic(hex_data, session_index=0)
+
+
 def main():
     """交互式入口 (复原 cs_yb.py 完整流程)"""
     from utils import read_pcap
@@ -32,11 +104,13 @@ def main():
         for pkt in cap:
             if 'HTTP' in pkt:
                 try:
-                    cookie = getattr(pkt.http, 'cookie', '')
-                    if cookie and len(cookie) > 30 and cookie not in seen_cookies:
-                        print(f"[+] 捕获新 Cookie: {cookie}")
-                        seen_cookies.add(cookie)
-                        cookies_list.append(cookie)
+                    cookie_header = getattr(pkt.http, 'cookie', '')
+                    for candidate in CobaltStrikeAnalyzer.extract_metadata_cookie_candidates(cookie_header):
+                        cookie = candidate['cookie']
+                        if cookie not in seen_cookies:
+                            print(f"[+] 捕获新 Cookie: {cookie}")
+                            seen_cookies.add(cookie)
+                            cookies_list.append(cookie)
                 except AttributeError:
                     continue
     except Exception as e:
@@ -128,7 +202,9 @@ def main():
     for idx, cookie_b64 in enumerate(cookies_list):
         print(f"\n--- 分析第 {idx+1} 个 Cookie ---")
         try:
-            ciphertext = base64.b64decode(cookie_b64)
+            ciphertext = CobaltStrikeAnalyzer._decode_base64_cookie_value(cookie_b64)
+            if not ciphertext:
+                raise ValueError("Cookie不是合法的CS Metadata base64密文")
             plaintext = private_key.decrypt(ciphertext, padding.PKCS1v15())
             session_info = CobaltStrikeAnalyzer._parse_metadata(plaintext)
             if session_info:

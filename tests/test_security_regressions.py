@@ -1,7 +1,10 @@
 import base64
 import gzip
+import hashlib
+import hmac
 import zlib
 from dataclasses import dataclass
+from urllib.parse import quote
 
 import pytest
 
@@ -31,6 +34,8 @@ from core.http_reassembly import (
     reconstruct_http_response_from_fields,
     reconstruct_http_response_from_text_dump,
 )
+from core.protocol_analyzer import CobaltStrikeAnalyzer
+from core.CS_analyzer import decrypt_traffic as decrypt_cs_traffic
 from core.tshark_stream import PacketParser
 from core.tshark_fields import FIELD_SEPARATOR, parse_quoted_fields, split_fields
 
@@ -179,6 +184,77 @@ def test_display_safety_keeps_legitimate_unicode_text_readable():
 
     assert is_binary_or_corrupt_text(text) is False
     assert safe_display_text(text) == text
+
+
+def test_cobaltstrike_cookie_extraction_parses_cookie_values_not_whole_header():
+    metadata_ciphertext = base64.b64encode(b"A" * 128).decode("ascii")
+    cookie_header = f"JSESSIONID=normal-value; __cfduid={metadata_ciphertext}; theme=light"
+
+    candidates = CobaltStrikeAnalyzer.extract_metadata_cookie_candidates(cookie_header)
+
+    assert len(candidates) == 1
+    assert candidates[0]["cookie"] == metadata_ciphertext
+    assert candidates[0]["source"] == "__cfduid"
+    assert candidates[0]["decoded_length"] == 128
+    assert candidates[0]["confidence"] >= 0.8
+
+
+def test_cobaltstrike_cookie_extraction_normalizes_url_encoded_base64():
+    metadata_ciphertext = base64.b64encode(b"\xfb" * 128).decode("ascii")
+    cookie_header = f"metadata={quote(metadata_ciphertext, safe='')}"
+
+    candidates = CobaltStrikeAnalyzer.extract_metadata_cookie_candidates(cookie_header)
+
+    assert len(candidates) == 1
+    assert candidates[0]["cookie"] == metadata_ciphertext
+    assert candidates[0]["raw_cookie"] != metadata_ciphertext
+    assert CobaltStrikeAnalyzer._decode_base64_cookie_value(candidates[0]["cookie"]) == b"\xfb" * 128
+
+
+def test_cobaltstrike_cookie_extraction_rejects_short_or_non_base64_values():
+    cookie_header = "short=abcd; tracking=not-a-valid-base64-token; id=12345"
+
+    assert CobaltStrikeAnalyzer.extract_metadata_cookie_candidates(cookie_header) == []
+
+
+def _build_cs_encrypted_blob(aes_key: bytes, hmac_key: bytes, raw_content: bytes, task_type: int = 1) -> str:
+    AES = pytest.importorskip("Crypto.Cipher.AES")
+
+    payload = task_type.to_bytes(4, "big") + raw_content
+    plain = (7).to_bytes(4, "big") + len(payload).to_bytes(4, "big") + payload
+    plain += b"\x00" * ((16 - len(plain) % 16) % 16)
+    encrypted = AES.new(aes_key, AES.MODE_CBC, b"abcdefghijklmnop").encrypt(plain)
+    signature = hmac.new(hmac_key, encrypted, hashlib.sha256).digest()[:16]
+    framed = (len(encrypted) + 16).to_bytes(4, "big") + encrypted + signature
+    return framed.hex()
+
+
+def test_cobaltstrike_decrypt_traffic_preserves_text_content():
+    aes_key = b"0123456789abcdef"
+    hmac_key = b"fedcba9876543210fedcba9876543210"
+    blob = _build_cs_encrypted_blob(aes_key, hmac_key, b"whoami\n")
+
+    result = decrypt_cs_traffic(blob, aes_key, hmac_key)
+
+    assert result["hmac_ok"] is True
+    assert result["counter"] == 7
+    assert result["task_type"] == 1
+    assert result["text_content"] == "whoami\n"
+    assert result["content_is_binary"] is False
+
+
+def test_cobaltstrike_decrypt_traffic_renders_binary_as_hex_not_garbage():
+    aes_key = b"0123456789abcdef"
+    hmac_key = b"fedcba9876543210fedcba9876543210"
+    blob = _build_cs_encrypted_blob(aes_key, hmac_key, b"\x00\x01\x02\xff\xfe\xfd" * 12)
+
+    result = decrypt_cs_traffic(blob, aes_key.hex(), hmac_key.hex())
+
+    assert result["hmac_ok"] is True
+    assert result["content_is_binary"] is True
+    assert result["text_content"] == ""
+    assert "0000" in result["display_content"]
+    assert "\ufffd" not in result["display_content"]
 
 
 def test_http_response_reconstruction_from_burp_style_fields():

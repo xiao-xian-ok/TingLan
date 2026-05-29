@@ -656,8 +656,10 @@ class KeyManagementPanel(QWidget):
                     )
                     if 'task_type' in result:
                         output += f"任务类型: {result['task_type']}\n"
-                    if 'text_content' in result:
-                        output += f"\n内容:\n{result['text_content']}"
+                    content = result.get('display_content') or result.get('text_content', '')
+                    if content:
+                        label = "二进制/Hex预览" if result.get('content_is_binary') else "内容"
+                        output += f"\n{label}:\n{content}"
                     self.resultReady.emit("CS 流量解密成功", output)
                     return
 

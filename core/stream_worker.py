@@ -796,10 +796,11 @@ class StreamAnalysisWorker(QThread):
                 output_format=OutputFormat.EK
             )
 
-            import base64 as b64_mod
+            from core.protocol_analyzer import CobaltStrikeAnalyzer
 
             seen_cookies = set()
             cs_cookies = []
+            cookie_records = []
 
             for packet in self._handler.stream_packets(config):
                 if self._is_cancelled:
@@ -817,28 +818,26 @@ class StreamAnalysisWorker(QThread):
 
                 del packet
 
-                if not cookie or len(cookie) <= 30:
+                if not cookie:
                     continue
 
-                if cookie in seen_cookies:
-                    continue
-                seen_cookies.add(cookie)
-
-                try:
-                    decoded = b64_mod.b64decode(cookie)
-                    if len(decoded) >= 48:
-                        cs_cookies.append(cookie)
-                except Exception:
-                    continue
+                for candidate in CobaltStrikeAnalyzer.extract_metadata_cookie_candidates(cookie):
+                    token = candidate['cookie']
+                    if token in seen_cookies:
+                        continue
+                    seen_cookies.add(token)
+                    cs_cookies.append(token)
+                    cookie_records.append(candidate)
 
             if cs_cookies:
+                confidence = max(c.get('confidence', 0.60) for c in cookie_records) if cookie_records else 0.60
                 pf = ProtocolFinding(
                     protocol="CS",
                     finding_type="Beacon Cookie",
                     description=f"检测到 {len(cs_cookies)} 个疑似 CobaltStrike Metadata Cookie",
                     data="\n".join(c[:80] + "..." for c in cs_cookies[:5]),
-                    confidence=0.6,
-                    raw_values=cs_cookies
+                    confidence=confidence,
+                    raw_values=cookie_records
                 )
                 findings.append(pf)
                 self.protocolFindingFound.emit(pf)
