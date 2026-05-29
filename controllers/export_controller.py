@@ -20,6 +20,23 @@ class ExportController(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
 
+    def _protocol_stat_to_dict(self, stat):
+        d = {"protocol": stat.protocol, "count": stat.count, "percentage": stat.percentage}
+        if stat.children:
+            d["children"] = [self._protocol_stat_to_dict(c) for c in stat.children]
+        return d
+
+    def _build_protocol_html(self, stats, depth):
+        html = ""
+        indent = "&nbsp;" * (depth * 4)
+        for i, p in enumerate(stats):
+            is_last = (i == len(stats) - 1)
+            prefix = ("└─ " if is_last else "├─ ") if depth > 0 else ""
+            html += f'<tr><td>{indent}{prefix}{p.protocol}</td><td>{p.count}</td><td>{p.percentage:.1f}%</td></tr>\n'
+            if p.children:
+                html += self._build_protocol_html(p.children, depth + 1)
+        return html
+
     def exportToJson(self, summary: AnalysisSummary, output_path: str) -> bool:
         try:
             self.exportStarted.emit()
@@ -31,11 +48,7 @@ class ExportController(QObject):
                 "total_packets": summary.total_packets,
                 "analysis_time": summary.analysis_time,
                 "protocol_stats": [
-                    {
-                        "protocol": s.protocol,
-                        "count": s.count,
-                        "percentage": s.percentage
-                    }
+                    self._protocol_stat_to_dict(s)
                     for s in summary.protocol_stats
                 ],
                 "detections": [
@@ -115,15 +128,7 @@ class ExportController(QObject):
             </tr>
             """
 
-        protocol_html = ""
-        for p in summary.protocol_stats:
-            protocol_html += f"""
-            <tr>
-                <td>{p.protocol}</td>
-                <td>{p.count}</td>
-                <td>{p.percentage:.1f}%</td>
-            </tr>
-            """
+        protocol_html = self._build_protocol_html(summary.protocol_stats, 0)
 
         html = f"""<!DOCTYPE html>
 <html lang="zh-CN">

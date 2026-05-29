@@ -4,6 +4,7 @@ import subprocess
 import platform
 import pyshark
 import pathlib
+from services.analysis_service import AnalysisService
 
 def create_folder_if_not_exists(folder_path):     #创建文件夹
     if not os.path.exists(folder_path):
@@ -41,17 +42,19 @@ def picture(packet):                #保存图片
 
 
 def read_pcap(pcap_file):
-    # 1. 动态获取 tshark 路径
-    current_dir = pathlib.Path(__file__).resolve().parent
-    tshark_exe = current_dir / "wireshark" / "tshark.exe"
+    service = AnalysisService()
+    tshark_exe = service.find_tshark()
     
-    # 2. 使用 FileCapture 并指定路径
+    if not tshark_exe:
+        print("[-] 警告：未找到 tshark 路径")
+
     cap = pyshark.FileCapture(
         str(pcap_file), 
-        tshark_path=str(tshark_exe),
+        tshark_path=str(tshark_exe) if tshark_exe else None,
         keep_packets=False 
     )
     return cap
+
 def hex_to_string(hex_data):
     if not hex_data: return None
     hex_str = str(hex_data).replace(':', '').replace(' ', '').replace('0x', '')

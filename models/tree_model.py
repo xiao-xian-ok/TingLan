@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 from models.detection_result import (
     AnalysisSummary, DetectionResult, DetectionType, ThreatLevel, ProtocolFinding,
-    AutoDecodingResult, FileRecoveryResult, AttackDetectionInfo
+    AutoDecodingResult, FileRecoveryResult, AttackDetectionInfo, RTPStreamInfo
 )
 
 
@@ -144,15 +144,7 @@ class AnalysisTreeModel(QAbstractItemModel):
         )
         self.root.appendChild(protocol_node)
 
-        for stat in summary.protocol_stats:
-            stat_node = TreeNode(
-                name=stat.protocol,
-                count=stat.count,
-                icon_name=f"protocol_{stat.protocol.lower()}",
-                node_type="protocol"
-            )
-            stat_node.payload = stat
-            protocol_node.appendChild(stat_node)
+        self._build_protocol_children(protocol_node, summary.protocol_stats)
 
         # 文件提取节点
         if summary.extracted_files:
@@ -262,6 +254,43 @@ class AnalysisTreeModel(QAbstractItemModel):
                     )
                     result_node.payload = result
                     normal_group.appendChild(result_node)
+
+        # 音视频流节点
+        if summary.rtp_streams:
+            rtp_node = TreeNode(
+                name="音视频流",
+                count=len(summary.rtp_streams),
+                icon_name="media_stream",
+                node_type="category"
+            )
+            self.root.appendChild(rtp_node)
+
+            grouped = {}
+            for stream in summary.rtp_streams:
+                grouped.setdefault(stream.media_type, []).append(stream)
+
+            type_names = {"audio": "音频流", "video": "视频流"}
+            for mtype, streams in grouped.items():
+                if not streams:
+                    continue
+                cat_display = type_names.get(mtype, mtype)
+                cat_node = TreeNode(
+                    name=f"{cat_display} ({len(streams)})",
+                    count=len(streams),
+                    icon_name=f"rtp_{mtype}",
+                    node_type="rtp_category"
+                )
+                rtp_node.appendChild(cat_node)
+
+                for stream in streams:
+                    stream_node = TreeNode(
+                        name=stream.display_title,
+                        count=0,
+                        icon_name=f"rtp_{mtype}",
+                        node_type="rtp_stream"
+                    )
+                    stream_node.payload = stream
+                    cat_node.appendChild(stream_node)
 
         # 文件还原结果节点
         if summary.recovered_files:
@@ -380,6 +409,19 @@ class AnalysisTreeModel(QAbstractItemModel):
 
         logger.debug(f"TreeModel 节点构建完成, 总耗时={(_time.time()-t0)*1000:.1f}ms")
         self.endResetModel()
+
+    def _build_protocol_children(self, parent_node: TreeNode, stats_list):
+        for stat in stats_list:
+            node = TreeNode(
+                name=stat.protocol,
+                count=stat.count,
+                icon_name=f"protocol_{stat.protocol.lower()}",
+                node_type="protocol"
+            )
+            node.payload = stat
+            parent_node.appendChild(node)
+            if stat.children:
+                self._build_protocol_children(node, stat.children)
 
     def addDetection(self, detection: DetectionResult):
         self._addDetectionInternal(detection, emit_signals=True)
@@ -838,7 +880,6 @@ class AnalysisTreeModel(QAbstractItemModel):
         if not index.isValid():
             return None
 
-        # 只处理 3 种 role，其余返回 None
         if role == Qt.DisplayRole:
             node = index.internalPointer()
             return node.data(index.column())
@@ -846,6 +887,12 @@ class AnalysisTreeModel(QAbstractItemModel):
         if role == Qt.UserRole:
             node = index.internalPointer()
             return node.payload
+
+        if role == Qt.ToolTipRole:
+            node = index.internalPointer()
+            if node.count > 0:
+                return f"{node.name}  ({node.count})"
+            return node.name
 
         if role != Qt.ForegroundRole:
             return None
