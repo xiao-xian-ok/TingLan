@@ -26,7 +26,7 @@ def sanitize_filename(filename: object, fallback: str = "extracted.bin", max_len
     raw = _INVALID_WINDOWS_CHARS.sub("_", raw)
     raw = raw.strip().strip(". ")
 
-    if not raw or raw in {".", ".."}:
+    if not raw or raw in {".", ".."} or not any(ch.isalnum() for ch in raw):
         raw = fallback
 
     stem, ext = os.path.splitext(raw)
