@@ -15,6 +15,7 @@ from core.auto_decoder import (
     DecodingStep,
     MagicDecoder,
 )
+from core.attack_detector import detect_attack
 from core.display_safety import (
     LOSSY_TEXT_NOTICE,
     format_binary_as_hex,
@@ -255,6 +256,47 @@ def test_cobaltstrike_decrypt_traffic_renders_binary_as_hex_not_garbage():
     assert result["text_content"] == ""
     assert "0000" in result["display_content"]
     assert "\ufffd" not in result["display_content"]
+
+
+def _build_cs_like_http_body() -> bytes:
+    encrypted = (bytes(range(256)) * 3)[:752]
+    signature = bytes(reversed(range(16)))
+    declared_length = len(encrypted) + len(signature)
+    return declared_length.to_bytes(4, "big") + encrypted + signature
+
+
+def test_cobaltstrike_detects_length_prefixed_encrypted_http_body():
+    body = _build_cs_like_http_body()
+
+    candidate = CobaltStrikeAnalyzer.detect_encrypted_http_payload(
+        body,
+        method="POST",
+        content_type="application/octet-stream",
+        uri="/submit.php?id=1603726794",
+    )
+
+    assert candidate is not None
+    assert candidate["declared_length"] == 768
+    assert candidate["encrypted_length"] == 752
+    assert candidate["entropy"] >= 7.0
+
+
+def test_binary_cs_http_body_is_not_misclassified_as_rce_or_sqli():
+    body = _build_cs_like_http_body()
+
+    result = detect_attack(
+        body,
+        method="POST",
+        uri="/submit.php?id=1603726794",
+        content_type="application/octet-stream",
+    )
+
+    assert result["detected"] is False
+    assert result["detection_type"] == "unknown"
+    assert result["text_detection_skipped"] is True
+    assert result["is_binary_payload"] is True
+    assert result["protocol_hint"] == "cobalt_strike_encrypted_http"
+    assert not any(ind["name"].startswith(("rce:", "sqli:")) for ind in result["indicators"])
 
 
 def test_http_response_reconstruction_from_burp_style_fields():

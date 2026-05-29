@@ -337,6 +337,10 @@ class DetectionContext:
     entropy: float = 0.0
     entropy_class: str = ""
     is_code_like: bool = False
+    is_binary_payload: bool = False
+    text_detection_skipped: bool = False
+    skip_reason: str = ""
+    protocol_hint: str = ""
 
     is_json: bool = False
     json_values: List[str] = field(default_factory=list)
@@ -1564,6 +1568,13 @@ class AttackDetector:
             except Exception:
                 pass
 
+        if self._should_skip_text_detection(context):
+            context.text_detection_skipped = True
+            context.is_binary_payload = True
+            result = DetectorResult()
+            result.tags.append("binary_payload:text_detection_skipped")
+            return self._to_dict(result, context)
+
         # 判断是不是代码
         context.is_code_like = self._looks_like_code(context.decoded_text)
 
@@ -1639,11 +1650,69 @@ class AttackDetector:
             'decode_chain': context.decode_chain,
             'decode_layers': context.decode_layers,
             'is_sampled': context.is_sampled,
+            'is_binary_payload': context.is_binary_payload,
+            'text_detection_skipped': context.text_detection_skipped,
+            'skip_reason': context.skip_reason,
+            'protocol_hint': context.protocol_hint,
             'is_json': context.is_json,
             'tainted_sinks': result.tainted_sinks,
             'detected': result.detected,
             'error': result.error,
         }
+
+    def _should_skip_text_detection(self, context: DetectionContext) -> bool:
+        """不要把高熵二进制 HTTP body 当成 Web 攻击文本跑正则。"""
+        data = context.decoded_data or context.raw_data
+        if not data or len(data) < 32:
+            return False
+
+        content_type = (context.content_type or "").lower()
+        textual_types = (
+            "text/",
+            "application/json",
+            "application/xml",
+            "application/x-www-form-urlencoded",
+            "multipart/form-data",
+        )
+        if any(token in content_type for token in textual_types):
+            return False
+
+        binary_type = any(token in content_type for token in (
+            "application/octet-stream",
+            "application/x-binary",
+            "binary/octet-stream",
+        ))
+        sample = data[:4096]
+        control_ratio = sum(1 for b in sample if b < 32 and b not in (9, 10, 13)) / len(sample)
+        high_ratio = sum(1 for b in sample if b >= 128) / len(sample)
+        replacement_ratio = (context.decoded_text[:4096].count("\ufffd") / max(len(context.decoded_text[:4096]), 1))
+        high_entropy = context.entropy >= 7.0 or context.entropy_class in {"random", "encrypted", "compressed"}
+
+        if binary_type and (high_entropy or control_ratio > 0.03 or replacement_ratio > 0.01):
+            context.skip_reason = "binary_content_type_high_entropy"
+            context.protocol_hint = self._binary_protocol_hint(data, context)
+            return True
+
+        if high_entropy and (control_ratio > 0.08 or (high_ratio > 0.40 and replacement_ratio > 0.01)):
+            context.skip_reason = "high_entropy_non_text_body"
+            context.protocol_hint = self._binary_protocol_hint(data, context)
+            return True
+
+        return False
+
+    def _binary_protocol_hint(self, data: bytes, context: DetectionContext) -> str:
+        try:
+            from core.protocol_analyzer import CobaltStrikeAnalyzer
+            if CobaltStrikeAnalyzer.detect_encrypted_http_payload(
+                data,
+                method=context.method,
+                content_type=context.content_type,
+                uri=context.uri,
+            ):
+                return "cobalt_strike_encrypted_http"
+        except Exception:
+            pass
+        return ""
 
     def _looks_like_code(self, text: str) -> bool:
         text = text[:5000]

@@ -46,6 +46,7 @@ from models.detection_result import (
     FileRecoveryResult,
     RTPStreamInfo
 )
+from core.display_safety import safe_display_text
 
 logger = logging.getLogger(__name__)
 
@@ -508,10 +509,7 @@ class StreamAnalysisWorker(QThread):
                     raw_headers += f"Content-Type: {packet.http_content_type}\r\n"
                 raw_headers += "\r\n"
 
-                try:
-                    raw_body_str = body.decode('utf-8', errors='replace')
-                except Exception:
-                    raw_body_str = repr(body)[:1000]
+                raw_body_str = safe_display_text(body, max_length=50000)
 
                 detection['raw_request_headers'] = raw_headers
                 detection['raw_request_body'] = raw_body_str[:50000]
@@ -792,15 +790,17 @@ class StreamAnalysisWorker(QThread):
         try:
             config = StreamConfig(
                 pcap_path=self.pcap_path,
-                display_filter="http.cookie",
+                display_filter="http.request",
                 output_format=OutputFormat.EK
             )
 
             from core.protocol_analyzer import CobaltStrikeAnalyzer
 
             seen_cookies = set()
+            seen_body_keys = set()
             cs_cookies = []
             cookie_records = []
+            body_records = []
 
             for packet in self._handler.stream_packets(config):
                 if self._is_cancelled:
@@ -816,34 +816,71 @@ class StreamAnalysisWorker(QThread):
                         cookie = val[0] if isinstance(val, list) else val
                         break
 
+                if cookie:
+                    for candidate in CobaltStrikeAnalyzer.extract_metadata_cookie_candidates(cookie):
+                        token = candidate['cookie']
+                        if token in seen_cookies:
+                            continue
+                        seen_cookies.add(token)
+                        cs_cookies.append(token)
+                        cookie_records.append(candidate)
+
+                body_candidate = CobaltStrikeAnalyzer.detect_encrypted_http_payload(
+                    packet.http_request_body,
+                    method=packet.http_method,
+                    content_type=packet.http_content_type,
+                    uri=packet.http_uri,
+                )
+                if body_candidate:
+                    body_key = (packet.tcp_stream, packet.frame_number, body_candidate['declared_length'])
+                    if body_key not in seen_body_keys:
+                        seen_body_keys.add(body_key)
+                        body_candidate.update({
+                            'frame_number': packet.frame_number,
+                            'src_ip': packet.src_ip,
+                            'dst_ip': packet.dst_ip,
+                            'tcp_stream': packet.tcp_stream,
+                        })
+                        body_records.append(body_candidate)
+
                 del packet
 
-                if not cookie:
-                    continue
-
-                for candidate in CobaltStrikeAnalyzer.extract_metadata_cookie_candidates(cookie):
-                    token = candidate['cookie']
-                    if token in seen_cookies:
-                        continue
-                    seen_cookies.add(token)
-                    cs_cookies.append(token)
-                    cookie_records.append(candidate)
-
-            if cs_cookies:
+            if cs_cookies or body_records:
                 confidence = max(c.get('confidence', 0.60) for c in cookie_records) if cookie_records else 0.60
+                if body_records:
+                    confidence = max(confidence, max(b.get('confidence', 0.70) for b in body_records))
+                data_lines = []
+                if cs_cookies:
+                    data_lines.append("Metadata Cookie:")
+                    data_lines.extend(c[:80] + "..." for c in cs_cookies[:5])
+                if body_records:
+                    data_lines.append("Encrypted HTTP Body:")
+                    for record in body_records[:10]:
+                        data_lines.append(
+                            f"frame={record['frame_number']} stream={record['tcp_stream']} "
+                            f"{record['method']} {record['uri']} len={record['declared_length']} "
+                            f"entropy={record['entropy']:.2f}"
+                        )
                 pf = ProtocolFinding(
                     protocol="CS",
-                    finding_type="Beacon Cookie",
-                    description=f"检测到 {len(cs_cookies)} 个疑似 CobaltStrike Metadata Cookie",
-                    data="\n".join(c[:80] + "..." for c in cs_cookies[:5]),
+                    finding_type="Beacon Traffic",
+                    description=(
+                        f"检测到 {len(cs_cookies)} 个疑似 CobaltStrike Metadata Cookie, "
+                        f"{len(body_records)} 个疑似加密 Beacon HTTP Body"
+                    ),
+                    data="\n".join(data_lines),
                     confidence=confidence,
-                    raw_values=cookie_records
+                    raw_values=cookie_records + body_records
                 )
                 findings.append(pf)
                 self.protocolFindingFound.emit(pf)
 
             seen_cookies.clear()
-            status = f"CS检测完成: {len(cs_cookies)} 可疑Cookie" if cs_cookies else "未发现CS特征"
+            seen_body_keys.clear()
+            status = (
+                f"CS检测完成: {len(cs_cookies)} 可疑Cookie, {len(body_records)} 加密Body"
+                if (cs_cookies or body_records) else "未发现CS特征"
+            )
             self._emit_progress(60, status)
 
         except Exception as e:

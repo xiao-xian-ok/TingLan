@@ -8,6 +8,7 @@ import struct
 import binascii
 import hashlib
 import hmac as hmac_mod
+import math
 import subprocess
 import tempfile
 import pathlib
@@ -1321,6 +1322,11 @@ class CobaltStrikeAnalyzer(ProtocolAnalyzer):
     _BASE64_TOKEN_RE = re.compile(r"^[A-Za-z0-9+/_=-]+$")
     _RSA_CIPHERTEXT_LENGTHS = {128, 256, 512}
     _MAX_COOKIE_TOKEN_LEN = 4096
+    _BINARY_CONTENT_TYPES = (
+        "application/octet-stream",
+        "application/x-binary",
+        "binary/octet-stream",
+    )
 
     def __init__(self, key_file_path: Optional[str] = None, output_dir: Optional[str] = None):
         self.key_file_path = key_file_path
@@ -1411,6 +1417,61 @@ class CobaltStrikeAnalyzer(ProtocolAnalyzer):
             })
             seen.add(token)
         return candidates
+
+    @staticmethod
+    def _byte_entropy(data: bytes) -> float:
+        if not data:
+            return 0.0
+        counts = Counter(data)
+        total = len(data)
+        return -sum((count / total) * math.log2(count / total) for count in counts.values())
+
+    @classmethod
+    def detect_encrypted_http_payload(
+        cls,
+        body: bytes,
+        *,
+        method: str = "",
+        content_type: str = "",
+        uri: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """识别疑似 CS Beacon 加密 HTTP body: 4字节长度头 + AES密文 + HMAC。"""
+        if not body or len(body) < 36:
+            return None
+        if method and method.upper() not in {"POST", "PUT"}:
+            return None
+
+        declared_length = int.from_bytes(body[:4], "big")
+        remaining = len(body) - 4
+        if declared_length < 32 or declared_length > remaining:
+            return None
+        if declared_length % 16 != 0:
+            return None
+
+        encrypted = body[4:4 + declared_length - 16]
+        signature = body[4 + declared_length - 16:4 + declared_length]
+        if not encrypted or len(encrypted) % 16 or len(signature) != 16:
+            return None
+
+        entropy = cls._byte_entropy(encrypted[:4096])
+        content_type_lower = (content_type or "").lower()
+        binary_content_type = any(token in content_type_lower for token in cls._BINARY_CONTENT_TYPES)
+        if entropy < 7.0 and not binary_content_type:
+            return None
+
+        confidence = 0.88 if binary_content_type and entropy >= 7.0 else 0.70
+        return {
+            "kind": "encrypted_http_body",
+            "method": method,
+            "uri": uri,
+            "declared_length": declared_length,
+            "actual_length": len(body),
+            "encrypted_length": len(encrypted),
+            "hmac_length": len(signature),
+            "entropy": entropy,
+            "content_type": content_type,
+            "confidence": confidence,
+        }
 
     @staticmethod
     def _parse_metadata(data: bytes) -> Optional[Dict]:
