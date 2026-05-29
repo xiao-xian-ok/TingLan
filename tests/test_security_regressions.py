@@ -12,6 +12,12 @@ from core.auto_decoder import (
     DecodingStep,
     MagicDecoder,
 )
+from core.display_safety import (
+    LOSSY_TEXT_NOTICE,
+    format_binary_as_hex,
+    is_binary_or_corrupt_text,
+    safe_display_text,
+)
 from core.safe_paths import (
     ensure_child_path,
     iter_safe_child_files,
@@ -154,6 +160,25 @@ def test_http_reassembly_does_not_force_binary_garbage_to_text():
 
     assert decode_http_body_text(layer) == ""
     assert "\ufffd" in decode_http_body_text(layer, allow_binary_text=True)
+
+
+def test_display_safety_hides_lossy_decoded_binary_text():
+    garbled = "��S1kM`�J�8����`�i�R��5�$�H)g�yW�(�fKgj��A��y�%`���K"
+
+    assert is_binary_or_corrupt_text(garbled) is True
+    assert safe_display_text(garbled) == LOSSY_TEXT_NOTICE
+
+
+def test_display_safety_handles_short_lossy_binary_fragments():
+    assert is_binary_or_corrupt_text("�3�") is True
+    assert format_binary_as_hex("�3�") == LOSSY_TEXT_NOTICE
+
+
+def test_display_safety_keeps_legitimate_unicode_text_readable():
+    text = "检测结果：Tomcat 响应体已成功还原\n<html>OK</html>"
+
+    assert is_binary_or_corrupt_text(text) is False
+    assert safe_display_text(text) == text
 
 
 def test_http_response_reconstruction_from_burp_style_fields():

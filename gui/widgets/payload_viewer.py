@@ -27,67 +27,26 @@ from models.detection_result import (
     AutoDecodingResult, FileRecoveryResult, AttackDetectionInfo,
     RTPStreamInfo
 )
+from core.display_safety import (
+    format_binary_as_hex as _format_binary_as_hex,
+    is_binary_or_corrupt_text,
+    safe_display_text as _safe_display_text,
+)
 
 
 def is_binary_data(data: str, threshold: float = 0.3) -> bool:
     """检查是否为二进制数据"""
-    if not data:
-        return False
-
-    # 检查前1000个字符
-    sample = data[:1000]
-    non_printable = sum(1 for c in sample if ord(c) < 32 and c not in '\n\r\t')
-    ratio = non_printable / len(sample) if sample else 0
-
-    return ratio > threshold
+    return is_binary_or_corrupt_text(data, threshold=threshold)
 
 
 def format_binary_as_hex(data: str, max_bytes: int = 4096) -> str:
     """Wireshark风格hex dump"""
-    try:
-        # 尝试将字符串编码为字节
-        if isinstance(data, str):
-            raw_bytes = data.encode('latin-1', errors='replace')[:max_bytes]
-        else:
-            raw_bytes = bytes(data)[:max_bytes]
-
-        lines = []
-        for i in range(0, len(raw_bytes), 16):
-            chunk = raw_bytes[i:i+16]
-            offset = f"{i:04x}"
-
-            # 十六进制部分
-            hex_left = " ".join(f"{b:02x}" for b in chunk[:8])
-            hex_right = " ".join(f"{b:02x}" for b in chunk[8:])
-            hex_part = f"{hex_left:<23}  {hex_right:<23}"
-
-            # ASCII部分
-            ascii_part = "".join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
-
-            lines.append(f"{offset}   {hex_part}  |{ascii_part}|")
-
-        if len(raw_bytes) == max_bytes:
-            lines.append(f"\n... (仅显示前 {max_bytes} 字节)")
-
-        return '\n'.join(lines)
-    except Exception as e:
-        return f"[无法格式化二进制数据: {e}]"
+    return _format_binary_as_hex(data, max_bytes=max_bytes)
 
 
 def safe_display_text(data, max_length: int = 50000) -> str:
     """安全显示文本，二进制自动转hex"""
-    if data is None:
-        return ""
-
-    text = str(data)
-
-    if is_binary_data(text):
-        return format_binary_as_hex(text)
-
-    if len(text) > max_length:
-        return text[:max_length] + "\n... (截断)"
-
-    return text
+    return _safe_display_text(data, max_length=max_length)
 
 
 class WiresharkStyleViewer(QFrame):
