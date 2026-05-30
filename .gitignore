@@ -5,6 +5,7 @@
 
 # 测试和输出目录
 test/
+tests/
 tests/*.json
 output/
 .claude/

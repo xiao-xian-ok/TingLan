@@ -96,6 +96,46 @@ def test_tshark_quoted_field_parser_handles_complex_payload():
     assert parse_quoted_fields(line, expected=3) == ["1", payload, "3"]
 
 
+def test_detects_suspicious_high_entropy_form_payload_to_script():
+    segments = []
+    for idx in range(12):
+        seed = hashlib.sha256(f"encrypted-payload-{idx}".encode()).digest()
+        segments.append(base64.b64encode(seed * 4).decode())
+    body = (
+        "j1ebfc790c8727=Jz"
+        "&rd5b708778e16c=byY21k"
+        f"&shell={quote('|'.join(segments))}"
+    ).encode()
+
+    result = detect_attack(
+        body,
+        method="POST",
+        uri="/uploads/1768728211_696ca6939300d_san.php",
+        content_type="application/x-www-form-urlencoded",
+    )
+
+    assert result["detected"] is True
+    assert result["detection_type"] == "encrypted_http"
+    indicator_names = {item["name"] for item in result["indicators"]}
+    assert "encrypted_http:high_entropy_form_param" in indicator_names
+    assert "encrypted_http:segmented_base64_payload" in indicator_names
+
+
+def test_high_entropy_form_payload_needs_suspicious_http_context():
+    token = base64.b64encode(hashlib.sha512(b"normal-token").digest() * 6).decode()
+    body = f"nonce={quote(token)}&page=1".encode()
+
+    result = detect_attack(
+        body,
+        method="POST",
+        uri="/api/session/refresh",
+        content_type="application/x-www-form-urlencoded",
+    )
+
+    assert result["detected"] is False
+    assert result["detection_type"] != "encrypted_http"
+
+
 class _FakeHttpLayer:
     def __init__(self, **fields):
         self._data = fields

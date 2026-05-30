@@ -73,6 +73,7 @@ class DetectionType(Enum):
     COMMAND_INJECTION = "command_injection"
     DESERIALIZATION = "deserialization"
     FILE_UPLOAD = "file_upload"
+    ENCRYPTED_HTTP = "encrypted_http"
     LFI = "lfi"
     RFI = "rfi"
     LDAP_INJECTION = "ldap_injection"
@@ -96,6 +97,7 @@ class DetectionType(Enum):
             "command_injection": "命令注入",
             "deserialization": "反序列化漏洞",
             "file_upload": "恶意文件上传",
+            "encrypted_http": "可疑加密 HTTP Payload",
             "lfi": "本地文件包含",
             "rfi": "远程文件包含",
             "ldap_injection": "LDAP注入",
@@ -109,7 +111,7 @@ class DetectionType(Enum):
     def is_owasp(self) -> bool:
         return self.value in ['sqli', 'xss', 'rce', 'xxe', 'ssrf',
                               'path_traversal', 'command_injection', 'deserialization',
-                              'file_upload', 'lfi', 'rfi', 'ldap_injection', 'ssti',
+                              'file_upload', 'encrypted_http', 'lfi', 'rfi', 'ldap_injection', 'ssti',
                               'attack']
 
     @classmethod
@@ -363,6 +365,7 @@ class DetectionResult:
             "command_injection": DetectionType.COMMAND_INJECTION,
             "deserialization": DetectionType.DESERIALIZATION,
             "file_upload": DetectionType.FILE_UPLOAD,
+            "encrypted_http": DetectionType.ENCRYPTED_HTTP,
             "lfi": DetectionType.LFI,
             "antsword": DetectionType.ANTSWORD,
             "caidao": DetectionType.CAIDAO,

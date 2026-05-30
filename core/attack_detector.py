@@ -6,6 +6,7 @@ import time
 import hashlib
 import threading
 import json
+import math
 import concurrent.futures
 from abc import ABC, abstractmethod
 from enum import Enum, auto
@@ -15,7 +16,7 @@ from typing import (
     Type, Callable, Union, Pattern
 )
 from functools import wraps
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qsl, unquote, urlparse
 import logging
 
 try:
@@ -144,6 +145,7 @@ class AttackType(Enum):
     DESERIALIZATION = "deserialization"
     COMMAND_INJECTION = "command_injection"
     FILE_UPLOAD = "file_upload"
+    ENCRYPTED_HTTP = "encrypted_http"
 
     UNKNOWN = "unknown"
 
@@ -164,6 +166,7 @@ class AttackType(Enum):
             "deserialization": "不安全反序列化",
             "command_injection": "命令注入",
             "file_upload": "文件上传漏洞",
+            "encrypted_http": "可疑加密 HTTP Payload",
             "unknown": "未知攻击",
         }
         return names.get(self.value, self.value)
@@ -1354,6 +1357,204 @@ class FileUploadDetector(ASTEnhancedDetector):
         return False
 
 
+class SuspiciousEncryptedHTTPDetector(BaseDetector):
+    """Fast generic heuristic for suspicious high-entropy HTTP payloads."""
+
+    ATTACK_TYPE = AttackType.ENCRYPTED_HTTP
+    PRIORITY = 4
+
+    SCRIPT_EXT_RE = re.compile(r'\.(php\d*|phtml|phar|jsp|jspx|asp|aspx|ashx)\b', re.IGNORECASE)
+    SUSPICIOUS_PATH_RE = re.compile(r'/(uploads?|upload|files?|assets?|cache|tmp|temp)/', re.IGNORECASE)
+    DANGEROUS_PARAM_RE = re.compile(
+        r'^(cmd|exec|shell|payload|code|pass|password|key|data|action|method)$',
+        re.IGNORECASE,
+    )
+    RANDOM_PARAM_RE = re.compile(r'^[a-z][a-z0-9]{9,24}$', re.IGNORECASE)
+    BASE64_SEGMENT_RE = re.compile(r'^[A-Za-z0-9+/]{40,}={0,2}$')
+
+    MAX_BODY_PARSE = 64 * 1024
+    MAX_PARAMS = 32
+    MAX_VALUE_SAMPLE = 8192
+    MIN_LONG_VALUE = 128
+    HIGH_ENTROPY_THRESHOLD = 4.75
+
+    def detect(self, context: DetectionContext) -> DetectorResult:
+        result = DetectorResult(attack_type=self.ATTACK_TYPE)
+
+        if self._check_timeout(context):
+            result.error = "timeout"
+            return result
+
+        method = (context.method or "").upper()
+        if method not in {"POST", "PUT", "PATCH"}:
+            return result
+
+        body = context.raw_data or context.decoded_data or b""
+        if len(body) < 64:
+            return result
+
+        uri = context.uri or "/"
+        content_type = (context.content_type or "").lower()
+        text = safe_decode(body[:self.MAX_BODY_PARSE])
+        looks_form = (
+            "application/x-www-form-urlencoded" in content_type
+            or ("=" in text and "&" in text[:4096])
+        )
+        if not looks_form:
+            return result
+
+        params = self._parse_form_params(text)
+        if not params:
+            return result
+
+        evidences: List[Evidence] = []
+        has_script_target = bool(self.SCRIPT_EXT_RE.search(uri))
+        has_suspicious_path = bool(self.SUSPICIOUS_PATH_RE.search(uri))
+        high_entropy_params = []
+        segmented_params = []
+        dangerous_params = []
+        random_param_count = 0
+
+        if has_script_target:
+            evidences.append(Evidence(
+                pattern_name="encrypted_http:post_to_script",
+                matched_text=uri.split("?", 1)[0][-120:],
+                weight=20,
+                description="POST/PUT/PATCH request targets an executable script",
+            ))
+
+        if has_suspicious_path:
+            evidences.append(Evidence(
+                pattern_name="encrypted_http:suspicious_script_path",
+                matched_text=uri.split("?", 1)[0][-120:],
+                weight=20,
+                description="Script target is under upload/cache/temp-like path",
+            ))
+
+        if "application/x-www-form-urlencoded" in content_type:
+            evidences.append(Evidence(
+                pattern_name="encrypted_http:urlencoded_form",
+                matched_text=content_type[:120],
+                weight=10,
+                description="URL-encoded form body",
+            ))
+
+        for name, value in params[:self.MAX_PARAMS]:
+            if self.DANGEROUS_PARAM_RE.match(name):
+                dangerous_params.append(name)
+
+            if self._looks_random_param_name(name):
+                random_param_count += 1
+
+            clean_value = value.strip()
+            if len(clean_value) < self.MIN_LONG_VALUE:
+                continue
+
+            value_sample = clean_value[:self.MAX_VALUE_SAMPLE]
+            entropy = self._calculate_entropy(value_sample)
+            if entropy >= self.HIGH_ENTROPY_THRESHOLD:
+                high_entropy_params.append((name, len(clean_value), entropy))
+
+            segments = [s for s in clean_value.split("|") if s]
+            long_b64_segments = sum(1 for s in segments if self.BASE64_SEGMENT_RE.match(s))
+            if len(segments) >= 3 and long_b64_segments >= 3:
+                segmented_params.append((name, len(segments), long_b64_segments))
+
+        for name in dangerous_params[:3]:
+            evidences.append(Evidence(
+                pattern_name="encrypted_http:dangerous_param_name",
+                matched_text=name,
+                weight=25,
+                description="Parameter name is commonly used to carry commands or encrypted payloads",
+            ))
+
+        if random_param_count >= 2:
+            evidences.append(Evidence(
+                pattern_name="encrypted_http:randomized_param_names",
+                matched_text=f"random_params={random_param_count}",
+                weight=15,
+                description="Multiple randomized-looking parameter names",
+            ))
+
+        for name, value_len, entropy in high_entropy_params[:3]:
+            weight = 45 if entropy >= 5.2 else 35
+            if value_len >= 1024:
+                weight += 10
+            evidences.append(Evidence(
+                pattern_name="encrypted_http:high_entropy_form_param",
+                matched_text=f"{name}: len={value_len}, entropy={entropy:.2f}",
+                weight=weight,
+                description="Long high-entropy form parameter",
+            ))
+
+        for name, segment_count, b64_count in segmented_params[:2]:
+            evidences.append(Evidence(
+                pattern_name="encrypted_http:segmented_base64_payload",
+                matched_text=f"{name}: segments={segment_count}, base64_segments={b64_count}",
+                weight=30,
+                description="Form parameter contains multiple long Base64-like chunks",
+            ))
+
+        if len(body) >= 2048:
+            evidences.append(Evidence(
+                pattern_name="encrypted_http:large_form_body",
+                matched_text=f"body_len={len(body)}",
+                weight=10,
+                description="Large form body",
+            ))
+
+        target_context = has_script_target or has_suspicious_path or bool(dangerous_params)
+        encrypted_payload = bool(high_entropy_params) or bool(segmented_params)
+        if not (target_context and encrypted_payload):
+            return result
+
+        result.evidences = evidences
+        result.weight = sum(e.weight for e in evidences)
+        result.detected = result.weight >= 70
+        result.confidence = ThreatLevel.from_weight(result.weight).value
+        result.tags.extend(["encrypted_http_heuristic", "form_param_entropy"])
+        return result
+
+    def _parse_form_params(self, text: str) -> List[Tuple[str, str]]:
+        try:
+            return [
+                (k, v)
+                for k, v in parse_qsl(text, keep_blank_values=True, strict_parsing=False)
+                if k
+            ]
+        except Exception:
+            params = []
+            for pair in text.split("&")[:self.MAX_PARAMS]:
+                if "=" not in pair:
+                    continue
+                key, value = pair.split("=", 1)
+                key = unquote(key.strip())
+                value = unquote(value.strip())
+                if key:
+                    params.append((key, value))
+            return params
+
+    def _looks_random_param_name(self, name: str) -> bool:
+        if not self.RANDOM_PARAM_RE.match(name):
+            return False
+        digit_count = sum(1 for ch in name if ch.isdigit())
+        return digit_count >= 3 or len(set(name.lower())) >= 8
+
+    @staticmethod
+    def _calculate_entropy(value: str) -> float:
+        if not value:
+            return 0.0
+        counts: Dict[str, int] = {}
+        for ch in value:
+            counts[ch] = counts.get(ch, 0) + 1
+        length = len(value)
+        entropy = 0.0
+        for count in counts.values():
+            p = count / length
+            entropy -= p * math.log2(p)
+        return entropy
+
+
 class DetectorRegistry:
 
     _instance = None
@@ -1396,6 +1597,7 @@ def register_detector(cls: Type[BaseDetector]) -> Type[BaseDetector]:
 
 
 register_detector(FileUploadDetector)
+register_detector(SuspiciousEncryptedHTTPDetector)
 register_detector(SQLiDetector)
 register_detector(XSSDetector)
 register_detector(RCEDetector)

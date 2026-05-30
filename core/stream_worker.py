@@ -509,11 +509,14 @@ class StreamAnalysisWorker(QThread):
                     raw_headers += f"Content-Type: {packet.http_content_type}\r\n"
                 raw_headers += "\r\n"
 
+                raw_body_full = body.decode('utf-8', errors='replace')
                 raw_body_str = safe_display_text(body, max_length=50000)
 
                 detection['raw_request_headers'] = raw_headers
                 detection['raw_request_body'] = raw_body_str[:50000]
                 detection['raw_http_request'] = (raw_headers + raw_body_str)[:100000]
+                detection['raw_request_body_full'] = raw_body_full
+                detection['raw_http_request_full'] = raw_headers + raw_body_full
                 detection['frame_number'] = packet.frame_number
                 detection['src_ip'] = packet.src_ip
                 detection['dst_ip'] = packet.dst_ip

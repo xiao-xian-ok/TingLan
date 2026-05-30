@@ -637,6 +637,8 @@ class BurpStyleViewer(QFrame):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._current_detection: Optional[DetectionResult] = None
+        self._full_text = ""
         self._setupUI()
 
     def _setupUI(self):
@@ -680,6 +682,23 @@ class BurpStyleViewer(QFrame):
         copy_btn.clicked.connect(self._copyToClipboard)
         title_layout.addWidget(copy_btn)
 
+        export_btn = QPushButton("导出完整")
+        export_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #43A047;
+                color: white;
+                border: none;
+                border-radius: 3px;
+                padding: 3px 10px;
+                font-size: 11px;
+            }
+            QPushButton:hover {
+                background-color: #2E7D32;
+            }
+        """)
+        export_btn.clicked.connect(self._exportFullView)
+        title_layout.addWidget(export_btn)
+
         layout.addWidget(title_bar)
 
         # 内容区域
@@ -699,6 +718,8 @@ class BurpStyleViewer(QFrame):
 
     def setContent(self, detection: DetectionResult):
         """Burp Suite风格展示HTTP请求"""
+        self._current_detection = detection
+        self._full_text = ""
         lines = []
 
         # 优先使用真实的 HTTP 请求数据
@@ -846,15 +867,78 @@ class BurpStyleViewer(QFrame):
                     sample_str = sample_str[:50000] + "\n... (截断)"
                 lines.append(sample_str)
 
-        self.text_edit.setPlainText('\n'.join(lines))
+        preview_text = '\n'.join(lines)
+        self._full_text = self._buildFullExportText(detection, preview_text)
+        self.text_edit.setPlainText(preview_text)
 
     def clear(self):
+        self._current_detection = None
+        self._full_text = ""
         self.text_edit.clear()
 
     def _copyToClipboard(self):
         from PySide6.QtWidgets import QApplication
         clipboard = QApplication.clipboard()
         clipboard.setText(self.text_edit.toPlainText())
+
+    def _buildFullExportText(self, detection: DetectionResult, preview_text: str) -> str:
+        """Return the non-preview Burp text when full request fields were preserved."""
+        full_text = preview_text
+        if not detection.raw_result or not isinstance(detection.raw_result, dict):
+            return full_text
+
+        raw_result = detection.raw_result
+        raw_http = str(raw_result.get('raw_http_request', '') or '')
+        raw_http_full = str(raw_result.get('raw_http_request_full', '') or '')
+        raw_body = str(raw_result.get('raw_request_body', '') or '')
+        raw_body_full = str(raw_result.get('raw_request_body_full', '') or '')
+        if raw_http and raw_http_full and raw_http_full != raw_http:
+            full_text = full_text.replace(raw_http, raw_http_full, 1)
+            if raw_body:
+                duplicate_body = raw_http_full + "\n\n" + raw_body
+                full_text = full_text.replace(duplicate_body, raw_http_full, 1)
+            return full_text
+
+        if raw_body and raw_body_full and raw_body_full != raw_body:
+            full_text = full_text.replace(raw_body, raw_body_full, 1)
+        elif not raw_http_full and raw_body_full and 'raw_request_headers' in raw_result:
+            headers = str(raw_result.get('raw_request_headers', '') or '')
+            if headers:
+                full_text = headers + raw_body_full
+
+        return full_text
+
+    def _exportFullView(self):
+        text = self._full_text or self.text_edit.toPlainText()
+        if not text:
+            QMessageBox.information(self, "导出 Burp Suite 视图", "没有可导出的 Burp Suite 视图")
+            return
+
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出 Burp Suite 视图",
+            self._defaultExportName(),
+            "Text Files (*.txt);;All Files (*)"
+        )
+        if not save_path:
+            return
+
+        if "." not in os.path.basename(save_path):
+            save_path += ".txt"
+
+        try:
+            with open(save_path, "w", encoding="utf-8", newline="") as fp:
+                fp.write(text)
+            QMessageBox.information(self, "导出成功", f"Burp Suite 视图已导出到:\n{save_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", f"导出 Burp Suite 视图时出错:\n{str(e)}")
+
+    def _defaultExportName(self) -> str:
+        det = self._current_detection
+        uri = det.uri if det else ""
+        name = os.path.basename((uri or "").split("?", 1)[0].rstrip("/")) or "burp_request"
+        safe_name = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in name)
+        return f"{safe_name[:80]}_burp.txt"
 
 
 class ImageViewer(QFrame):

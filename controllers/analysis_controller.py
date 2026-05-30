@@ -631,6 +631,8 @@ class AnalysisWorker(QThread):
                         detection['raw_request_headers'] = raw_headers
                         detection['raw_request_body'] = raw_body_str
                         detection['raw_http_request'] = raw_headers + raw_body_str
+                        detection['raw_request_body_full'] = raw_body_str
+                        detection['raw_http_request_full'] = raw_headers + raw_body_str
                         detection['frame_number'] = http_data.frame_number
                         detection['src_ip'] = http_data.src_ip
                         detection['dst_ip'] = http_data.dst_ip
