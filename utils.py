@@ -42,16 +42,23 @@ def picture(packet):                #保存图片
 
 
 def read_pcap(pcap_file):
+    import asyncio
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
     service = AnalysisService()
     tshark_exe = service.find_tshark()
-    
+
     if not tshark_exe:
         print("[-] 警告：未找到 tshark 路径")
 
     cap = pyshark.FileCapture(
-        str(pcap_file), 
+        str(pcap_file),
         tshark_path=str(tshark_exe) if tshark_exe else None,
-        keep_packets=False 
+        keep_packets=False
     )
     return cap
 

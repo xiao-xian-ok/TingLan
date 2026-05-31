@@ -8,7 +8,7 @@ import shlex
 import logging
 import threading
 import weakref
-from typing import Optional, Dict, List, Any, Set
+from typing import Optional, Dict, List, Tuple, Any, Set
 from dataclasses import dataclass, field
 from collections import deque
 
@@ -208,7 +208,7 @@ class StreamAnalysisWorker(QThread):
                 r"C:\Program Files\Wireshark\tshark.exe",
                 r"C:\Program Files (x86)\Wireshark\tshark.exe",
                 r"D:\Program Files\Wireshark\tshark.exe",
-                r"D:\Wireshark\tshark.exe",
+                r"E:\wireshark\tshark.exe",
                 os.path.join(os.environ.get("ProgramFiles", ""), "Wireshark", "tshark.exe"),
                 os.path.join(os.environ.get("ProgramFiles(x86)", ""), "Wireshark", "tshark.exe"),
             ]
@@ -368,8 +368,29 @@ class StreamAnalysisWorker(QThread):
         if self._is_cancelled:
             return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets, rtp_streams)
 
+        self._emit_progress(64, "深度协议分析 (SSH/TLS/SMB/RDP/Redis 等)...")
+        deep_findings, deep_extracted = self._run_deep_protocol_analysis()
+        protocol_findings.extend(deep_findings)
+        for fp in deep_extracted:
+            if os.path.isfile(fp):
+                fname = os.path.basename(fp)
+                fsize = os.path.getsize(fp)
+                fext = os.path.splitext(fname)[1].lower()
+                ftype = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg"}.get(fext.lstrip("."), "application/octet-stream")
+                extracted_files.append(ExtractedFile(
+                    file_path=fp,
+                    file_name=fname,
+                    file_type=ftype,
+                    file_size=fsize,
+                    pcap_path=self.pcap_path
+                ))
+
+        if self._is_cancelled:
+            return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets, rtp_streams)
+
         self._emit_progress(64, "HTTP 对象提取...")
-        extracted_files = self._export_http_objects()
+        http_extracted = self._export_http_objects()
+        extracted_files.extend(http_extracted)
 
         if self._is_cancelled:
             return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets, rtp_streams)
@@ -638,268 +659,48 @@ class StreamAnalysisWorker(QThread):
         return "\r\n".join(header_lines)
 
     def _run_icmp_analysis(self) -> List[ProtocolFinding]:
-        import re
-
+        from core.protocol_analyzer import ICMPAnalyzer
         findings: List[ProtocolFinding] = []
-
         try:
-            config = StreamConfig(
-                pcap_path=self.pcap_path,
-                display_filter="icmp",
-                output_format=OutputFormat.EK
-            )
-
-            all_data = bytearray()
-            packet_numbers = []
-            icmp_count = 0
-
-            for packet in self._handler.stream_packets(config):
-                if self._is_cancelled:
-                    break
-
-                icmp_count += 1
-
-                layers = packet.raw_ek_data.get('layers', {})
-                data_layer = layers.get('data', {})
-
-                data_hex = None
-                for key in ['data_data_data', 'data_data', 'data']:
-                    if key in data_layer:
-                        data_hex = data_layer[key]
-                        if isinstance(data_hex, list):
-                            data_hex = data_hex[0] if data_hex else None
-                        break
-
-                if data_hex:
-                    try:
-                        all_data.extend(bytes.fromhex(data_hex.replace(":", "")))
-                        packet_numbers.append(packet.frame_number)
-                    except Exception:
-                        pass
-
-                del packet
-
-                if len(all_data) > 1024 * 1024:  # 1MB上限
-                    break
-
-            if icmp_count == 0:
-                self._emit_progress(50, "未发现ICMP流量")
-                return findings
-
-            if len(all_data) > 4:
-                try:
-                    text = bytes(all_data).decode('utf-8', errors='ignore')
-                    printable_ratio = sum(1 for c in text if c.isprintable() or c in '\r\n\t') / max(len(text), 1)
-
-                    if printable_ratio > 0.7:
-                        flag_match = re.search(r'(flag\{[^}]+\}|ctf\{[^}]+\})', text, re.IGNORECASE)
-
-                        pf = ProtocolFinding(
-                            protocol="ICMP",
-                            finding_type="FLAG发现" if flag_match else "隐写数据",
-                            description=f"在 {len(packet_numbers)} 个ICMP包中发现隐藏数据 (帧 {packet_numbers[0]}-{packet_numbers[-1]})" if packet_numbers else "ICMP隐藏数据",
-                            data=text[:500],
-                            confidence=0.9 if flag_match else 0.7,
-                            is_flag=bool(flag_match)
-                        )
-                        findings.append(pf)
-                        self.protocolFindingFound.emit(pf)
-                except Exception:
-                    pass
-
-            all_data.clear()
-            packet_numbers.clear()
-
-            self._emit_progress(55, f"ICMP分析完成: {icmp_count} 包, {len(findings)} 发现")
-
+            analyzer = ICMPAnalyzer()
+            result = analyzer.analyze_pcap(self.pcap_path)
+            for af in result.findings:
+                pf = ProtocolFinding.from_analyzer_finding(af)
+                findings.append(pf)
+                self.protocolFindingFound.emit(pf)
+            self._emit_progress(55, f"ICMP分析完成: {len(findings)} 个发现")
         except Exception as e:
-            logger.debug(f"ICMP分析异常: {e}")
-
+            logger.warning(f"ICMP 分析异常: {e}")
         return findings
 
     def _run_dns_analysis(self) -> List[ProtocolFinding]:
+        from core.protocol_analyzer import DNSCovertChannelAnalyzer
         findings: List[ProtocolFinding] = []
-
         try:
-            from core.dns_analyzer import (
-                extract_dns_domains, try_decode_buffer, save_domain_list
-            )
-
-            config = StreamConfig(
-                pcap_path=self.pcap_path,
-                display_filter="dns",
-                output_format=OutputFormat.EK
-            )
-
-            def _packet_iter():
-                for pkt in self._handler.stream_packets(config):
-                    if self._is_cancelled:
-                        break
-                    yield pkt
-
-            all_domains, tunnel_buffers, commands = extract_dns_domains(_packet_iter())
-
-            if not all_domains:
-                self._emit_progress(58, "未发现DNS流量")
-                return findings
-
-            # TXT 指令发现
-            for frame_num, cmd in commands:
-                pf = ProtocolFinding(
-                    protocol="DNS",
-                    finding_type="TXT指令",
-                    description=f"DNS TXT 双层Base64指令 (帧 {frame_num})",
-                    data=cmd[:500],
-                    confidence=0.9,
-                    is_flag="flag{" in cmd.lower()
-                )
+            analyzer = DNSCovertChannelAnalyzer()
+            result = analyzer.analyze_pcap(self.pcap_path)
+            for af in result.findings:
+                pf = ProtocolFinding.from_analyzer_finding(af)
                 findings.append(pf)
                 self.protocolFindingFound.emit(pf)
-
-            # 隧道数据解码
-            for base_domain, buffer in tunnel_buffers.items():
-                if len(buffer) < 10:
-                    continue
-                decoded, mode_name = try_decode_buffer(buffer)
-                if decoded:
-                    import re
-                    flag_match = re.search(
-                        r'(flag\{[^}]+\}|ctf\{[^}]+\})', decoded, re.IGNORECASE
-                    )
-                    pf = ProtocolFinding(
-                        protocol="DNS",
-                        finding_type="FLAG发现" if flag_match else "隧道数据",
-                        description=f"DNS隧道 ({base_domain}), 解码: {mode_name}",
-                        data=decoded[:500],
-                        decode_chain=mode_name,
-                        confidence=0.85 if flag_match else 0.7,
-                        is_flag=bool(flag_match)
-                    )
-                    findings.append(pf)
-                    self.protocolFindingFound.emit(pf)
-
-            save_domain_list(all_domains, self.pcap_path)
-
-            self._emit_progress(58, f"DNS分析完成: {len(all_domains)} 查询, {len(findings)} 发现")
-
+            self._emit_progress(58, f"DNS分析完成: {len(findings)} 个发现")
         except Exception as e:
-            logger.debug(f"DNS分析异常: {e}")
-
+            logger.warning(f"DNS 分析异常: {e}")
         return findings
 
     def _run_cs_detection(self) -> List[ProtocolFinding]:
+        from core.protocol_analyzer import CobaltStrikeAnalyzer
         findings: List[ProtocolFinding] = []
-
         try:
-            config = StreamConfig(
-                pcap_path=self.pcap_path,
-                display_filter="http.request",
-                output_format=OutputFormat.EK
-            )
-
-            from core.protocol_analyzer import CobaltStrikeAnalyzer
-
-            seen_cookies = set()
-            seen_body_keys = set()
-            cs_cookies = []
-            cookie_records = []
-            body_records = []
-
-            for packet in self._handler.stream_packets(config):
-                if self._is_cancelled:
-                    break
-
-                layers = packet.raw_ek_data.get('layers', {})
-                http_layer = layers.get('http', {})
-
-                cookie = None
-                for key in ['http_http_cookie', 'http_cookie']:
-                    if key in http_layer:
-                        val = http_layer[key]
-                        cookie = val[0] if isinstance(val, list) else val
-                        break
-
-                if cookie:
-                    for candidate in CobaltStrikeAnalyzer.extract_metadata_cookie_candidates(cookie):
-                        token = candidate['cookie']
-                        if token in seen_cookies:
-                            continue
-                        seen_cookies.add(token)
-                        cs_cookies.append(token)
-                        cookie_records.append(candidate)
-
-                body_candidate = CobaltStrikeAnalyzer.detect_encrypted_http_payload(
-                    packet.http_request_body,
-                    method=packet.http_method,
-                    content_type=packet.http_content_type,
-                    uri=packet.http_uri,
-                )
-                if body_candidate:
-                    body_key = (packet.tcp_stream, packet.frame_number, body_candidate['declared_length'])
-                    if body_key not in seen_body_keys:
-                        seen_body_keys.add(body_key)
-                        body_candidate.update({
-                            'frame_number': packet.frame_number,
-                            'src_ip': packet.src_ip,
-                            'dst_ip': packet.dst_ip,
-                            'tcp_stream': packet.tcp_stream,
-                        })
-                        self._write_cs_payload_artifact(
-                            body_candidate,
-                            packet.http_request_body,
-                            len(body_records)
-                        )
-                        body_records.append(body_candidate)
-
-                del packet
-
-            if cs_cookies or body_records:
-                confidence = max(c.get('confidence', 0.60) for c in cookie_records) if cookie_records else 0.60
-                if body_records:
-                    confidence = max(confidence, max(b.get('confidence', 0.70) for b in body_records))
-                data_lines = []
-                if cs_cookies:
-                    data_lines.append("Metadata Cookie:")
-                    data_lines.extend(c[:80] + "..." for c in cs_cookies[:5])
-                if body_records:
-                    data_lines.append("Encrypted HTTP Body:")
-                    for record in body_records[:10]:
-                        data_lines.append(
-                            f"frame={record['frame_number']} stream={record['tcp_stream']} "
-                            f"{record['method']} {record['uri']} len={record['declared_length']} "
-                            f"entropy={record['entropy']:.2f}"
-                        )
-                        if record.get('encrypted_hex_preview'):
-                            preview = record['encrypted_hex_preview'][:128]
-                            suffix = "..." if len(record['encrypted_hex_preview']) > 128 else ""
-                            data_lines.append(f"encrypted_hex={preview}{suffix}")
-                pf = ProtocolFinding(
-                    protocol="CS",
-                    finding_type="Beacon Traffic",
-                    title="Cobalt Strike Beacon Traffic",
-                    description=(
-                        f"检测到 {len(cs_cookies)} 个疑似 CobaltStrike Metadata Cookie, "
-                        f"{len(body_records)} 个疑似加密 Beacon HTTP Body"
-                    ),
-                    data="\n".join(data_lines),
-                    decode_chain="CS length-prefixed encrypted HTTP body",
-                    confidence=confidence,
-                    raw_values=cookie_records + body_records
-                )
+            analyzer = CobaltStrikeAnalyzer()
+            result = analyzer.analyze_pcap(self.pcap_path)
+            for af in result.findings:
+                pf = ProtocolFinding.from_analyzer_finding(af)
                 findings.append(pf)
                 self.protocolFindingFound.emit(pf)
-
-            seen_cookies.clear()
-            seen_body_keys.clear()
-            status = (
-                f"CS检测完成: {len(cs_cookies)} 可疑Cookie, {len(body_records)} 加密Body"
-                if (cs_cookies or body_records) else "未发现CS特征"
-            )
-            self._emit_progress(60, status)
-
+            self._emit_progress(60, f"CS检测完成: {len(findings)} 个发现")
         except Exception as e:
-            logger.debug(f"CS检测异常: {e}")
-
+            logger.warning(f"CS 分析异常: {e}")
         return findings
 
     def _write_cs_payload_artifact(self, record: Dict[str, Any], body: bytes, index: int) -> None:
@@ -937,6 +738,45 @@ class StreamAnalysisWorker(QThread):
         except Exception as e:
             logger.warning(f"RTP 分析异常: {e}")
             return []
+
+    def _run_deep_protocol_analysis(self) -> Tuple[List[ProtocolFinding], List[str]]:
+        """运行 ProtocolAnalyzerManager 中所有注册的协议分析器
+
+        Returns:
+            (findings, extracted_file_paths) 双元组
+        """
+        findings: List[ProtocolFinding] = []
+        extracted_file_paths: List[str] = []
+
+        try:
+            from core.protocol_analyzer import ProtocolAnalyzerManager, ProtocolType
+
+            SKIP = {ProtocolType.ICMP, ProtocolType.DNS, ProtocolType.COBALT_STRIKE}
+
+            manager = ProtocolAnalyzerManager()
+            results = manager.analyze_all_pcap(self.pcap_path, generate_plot=True)
+
+            total_findings = 0
+            for proto_type, result in results.items():
+                if proto_type in SKIP:
+                    continue
+                if not result.has_findings():
+                    continue
+                for af in result.findings:
+                    pf = ProtocolFinding.from_analyzer_finding(af)
+                    findings.append(pf)
+                    self.protocolFindingFound.emit(pf)
+                    total_findings += 1
+                extracted_file_paths.extend(
+                    f for f in result.extracted_files if os.path.isfile(f)
+                )
+
+            self._emit_progress(64, f"深度协议分析完成: {len(results)} 个协议, {total_findings} 个发现")
+
+        except Exception as e:
+            logger.warning(f"深度协议分析异常: {e}")
+
+        return findings, extracted_file_paths
 
     def _export_http_objects(self) -> List[ExtractedFile]:
         """委托给AnalysisService做智能提取"""

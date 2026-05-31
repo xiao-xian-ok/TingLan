@@ -655,6 +655,13 @@ class FTPAnalyzer(ProtocolAnalyzer):
     def protocol_type(self) -> ProtocolType:
         return ProtocolType.FTP
 
+    def analyze_pcap(self, pcap_path: str, **kwargs) -> ProtocolAnalysisResult:
+        if 'output_dir' not in kwargs and not self.output_dir:
+            pcap_name = os.path.splitext(os.path.basename(pcap_path))[0]
+            PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
+            kwargs['output_dir'] = str(PROJECT_ROOT / 'output' / 'ftp' / pcap_name)
+        return super().analyze_pcap(pcap_path, **kwargs)
+
     def analyze(self, packets: List, **kwargs) -> ProtocolAnalysisResult:
         findings = []
         extracted_files = []
@@ -801,6 +808,12 @@ class MMSAnalyzer(ProtocolAnalyzer):
     def __init__(self, output_dir: Optional[str] = None):
         self.output_dir = output_dir
 
+    def analyze_pcap(self, pcap_path: str, **kwargs) -> ProtocolAnalysisResult:
+        if 'output_dir' not in kwargs and not self.output_dir:
+            pcap_name = os.path.splitext(os.path.basename(pcap_path))[0]
+            kwargs['output_dir'] = str(pathlib.Path(__file__).resolve().parent.parent / 'output' / 'mms' / pcap_name)
+        return super().analyze_pcap(pcap_path, **kwargs)
+
     @property
     def protocol_type(self) -> ProtocolType:
         return ProtocolType.MMS
@@ -946,6 +959,12 @@ class BluetoothAnalyzer(ProtocolAnalyzer):
 
     def __init__(self, output_dir: Optional[str] = None):
         self.output_dir = output_dir
+
+    def analyze_pcap(self, pcap_path: str, **kwargs) -> ProtocolAnalysisResult:
+        if 'output_dir' not in kwargs and not self.output_dir:
+            pcap_name = os.path.splitext(os.path.basename(pcap_path))[0]
+            kwargs['output_dir'] = str(pathlib.Path(__file__).resolve().parent.parent / 'output' / 'bluetooth' / pcap_name)
+        return super().analyze_pcap(pcap_path, **kwargs)
 
     @property
     def protocol_type(self) -> ProtocolType:
@@ -1109,6 +1128,12 @@ class SMTPAnalyzer(ProtocolAnalyzer):
 
     def __init__(self, output_dir: Optional[str] = None):
         self.output_dir = output_dir
+
+    def analyze_pcap(self, pcap_path: str, **kwargs) -> ProtocolAnalysisResult:
+        if 'output_dir' not in kwargs and not self.output_dir:
+            pcap_name = os.path.splitext(os.path.basename(pcap_path))[0]
+            kwargs['output_dir'] = str(pathlib.Path(__file__).resolve().parent.parent / 'output' / 'smtp' / pcap_name)
+        return super().analyze_pcap(pcap_path, **kwargs)
 
     @property
     def protocol_type(self) -> ProtocolType:
@@ -2115,26 +2140,25 @@ class USBAnalyzer(ProtocolAnalyzer):
                     is_flag=True
                 ))
 
-        if mouse_trace:
-            findings.append(AnalysisFinding(
-                finding_type=FindingType.INFO,
-                protocol=ProtocolType.USB,
-                title="USB鼠标轨迹",
-                description=f"恢复 {len(mouse_trace)} 个鼠标坐标点",
-                data=f"[{len(mouse_trace)} 个坐标点]",
-                confidence=0.7,
-                is_flag=False
-            ))
-
-        # 绘图（可选）
+        # 绘图（可选）— 保存到文件（先于 finding 创建，以便展示路径）
+        plot_path = None
         if generate_plot and mouse_trace:
             try:
+                import matplotlib
+                matplotlib.use('Agg')  # 非交互后端，线程安全
                 import matplotlib.pyplot as plt
                 import numpy as np
 
                 x_coords = np.array([p[0] for p in mouse_trace])
                 y_coords = np.array([p[1] for p in mouse_trace])
                 time_index = np.linspace(0, 1, len(mouse_trace))
+
+                # 确定输出目录
+                out_dir = kwargs.get('output_dir')
+                if not out_dir:
+                    pcap_name = os.path.splitext(os.path.basename(pcap_path))[0]
+                    out_dir = str(pathlib.Path(__file__).resolve().parent.parent / 'output' / 'usb' / pcap_name)
+                os.makedirs(out_dir, exist_ok=True)
 
                 plt.figure(figsize=(10, 6))
                 plt.plot(x_coords, y_coords, color='gray', linewidth=0.5, alpha=0.3)
@@ -2145,9 +2169,26 @@ class USBAnalyzer(ProtocolAnalyzer):
                 plt.axis('equal')
                 plt.title("Mouse Movement Trace (Gradient Analysis)")
                 plt.grid(True, linestyle=':', alpha=0.6)
-                plt.show()
+                plot_path = os.path.join(out_dir, 'mouse_trace.png')
+                plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+                plt.close()
+                logger.info(f"鼠标轨迹图已保存: {plot_path}")
             except ImportError:
                 logger.warning("matplotlib/numpy 未安装, 跳过鼠标轨迹绘图")
+
+        if mouse_trace:
+            desc = f"恢复 {len(mouse_trace)} 个鼠标坐标点"
+            if plot_path:
+                desc += f"\n轨迹图: {plot_path}"
+            findings.append(AnalysisFinding(
+                finding_type=FindingType.INFO,
+                protocol=ProtocolType.USB,
+                title="USB鼠标轨迹",
+                description=desc,
+                data=f"[{len(mouse_trace)} 个坐标点]",
+                confidence=0.7,
+                is_flag=False
+            ))
 
         summary_parts = []
         if kb_result:
@@ -2159,12 +2200,17 @@ class USBAnalyzer(ProtocolAnalyzer):
         if flags:
             summary_parts.append(f"FLAG: {flags[0][:80]}")
 
+        extracted = []
+        if plot_path and os.path.exists(plot_path):
+            extracted.append(plot_path)
+
         return ProtocolAnalysisResult(
             protocol=ProtocolType.USB,
             packet_count=packet_count,
             findings=findings,
             summary="; ".join(summary_parts),
-            metadata={'mouse_trace': mouse_trace, 'keyboard_text': "".join(kb_result)}
+            extracted_files=extracted,
+            metadata={'mouse_trace': mouse_trace, 'keyboard_text': "".join(kb_result), 'plot_path': plot_path}
         )
 
 
@@ -2626,7 +2672,7 @@ class TLSAnalyzer(ProtocolAnalyzer):
     def search_and_highlight_flags(self, output_dir, exported_files):
         """在新导出的 HTTP 文件中搜索并高亮显示疑似的 Flag 内容"""
         if not exported_files:
-            return
+            return []
 
         print('[阶段6] 自动搜索解密内容中的 Flag')
         print('-' * 60)
@@ -2635,6 +2681,7 @@ class TLSAnalyzer(ProtocolAnalyzer):
         # 支持匹配 flag{...}, ctf{...}, DASCTF{...}, flag_...{...} 等 CTF 常见格式
         flag_pattern = re.compile(r'((?:flag|ctf|[a-zA-Z0-9]+CTF)[_-]?\{.*?\})', re.IGNORECASE)
         found_flags = False
+        result_flags = []
 
         for fname in exported_files:
             fpath = os.path.join(output_dir, fname)
@@ -2651,6 +2698,8 @@ class TLSAnalyzer(ProtocolAnalyzer):
                     lines = content.splitlines()
                     for i, line in enumerate(lines):
                         if flag_pattern.search(line):
+                            matched = flag_pattern.search(line).group(1)
+                            result_flags.append(matched)
                             # \033[91m = 亮红色, \033[1m = 粗体, \033[0m = 重置颜色
                             highlighted_line = flag_pattern.sub(r'\033[91m\033[1m\1\033[0m', line)
                             print(f'    [行 {i+1}] {highlighted_line.strip()}')
@@ -2661,6 +2710,8 @@ class TLSAnalyzer(ProtocolAnalyzer):
         if not found_flags:
             print('[*] 未在解密的 HTTP 文件中自动匹配到常见格式的 Flag。')
         print()
+
+        return result_flags
 
     def analyze_pcap(self, pcap_path: str, **kwargs) -> ProtocolAnalysisResult:
         """TLS 完整分析入口"""
@@ -2832,7 +2883,17 @@ class TLSAnalyzer(ProtocolAnalyzer):
             extracted_files_list.extend(exported)
 
         if exported:
-            self.search_and_highlight_flags(output_dir, exported)
+            found_flags = self.search_and_highlight_flags(output_dir, exported)
+            for flag_str in found_flags:
+                findings.append(AnalysisFinding(
+                    finding_type=FindingType.CREDENTIAL,
+                    protocol=ProtocolType.TLS,
+                    title="发现 Flag",
+                    description=f"在 {flag_str} 中发现疑似 Flag",
+                    data=flag_str,
+                    confidence=0.95,
+                    is_flag=True
+                ))
 
         # 摘要
         print('=' * 60)
@@ -2868,7 +2929,7 @@ class TLSAnalyzer(ProtocolAnalyzer):
 
         return ProtocolAnalysisResult(
             protocol=ProtocolType.TLS,
-            packet_count=stream_count,
+            packet_count=stream_count or len(extracted_files_list) or len(findings) or 0,
             findings=findings,
             summary="; ".join(summary_parts),
             extracted_files=extracted_files_list,
@@ -3618,7 +3679,6 @@ class RedisAnalyzer(ProtocolAnalyzer):
     def analyze_redis_traffic(self, pcap_file, tshark_path):
         """分析 Redis 流量，提取凭证、命令、写入数据等"""
 
-        # 更可靠的方式: 直接提取 tcp payload
         payload_stdout = self._run_tshark(tshark_path, [
             "-r", pcap_file,
             "-Y", "tcp.port == 6379 && tcp.payload",
@@ -3681,14 +3741,11 @@ class RedisAnalyzer(ProtocolAnalyzer):
                 # SET / SETNX / SETEX / MSET -> 键值对
                 elif cmd_upper in ("SET", "SETNX", "SETEX", "MSET", "HSET", "HSETNX", "APPEND"):
                     if cmd_upper == "MSET":
-                        # MSET k1 v1 k2 v2 ...
                         for j in range(1, len(parts) - 1, 2):
                             key_values.append({'cmd': cmd_upper, 'key': parts[j], 'value': parts[j+1]})
                     elif cmd_upper == "SETEX" and len(parts) >= 4:
-                        # SETEX key ttl value
                         key_values.append({'cmd': cmd_upper, 'key': parts[1], 'value': parts[3]})
                     elif cmd_upper == "HSET" and len(parts) >= 4:
-                        # HSET hash field value
                         key_values.append({'cmd': cmd_upper, 'key': f"{parts[1]}->{parts[2]}", 'value': parts[3]})
                     elif len(parts) >= 3:
                         key_values.append({'cmd': cmd_upper, 'key': parts[1], 'value': parts[2]})
@@ -3771,15 +3828,48 @@ class RedisAnalyzer(ProtocolAnalyzer):
             print("[*] 尝试通过 TCP 流提取...")
             commands, raw = self.extract_redis_commands(pcap_path, tshark_path)
             if commands:
-                print(f"[+] 从 TCP 流中解析到 {len(commands)} 条命令:")
+                print(f"[+] 从 TCP 流中解析到 {len(commands)} 条命令")
+
+                # 导出完整结果到文件
+                pcap_name = os.path.splitext(os.path.basename(pcap_path))[0]
+                out_dir = os.path.join('output', 'redis', pcap_name)
+                os.makedirs(out_dir, exist_ok=True)
+                export_path = os.path.join(out_dir, 'redis_commands.txt')
+
+                exported_lines = []
                 for direction, parts in commands:
-                    print(f"    [{direction}] {self._format_command(parts)}")
+                    line = f"[{direction}] {self._format_command(parts)}"
+                    print(f"    {line}")
+                    exported_lines.append(line)
+
+                with open(export_path, 'w', encoding='utf-8') as f:
+                    f.write('\n'.join(exported_lines))
+                print(f"[+] Redis命令已导出: {export_path}")
+
+                # 在所有数据中搜索flag
+                all_text = '\n'.join(exported_lines)
+                if self.detect_flag_pattern(all_text):
+                    flag_keywords = ['flag{', 'ctf{', 'ctfhub{', 'key{', 'secret{']
+                    flag_lines = [line for line in exported_lines
+                                  if any(k in line.lower() for k in flag_keywords)]
+                    for fl in flag_lines[:5]:
+                        findings.append(AnalysisFinding(
+                            finding_type=FindingType.HIDDEN_DATA,
+                            protocol=ProtocolType.REDIS,
+                            title="Redis TCP流中发现FLAG",
+                            description="在TCP流数据中检测到flag标记",
+                            data=fl,
+                            confidence=0.95,
+                            is_flag=True
+                        ))
+
                 findings.append(AnalysisFinding(
                     finding_type=FindingType.INFO,
                     protocol=ProtocolType.REDIS,
                     title="Redis TCP流命令",
-                    description=f"从 TCP 流中解析到 {len(commands)} 条命令",
-                    data='\n'.join(f"[{d}] {self._format_command(p)}" for d, p in commands[:50]),
+                    description=f"从 TCP 流中解析到 {len(commands)} 条命令，已导出至 {export_path}",
+                    data=f"共 {len(commands)} 条命令\n导出文件: {export_path}\n预览前5条:\n" +
+                         '\n'.join(f"[{d}] {self._format_command(p)}" for d, p in commands[:5]),
                     confidence=0.7,
                     is_flag=False
                 ))
@@ -3788,7 +3878,8 @@ class RedisAnalyzer(ProtocolAnalyzer):
                 protocol=ProtocolType.REDIS,
                 packet_count=len(commands) if commands else 0,
                 findings=findings,
-                summary=f"TCP流命令: {len(commands)} 条" if commands else "未发现Redis流量"
+                extracted_files=[export_path] if commands else [],
+                summary=f"TCP流命令: {len(commands)} 条，导出至 {export_path}" if commands else "未发现Redis流量"
             )
 
         # 只打印客户端命令
@@ -3924,7 +4015,18 @@ class RedisAnalyzer(ProtocolAnalyzer):
                 is_flag=False
             ))
 
-        # 7. 摘要
+        # 7. 导出完整命令到文件
+        pcap_name = os.path.splitext(os.path.basename(pcap_path))[0]
+        out_dir = os.path.join('output', 'redis', pcap_name)
+        os.makedirs(out_dir, exist_ok=True)
+        export_path = os.path.join(out_dir, 'redis_commands.txt')
+        with open(export_path, 'w', encoding='utf-8') as f:
+            for direction, cmd_str, src, dst in all_decoded:
+                f.write(f"[{direction}] {cmd_str}\n")
+        print(f"[+] Redis命令已导出: {export_path}")
+        extracted_files = [export_path]
+
+        # 8. 摘要
         print("=" * 60)
         summary_parts = [f"命令: {len(all_decoded)} 条", f"凭证: {len(credentials)} 条",
                          f"写入: {len(key_values)} 条"]
@@ -3938,6 +4040,7 @@ class RedisAnalyzer(ProtocolAnalyzer):
             protocol=ProtocolType.REDIS,
             packet_count=len(all_decoded),
             findings=findings,
+            extracted_files=extracted_files,
             summary="; ".join(summary_parts),
             metadata={
                 'credentials': credentials,
