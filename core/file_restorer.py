@@ -405,20 +405,19 @@ FILE_SIGNATURES: List[FileSignature] = [
 ]
 
 # 按magic长度和首字节分组，加速查找
-_SIGNATURE_INDEX: Dict[int, Dict[int, List[FileSignature]]] = {}
+# The nested mapping is magic length -> signature offset -> leading magic byte.
+_SIGNATURE_INDEX: Dict[int, Dict[int, Dict[int, List[Tuple[int, FileSignature]]]]] = {}
 
 def _build_signature_index():
     global _SIGNATURE_INDEX
-    for sig in FILE_SIGNATURES:
+    _SIGNATURE_INDEX = {}
+    for signature_order, sig in enumerate(FILE_SIGNATURES):
         magic_len = len(sig.magic)
         first_byte = sig.magic[0]
 
-        if magic_len not in _SIGNATURE_INDEX:
-            _SIGNATURE_INDEX[magic_len] = {}
-        if first_byte not in _SIGNATURE_INDEX[magic_len]:
-            _SIGNATURE_INDEX[magic_len][first_byte] = []
-
-        _SIGNATURE_INDEX[magic_len][first_byte].append(sig)
+        by_offset = _SIGNATURE_INDEX.setdefault(magic_len, {})
+        by_first_byte = by_offset.setdefault(sig.offset, {})
+        by_first_byte.setdefault(first_byte, []).append((signature_order, sig))
 
 _build_signature_index()
 
@@ -470,33 +469,26 @@ class FileRestorer:
         if not data:
             return None
 
-        best_match = None
-        best_length = 0
-
         for magic_len in sorted(_SIGNATURE_INDEX.keys(), reverse=True):
-            if len(data) < magic_len:
-                continue
-
-            first_byte = data[0]
-            if first_byte not in _SIGNATURE_INDEX[magic_len]:
-                continue
-
-            for sig in _SIGNATURE_INDEX[magic_len][first_byte]:
-                offset = sig.offset
+            candidates: List[Tuple[int, FileSignature]] = []
+            for offset, by_first_byte in _SIGNATURE_INDEX[magic_len].items():
                 if len(data) < offset + magic_len:
                     continue
+                candidates.extend(by_first_byte.get(data[offset], []))
 
+            # Preserve detect_file_type's declaration-order tiebreaker for
+            # equal-length signatures after the indexed candidate lookup.
+            for _signature_order, sig in sorted(candidates, key=lambda item: item[0]):
+                offset = sig.offset
                 if data[offset:offset + magic_len] == sig.magic:
-                    if magic_len > best_length:
-                        best_match = sig
-                        best_length = magic_len
+                    return sig
 
-        return best_match
+        return None
 
     def restore_file(self, data: bytes, output_dir: str = None) -> FileRecovery:
         result = FileRecovery(data=data, size=len(data))
 
-        signature = self.detect_file_type(data)
+        signature = self.detect_file_type_fast(data)
         if not signature:
             return result
 

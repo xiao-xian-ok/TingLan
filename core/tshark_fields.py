@@ -6,9 +6,10 @@ import csv
 import io
 from typing import List, Optional
 
-# ASCII Record Separator. It is far less likely to appear in HTTP payloads,
-# URIs, headers, or decoded text than pipe, comma, or tab.
-FIELD_SEPARATOR = "\x1e"
+# ASCII Unit Separator. It is far less likely to appear in HTTP payloads,
+# URIs, headers, or decoded text than pipe, comma, or tab, and unlike 0x1e it
+# is not treated as a line boundary by Python's str.splitlines().
+FIELD_SEPARATOR = "\x1f"
 
 
 def separator_arg() -> str:

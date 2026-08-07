@@ -41,7 +41,7 @@ def picture(packet):                #保存图片
             print(f"保存失败: {e}")
 
 
-def read_pcap(pcap_file):
+def read_pcap(pcap_file, display_filter=None):
     import asyncio
     try:
         asyncio.get_event_loop()
@@ -55,11 +55,14 @@ def read_pcap(pcap_file):
     if not tshark_exe:
         print("[-] 警告：未找到 tshark 路径")
 
-    cap = pyshark.FileCapture(
-        str(pcap_file),
-        tshark_path=str(tshark_exe) if tshark_exe else None,
-        keep_packets=False
-    )
+    capture_kwargs = {
+        "tshark_path": str(tshark_exe) if tshark_exe else None,
+        "keep_packets": False,
+    }
+    if display_filter:
+        capture_kwargs["display_filter"] = display_filter
+
+    cap = pyshark.FileCapture(str(pcap_file), **capture_kwargs)
     return cap
 
 def hex_to_string(hex_data):

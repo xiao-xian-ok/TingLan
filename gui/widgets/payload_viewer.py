@@ -33,6 +33,7 @@ from core.display_safety import (
     safe_display_text as _safe_display_text,
 )
 from core.protocol_display import format_protocol_raw_values
+from core.tshark_locator import find_tshark
 
 
 def is_binary_data(data: str, threshold: float = 0.3) -> bool:
@@ -2012,23 +2013,9 @@ class RTPStreamViewer(QFrame):
         return str(pathlib.Path(__file__).resolve().parent.parent.parent / "output" / "rtp")
 
     def _find_tshark(self) -> str:
-        tshark = shutil.which("tshark")
+        tshark = find_tshark()
         if tshark:
             return tshark
-        if sys.platform == "win32":
-            for p in [
-                r"E:\cyber_safe\wireshark\tshark.exe",
-                r"C:\Program Files\Wireshark\tshark.exe",
-                r"C:\Program Files (x86)\Wireshark\tshark.exe",
-                r"D:\Program Files\Wireshark\tshark.exe",
-                os.path.join(os.environ.get("ProgramFiles", ""), "Wireshark", "tshark.exe"),
-            ]:
-                if p and os.path.exists(p):
-                    return p
-        else:
-            for p in ["/usr/bin/tshark", "/usr/local/bin/tshark"]:
-                if os.path.exists(p):
-                    return p
         raise FileNotFoundError("未找到 tshark，请安装 Wireshark")
 
     def _start_export(self, streams: list):

@@ -12,7 +12,6 @@ import sys
 import json
 import time
 import traceback
-import shutil
 import importlib
 from dataclasses import asdict, is_dataclass
 from typing import Any, Dict, List, Optional
@@ -30,6 +29,8 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 for p in [PROJECT_ROOT, os.path.join(PROJECT_ROOT, "core"), os.path.join(PROJECT_ROOT, "models")]:
     if p not in sys.path:
         sys.path.insert(0, p)
+
+from core.tshark_locator import find_tshark
 
 def _import(name, *attrs):
     """尝试从多个路径导入模块"""
@@ -275,20 +276,11 @@ def _jsonable(obj):
 
 def _find_tshark(explicit=None):
     """查找tshark路径"""
+    found = find_tshark(explicit_path=explicit, project_root=PROJECT_ROOT)
+    if found:
+        return found
     if explicit:
-        if os.path.exists(explicit): return explicit
         raise FileNotFoundError(f"tshark不存在: {explicit}")
-
-    found = shutil.which("tshark")
-    if found: return found
-
-    for p in [r"C:\Program Files\Wireshark\tshark.exe",
-              r"C:\Program Files (x86)\Wireshark\tshark.exe",
-              r"D:\Program Files\Wireshark\tshark.exe",
-              r"D:\Wireshark\tshark.exe",
-              r"E:\internet_safe\wireshark\tshark.exe",
-              "/usr/bin/tshark", "/usr/local/bin/tshark", "/opt/homebrew/bin/tshark"]:
-        if os.path.exists(p): return p
     raise FileNotFoundError("未找到TShark")
 
 

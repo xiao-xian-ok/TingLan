@@ -6,9 +6,10 @@ import sys
 import time
 import subprocess
 import tempfile
-import shutil
 import hashlib
 import math
+import logging
+import re
 from collections import Counter
 from typing import List, Dict, Optional, Callable, Tuple, Generator
 
@@ -41,8 +42,22 @@ from core.tshark_stream import (
 )
 
 from core.attack_detector import AttackDetector
+from core.http_response_inspector import (
+    HttpResponseInspector,
+    content_disposition_from_response_lines,
+)
 from core.safe_paths import iter_safe_child_files, safe_unique_path
 from core.tshark_fields import separator_arg, split_fields
+from core.tshark_locator import find_tshark
+from core.opaque_http_recovery import (
+    OpaqueHttpRequest,
+    file_like_uri_score,
+    is_file_like_uri,
+    parse_follow_tcp_raw,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 class AnalysisService(IAnalysisService):
@@ -52,23 +67,7 @@ class AnalysisService(IAnalysisService):
         self._handler: Optional[TsharkProcessHandler] = None
 
     def find_tshark(self) -> Optional[str]:
-        tshark_path = shutil.which("tshark")
-        if tshark_path:
-            return tshark_path
-
-        possible_paths = [
-            r"E:\wireshark\tshark.exe",
-            r"C:\Program Files\Wireshark\tshark.exe",
-            r"C:\Program Files (x86)\Wireshark\tshark.exe",
-            r"D:\Program Files\Wireshark\tshark.exe",
-            r"D:\Wireshark\tshark.exe",
-            "/usr/bin/tshark",
-            "/usr/local/bin/tshark",
-        ]
-        for path in possible_paths:
-            if os.path.exists(path):
-                return path
-        return None
+        return find_tshark()
 
     def analyze_pcap(
         self,
@@ -146,8 +145,16 @@ class AnalysisService(IAnalysisService):
         except Exception:
             return {}, 0, []
 
-    def extract_http_objects(self, pcap_path: str) -> List[ExtractedFile]:
+    def extract_http_objects(
+        self,
+        pcap_path: str,
+        enabled: bool = True,
+        complete_export: bool = False,
+    ) -> List[ExtractedFile]:
         """提取HTTP对象，区分真正的文件下载和普通HTTP流量"""
+        if not enabled:
+            return []
+
         if not self._tshark_path:
             return []
 
@@ -161,68 +168,36 @@ class AnalysisService(IAnalysisService):
         http_metadata = self._get_http_response_metadata(pcap_path)
         print(f"[*] 发现 {len(http_metadata)} 个 HTTP 响应")
 
-        # 识别真正的文件下载
-        real_file_downloads = self._identify_real_file_downloads(http_metadata)
+        # Limit candidate materialization before creating files or scanning bodies.
+        real_file_downloads = self._identify_real_file_downloads(http_metadata)[:200]
         print(f"[*] 识别出 {len(real_file_downloads)} 个真正的文件下载")
 
-        print("[*] 使用 tshark 导出 HTTP 对象...")
-        try:
-            cmd = [
-                self._tshark_path,
-                "-r", pcap_path,
-                "-q",
-                "--export-objects", f"http,{export_dir}"
-            ]
-
-            popen_kwargs = {
-                "capture_output": True,
-                "text": True,
-                "encoding": 'utf-8',
-                "errors": 'replace',
-                "timeout": 120
-            }
-
-            if sys.platform == "win32":
-                popen_kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
-
-            subprocess.run(cmd, **popen_kwargs)
-
-            if os.path.exists(export_dir):
-                files = os.listdir(export_dir)
-                print(f"[*] tshark 导出了 {len(files)} 个原始对象")
-
-                for filepath, filename in iter_safe_child_files(export_dir):
-                    current_name = os.path.basename(filepath)
-                    if current_name != filename:
-                        target, filename = safe_unique_path(export_dir, filename)
-                        os.replace(filepath, target)
-                        filepath = target
-
-                    # 使用智能清洗过滤
-                    ef = self._smart_filter_file(filepath, filename, pcap_path, real_file_downloads)
-                    if ef:
-                        file_hash = self._get_file_hash(filepath)
-                        if file_hash not in seen_hashes:
-                            seen_hashes.add(file_hash)
-                            extracted_files.append(ef)
-                            print(f"[+] 保留: {ef.file_name} ({ef.file_size} bytes, {ef.file_type})")
-
-        except Exception as e:
-            print(f"[!] tshark 导出异常: {e}")
-
-        if real_file_downloads:
-            print(f"[*] 补充提取已识别的文件下载...")
-            for meta in real_file_downloads:
-                try:
-                    ef = self._extract_single_http_response(pcap_path, meta, export_dir)
-                    if ef:
-                        file_hash = self._get_file_hash(ef.file_path)
-                        if file_hash not in seen_hashes:
-                            seen_hashes.add(file_hash)
-                            extracted_files.append(ef)
-                            print(f"[+] 补充提取: {ef.file_name} ({ef.file_size} bytes)")
-                except Exception:
-                    continue
+        if complete_export:
+            print("[*] 使用 tshark 导出全部 HTTP 对象...")
+            self._extract_complete_http_objects(
+                pcap_path,
+                export_dir,
+                real_file_downloads,
+                extracted_files,
+                seen_hashes,
+            )
+        else:
+            print("[*] 批量提取候选 HTTP 响应...")
+            materialized_streams = self._extract_candidate_http_objects(
+                pcap_path,
+                export_dir,
+                real_file_downloads,
+                extracted_files,
+                seen_hashes,
+            )
+            self._extract_opaque_http_objects(
+                pcap_path,
+                export_dir,
+                http_metadata,
+                materialized_streams,
+                extracted_files,
+                seen_hashes,
+            )
 
         extracted_files.sort(key=self._get_file_priority)
 
@@ -237,6 +212,385 @@ class AnalysisService(IAnalysisService):
 
         return extracted_files[:200]
 
+    def _extract_candidate_http_objects(
+        self,
+        pcap_path: str,
+        output_dir: str,
+        candidates: List[Dict],
+        extracted_files: List[ExtractedFile],
+        seen_hashes: set,
+    ) -> set:
+        candidate_frames = {
+            meta.get("frame_number"): meta
+            for meta in candidates
+            if isinstance(meta.get("frame_number"), int) and meta["frame_number"] > 0
+        }
+        if not candidate_frames:
+            return set()
+
+        materialized_streams = set()
+        inspector = HttpResponseInspector()
+
+        cmd = [
+            self._tshark_path,
+            "-r", pcap_path,
+            "-Y", "http.response",
+            "-T", "fields",
+            "-e", "frame.number",
+            "-e", "http.content_type",
+            "-e", "http.content_length",
+            "-e", "http.response.line",
+            "-e", "http.file_data",
+            "-E", separator_arg(),
+            "-E", "quote=n",
+        ]
+
+        popen_kwargs = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+        }
+        if sys.platform == "win32":
+            popen_kwargs["creationflags"] = 0x08000000
+
+        try:
+            process = subprocess.Popen(cmd, **popen_kwargs)
+        except Exception as e:
+            logger.warning("Candidate HTTP object extraction failed: %s", e)
+            return materialized_streams
+
+        try:
+            for line in process.stdout:
+                parts = split_fields(line, expected=5)
+                if not parts or not parts[0].isdigit():
+                    continue
+
+                frame_number = int(parts[0])
+                metadata = candidate_frames.get(frame_number)
+                if metadata is None:
+                    continue
+
+                body = self._decode_http_field_data(parts[4])
+                if len(body) < 200:
+                    continue
+
+                response_line = parts[3] or metadata.get("response_line", "")
+                content_type = parts[1] or metadata.get("content_type", "")
+                content_disposition = content_disposition_from_response_lines(response_line)
+                if not content_disposition:
+                    content_disposition = metadata.get("content_disposition", "")
+                match = inspector.inspect(
+                    frame_number=frame_number,
+                    body=body,
+                    content_type=content_type,
+                    content_disposition=content_disposition,
+                    request_uri=metadata.get("request_uri", ""),
+                )
+                if match is None:
+                    continue
+
+                stream_id = metadata.get("tcp_stream")
+                if isinstance(stream_id, int) and stream_id >= 0:
+                    materialized_streams.add(stream_id)
+                filename = match.filename
+
+                filepath, filename = safe_unique_path(
+                    output_dir,
+                    filename,
+                    fallback=f"frame_{frame_number}.bin",
+                )
+                try:
+                    with open(filepath, "wb") as f:
+                        f.write(body)
+                except OSError as e:
+                    logger.warning("Writing HTTP candidate object failed: %s", e)
+                    continue
+
+                ef = self._smart_filter_file(filepath, filename, pcap_path, candidates)
+                if not ef:
+                    continue
+
+                file_hash = self._get_file_hash(filepath)
+                if file_hash in seen_hashes:
+                    continue
+                seen_hashes.add(file_hash)
+                extracted_files.append(ef)
+                print(f"[+] 保留: {ef.file_name} ({ef.file_size} bytes, {ef.file_type})")
+        except Exception as e:
+            logger.warning("Candidate HTTP object stream failed: %s", e)
+        finally:
+            return_code = process.wait()
+            if return_code != 0:
+                stderr = process.stderr.read() if process.stderr else ""
+                logger.warning(
+                    "Candidate HTTP object extraction failed (exit %s): %s",
+                    return_code,
+                    stderr.strip()[:500],
+                )
+            if process.stdout:
+                process.stdout.close()
+            if process.stderr:
+                process.stderr.close()
+        return materialized_streams
+
+    def _get_http_request_metadata(self, pcap_path: str) -> List[OpaqueHttpRequest]:
+        """Read request identity fields used to find opaque file streams."""
+        cmd = [
+            self._tshark_path,
+            "-r", pcap_path,
+            "-Y", "http.request",
+            "-T", "fields",
+            "-e", "tcp.stream",
+            "-e", "frame.number",
+            "-e", "http.request.uri",
+            "-e", "http.host",
+            "-E", separator_arg(),
+            "-E", "quote=n",
+        ]
+        kwargs = {
+            "capture_output": True,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "timeout": 60,
+        }
+        if sys.platform == "win32":
+            kwargs["creationflags"] = 0x08000000
+        try:
+            result = subprocess.run(cmd, **kwargs)
+        except Exception as exc:
+            logger.warning("HTTP request metadata extraction failed: %s", exc)
+            return []
+        if result.returncode != 0:
+            return []
+
+        requests: List[OpaqueHttpRequest] = []
+        for line in (result.stdout or "").splitlines():
+            fields = split_fields(line, expected=4)
+            try:
+                stream_id = int(fields[0])
+            except (ValueError, TypeError):
+                continue
+            if stream_id < 0 or not fields[2]:
+                continue
+            frame_number = int(fields[1]) if fields[1].isdigit() else 0
+            requests.append(OpaqueHttpRequest(stream_id, fields[2], frame_number, fields[3]))
+        return requests
+
+    def _extract_opaque_http_objects(
+        self,
+        pcap_path: str,
+        output_dir: str,
+        response_metadata: List[Dict],
+        materialized_streams: set,
+        extracted_files: List[ExtractedFile],
+        seen_hashes: set,
+    ) -> None:
+        # Preserve compatibility with injected metadata seams that predate tcp.stream.
+        if response_metadata and not any("tcp_stream" in meta for meta in response_metadata):
+            return
+
+        requests = self._get_http_request_metadata(pcap_path)
+        unique_file_requests = {
+            request.stream_id
+            for request in requests
+            if is_file_like_uri(request.uri)
+        }
+        if len(unique_file_requests) > 64:
+            evidenced_streams = {
+                int(meta["tcp_stream"])
+                for meta in response_metadata
+                if str(meta.get("tcp_stream", "")).lstrip("-").isdigit()
+                and self._looks_like_download_response(meta)
+            }
+            requests = [request for request in requests if request.stream_id in evidenced_streams]
+        ranked_candidates = []
+        seen_streams = set()
+        for request in requests:
+            if request.stream_id in materialized_streams or request.stream_id in seen_streams:
+                continue
+            if not is_file_like_uri(request.uri):
+                continue
+            seen_streams.add(request.stream_id)
+            ranked_candidates.append((file_like_uri_score(request.uri), len(ranked_candidates), request))
+
+        ranked_candidates.sort(key=lambda item: (-item[0], item[1]))
+        strong_candidates = [item for item in ranked_candidates if item[0] >= 80]
+        if strong_candidates:
+            candidates = [item[2] for item in strong_candidates[:24]]
+        else:
+            # Generic extensions remain supported, but only in a small fallback window.
+            candidates = [item[2] for item in ranked_candidates[:24]]
+
+        inspector = HttpResponseInspector()
+        for request in candidates:
+            cmd = [
+                self._tshark_path,
+                "-r", pcap_path,
+                "-q",
+                "-z", f"follow,tcp,raw,{request.stream_id}",
+            ]
+            kwargs = {
+                "capture_output": True,
+                "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
+                "timeout": 60,
+            }
+            if sys.platform == "win32":
+                kwargs["creationflags"] = 0x08000000
+            try:
+                result = subprocess.run(cmd, **kwargs)
+            except Exception as exc:
+                logger.warning("Opaque HTTP stream %s recovery failed: %s", request.stream_id, exc)
+                continue
+            if result.returncode != 0:
+                continue
+            response = parse_follow_tcp_raw(result.stdout or "")
+            if response is None or len(response.body) < 200:
+                continue
+
+            match = inspector.inspect(
+                frame_number=request.frame_number or request.stream_id,
+                body=response.body,
+                content_type=response.headers.get("content-type", ""),
+                content_disposition=response.headers.get("content-disposition", ""),
+                request_uri=request.uri,
+            )
+            if match is None:
+                continue
+            filename = match.filename
+            filepath, filename = safe_unique_path(
+                output_dir,
+                filename,
+                fallback=f"stream_{request.stream_id}.bin",
+            )
+            try:
+                with open(filepath, "wb") as handle:
+                    handle.write(response.body)
+            except OSError as exc:
+                logger.warning("Writing opaque HTTP object failed: %s", exc)
+                continue
+            extracted = self._smart_filter_file(filepath, filename, pcap_path, response_metadata)
+            if not extracted:
+                try:
+                    os.remove(filepath)
+                except OSError:
+                    pass
+                continue
+            file_hash = self._get_file_hash(filepath)
+            if file_hash in seen_hashes:
+                try:
+                    os.remove(filepath)
+                except OSError:
+                    pass
+                continue
+            seen_hashes.add(file_hash)
+            extracted_files.append(extracted)
+            print(f"[+] 恢复: {extracted.file_name} ({extracted.file_size} bytes, {extracted.file_type})")
+
+    @staticmethod
+    def _looks_like_download_response(metadata: Dict) -> bool:
+        content_type = (metadata.get("content_type") or "").lower()
+        disposition = (metadata.get("content_disposition") or "").lower()
+        uri = metadata.get("request_uri") or ""
+        if "attachment" in disposition or "filename=" in disposition:
+            return True
+        if content_type.startswith("application/") and content_type not in {
+            "application/json", "application/xml", "application/javascript",
+            "application/x-www-form-urlencoded",
+        }:
+            return True
+        return file_like_uri_score(uri) >= 80 and not (
+            content_type.startswith("text/") or content_type.startswith("image/")
+        )
+
+    def _extract_complete_http_objects(
+        self,
+        pcap_path: str,
+        output_dir: str,
+        candidates: List[Dict],
+        extracted_files: List[ExtractedFile],
+        seen_hashes: set,
+    ) -> None:
+        try:
+            cmd = [
+                self._tshark_path,
+                "-r", pcap_path,
+                "-q",
+                "--export-objects", f"http,{output_dir}",
+            ]
+            popen_kwargs = {
+                "capture_output": True,
+                "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
+                "timeout": 120,
+            }
+            if sys.platform == "win32":
+                popen_kwargs["creationflags"] = 0x08000000
+
+            subprocess.run(cmd, **popen_kwargs)
+
+            if os.path.exists(output_dir):
+                for filepath, filename in iter_safe_child_files(output_dir):
+                    current_name = os.path.basename(filepath)
+                    if current_name != filename:
+                        target, filename = safe_unique_path(output_dir, filename)
+                        os.replace(filepath, target)
+                        filepath = target
+
+                    ef = self._smart_filter_file(filepath, filename, pcap_path, candidates)
+                    if not ef:
+                        continue
+                    file_hash = self._get_file_hash(filepath)
+                    if file_hash in seen_hashes:
+                        continue
+                    seen_hashes.add(file_hash)
+                    extracted_files.append(ef)
+                    print(f"[+] 保留: {ef.file_name} ({ef.file_size} bytes, {ef.file_type})")
+        except Exception as e:
+            print(f"[!] tshark 导出异常: {e}")
+
+        for meta in candidates:
+            try:
+                ef = self._extract_single_http_response(pcap_path, meta, output_dir)
+                if not ef:
+                    continue
+                file_hash = self._get_file_hash(ef.file_path)
+                if file_hash in seen_hashes:
+                    continue
+                seen_hashes.add(file_hash)
+                extracted_files.append(ef)
+                print(f"[+] 补充提取: {ef.file_name} ({ef.file_size} bytes)")
+            except Exception:
+                continue
+
+    @staticmethod
+    def _decode_http_field_data(value: str) -> bytes:
+        compact = (value or "").replace(":", "").replace(" ", "").strip()
+        if not compact or len(compact) % 2:
+            return b""
+        try:
+            return bytes.fromhex(compact)
+        except ValueError:
+            return b""
+
+    @staticmethod
+    def _get_attachment_filename(response_line: str) -> str:
+        value = (response_line or "").replace("\\r\\n", "\n").replace("\\n", "\n")
+        match = re.search(
+            r"filename\*?\s*=\s*(?:[^']*'[^']*')?\"([^\"]+)\"|"
+            r"filename\*?\s*=\s*(?:[^']*'[^']*')?([^;,\r\n\s]+)",
+            value,
+            re.IGNORECASE,
+        )
+        if not match:
+            return ""
+        return (match.group(1) or match.group(2) or "").strip()
+
     def _get_http_response_metadata(self, pcap_path: str) -> List[Dict]:
         """获取所有 HTTP 响应的元数据"""
         metadata_list = []
@@ -248,10 +602,11 @@ class AnalysisService(IAnalysisService):
                 "-Y", "http.response",
                 "-T", "fields",
                 "-e", "frame.number",
+                "-e", "tcp.stream",
                 "-e", "http.content_type",
                 "-e", "http.content_length",
                 "-e", "http.response.code",
-                "-e", "http.content_disposition",
+                "-e", "http.response.line",
                 "-e", "http.request.uri",
                 "-e", "http.host",
                 "-E", separator_arg(),
@@ -267,19 +622,34 @@ class AnalysisService(IAnalysisService):
                 timeout=60
             )
 
+            if result.returncode != 0:
+                logger.warning(
+                    "HTTP response metadata extraction failed (exit %s): %s",
+                    result.returncode,
+                    (getattr(result, "stderr", "") or "").strip()[:500],
+                )
+                return []
+
             for line in result.stdout.strip().split('\n'):
                 if not line:
                     continue
-                parts = split_fields(line, expected=7)
+                parts = split_fields(line, expected=8)
                 if len(parts) >= 4:
+                    response_line = parts[5] if len(parts) > 5 else ""
                     metadata_list.append({
                         "frame_number": int(parts[0]) if parts[0].isdigit() else 0,
-                        "content_type": parts[1] if len(parts) > 1 else "",
-                        "content_length": int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0,
-                        "response_code": parts[3] if len(parts) > 3 else "",
-                        "content_disposition": parts[4] if len(parts) > 4 else "",
-                        "request_uri": parts[5] if len(parts) > 5 else "",
-                        "host": parts[6] if len(parts) > 6 else "",
+                        "tcp_stream": int(parts[1]) if len(parts) > 1 and parts[1].lstrip("-").isdigit() else -1,
+                        "content_type": parts[2] if len(parts) > 2 else "",
+                        "content_length": int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0,
+                        "response_code": parts[4] if len(parts) > 4 else "",
+                        # Keep the legacy metadata key: downstream filename and
+                        # download heuristics already parse response headers from it.
+                        "content_disposition": content_disposition_from_response_lines(
+                            response_line
+                        ),
+                        "response_line": response_line,
+                        "request_uri": parts[6] if len(parts) > 6 else "",
+                        "host": parts[7] if len(parts) > 7 else "",
                     })
 
         except Exception as e:
@@ -304,6 +674,14 @@ class AnalysisService(IAnalysisService):
         ]
 
         # Content-Type 白名单
+        CONTENT_TYPE_BLACKLIST.extend([
+            'image/png',
+            'image/jpeg',
+            'image/gif',
+            'image/webp',
+            'image/svg+xml',
+        ])
+
         CONTENT_TYPE_WHITELIST = [
             'application/zip',
             'application/x-zip-compressed',
@@ -321,9 +699,6 @@ class AnalysisService(IAnalysisService):
             'application/vnd.ms-cab-compressed',
             'application/x-shockwave-flash',
             'application/java-archive',
-            'image/png',
-            'image/jpeg',
-            'image/gif',
         ]
 
         # API 路径特征
@@ -725,7 +1100,7 @@ class AnalysisService(IAnalysisService):
             return len(name) > 24
         return False
 
-    def _detect_file_type_by_magic(self, filepath: str) -> Optional[Dict]:
+    def _detect_file_type_by_magic_bytes(self, data: bytes) -> Optional[Dict]:
         MAGIC_SIGNATURES = [
             # 压缩包
             (b'\x50\x4B\x03\x04', {"extension": "zip", "mime_type": "application/zip", "category": "archive", "description": "ZIP Archive"}),
@@ -754,16 +1129,17 @@ class AnalysisService(IAnalysisService):
             (b'SQLite format 3', {"extension": "sqlite", "mime_type": "application/x-sqlite3", "category": "database", "description": "SQLite Database"}),
         ]
 
+        sorted_sigs = sorted(MAGIC_SIGNATURES, key=lambda x: len(x[0]), reverse=True)
+        for magic, info in sorted_sigs:
+            if data.startswith(magic):
+                return info
+
+        return None
+
+    def _detect_file_type_by_magic(self, filepath: str) -> Optional[Dict]:
         try:
             with open(filepath, 'rb') as f:
-                header = f.read(32)
-
-            sorted_sigs = sorted(MAGIC_SIGNATURES, key=lambda x: len(x[0]), reverse=True)
-
-            for magic, info in sorted_sigs:
-                if header.startswith(magic):
-                    return info
-
+                return self._detect_file_type_by_magic_bytes(f.read(32))
         except Exception:
             pass
 

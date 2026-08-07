@@ -40,6 +40,7 @@ from models.detection_result import (
 from services.interfaces import IAnalysisService
 from core.safe_paths import iter_safe_child_files, safe_unique_path
 from core.tshark_fields import parse_quoted_fields, separator_arg, split_fields
+from core.tshark_locator import find_tshark
 
 
 @dataclass
@@ -161,22 +162,7 @@ class AnalysisWorker(QThread):
                     break
 
     def _find_tshark(self) -> Optional[str]:
-        import shutil
-        tshark_path = shutil.which("tshark")
-        if tshark_path:
-            return tshark_path
-
-        possible_paths = [
-            r"E:\internet_safe\wireshark\tshark.exe",
-            r"C:\Program Files\Wireshark\tshark.exe",
-            r"C:\Program Files (x86)\Wireshark\tshark.exe",
-            r"D:\Program Files\Wireshark\tshark.exe",
-            r"D:\Wireshark\tshark.exe",
-        ]
-        for path in possible_paths:
-            if os.path.exists(path):
-                return path
-        return None
+        return find_tshark()
 
     def run(self):
         self._start_emit_thread()
@@ -1012,17 +998,7 @@ class AnalysisController(QObject):
 
 
 def get_packet_hex_dump(pcap_path: str, packet_num: int = 0) -> tuple:
-    possible_paths = [
-        r"E:\internet_safe\wireshark\tshark.exe",
-        r"C:\Program Files\Wireshark\tshark.exe",
-        r"C:\Program Files (x86)\Wireshark\tshark.exe",
-    ]
-
-    tshark_path = None
-    for path in possible_paths:
-        if os.path.exists(path):
-            tshark_path = path
-            break
+    tshark_path = find_tshark()
 
     if not tshark_path:
         return "", ["未找到 tshark"]
