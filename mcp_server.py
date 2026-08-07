@@ -14,6 +14,9 @@ import time
 import traceback
 import shutil
 import importlib
+import threading
+import re
+import hashlib
 from dataclasses import asdict, is_dataclass
 from typing import Any, Dict, List, Optional
 
@@ -66,7 +69,7 @@ DNSCovertChannelAnalyzer = _import('protocol_analyzer', 'DNSCovertChannelAnalyze
 CobaltStrikeAnalyzer = _import('protocol_analyzer', 'CobaltStrikeAnalyzer')[0]
 
 
-MCP_SERVER_VERSION = "v1.0"
+MCP_SERVER_VERSION = "v1.1"
 mcp = FastMCP("tinglan") if FastMCP else None
 
 if mcp is None:
@@ -119,7 +122,7 @@ if not logger.handlers:
 
 # 常量
 _TSHARK_DEFAULT_TIMEOUT = 300
-_MAX_FIX_PCAP_SIZE = 1024 * 1024 * 1024  # 1GB
+_MAX_FIX_PCAP_SIZE = 256 * 1024 * 1024  # 256MB,防全量读入内存 + O(n²) 扫描挂死
 _ALLOWED_READ_EXTS = {".pcap", ".pcapng", ".cap"}
 _ALLOWED_WRITE_EXTS = {".pcap", ".pcapng"}
 
@@ -140,6 +143,21 @@ def _safe_read_path(path: str) -> str:
         raise ValueError(
             f"不允许的扩展名 {ext!r},仅允许: {', '.join(sorted(_ALLOWED_READ_EXTS))}"
         )
+    return real
+
+
+def _safe_read_path_loose(path: str) -> str:
+    """宽松路径校验:exists + realpath + 拒符号链接 + 常规文件,不限扩展名。
+    用于 key_file_path 等非 pcap 文件(扩展名不在白名单内)。"""
+    if not path or not isinstance(path, str):
+        raise ValueError("路径不能为空")
+    if os.path.islink(path):
+        raise ValueError(f"拒绝符号链接: {path}")
+    real = os.path.realpath(path)
+    if not os.path.exists(real):
+        raise FileNotFoundError(f"文件不存在: {path}")
+    if not os.path.isfile(real):
+        raise ValueError(f"不是常规文件: {path}")
     return real
 
 
@@ -195,7 +213,8 @@ def _local_error(exc: Exception) -> Dict[str, Any]:
 def pcap_tool(*, read_paths=(), write_paths=(), requires_modules=()):
     """MCP tool 包装器:统一处理路径校验、必需模块检查、异常包装、日志记录。
 
-    read_paths: 参数名列表,这些参数会被 _safe_read_path 校验
+    read_paths: 参数名列表,这些参数会被 _safe_read_path 校验;
+                元素可为 ("参数名", "any_ext") 元组 = 宽松模式(_safe_read_path_loose,不限扩展名)
     write_paths: [(参数名, base_from_param)] 列表;base 允许目录 = [PROJECT_ROOT, dirname(base_from)]
     requires_modules: [(module_obj, 中文标签)] 列表;任一为 None 则早返 error
     """
@@ -219,9 +238,18 @@ def pcap_tool(*, read_paths=(), write_paths=(), requires_modules=()):
                 bound.apply_defaults()
                 params = dict(bound.arguments)
 
-                for p_name in read_paths:
-                    if p_name in params and params[p_name]:
+                for spec in read_paths:
+                    if isinstance(spec, tuple):
+                        p_name, mode = spec
+                        strict = mode != "any_ext"
+                    else:
+                        p_name, strict = spec, True
+                    if p_name not in params or not params[p_name]:
+                        continue
+                    if strict:
                         params[p_name] = _safe_read_path(params[p_name])
+                    else:
+                        params[p_name] = _safe_read_path_loose(params[p_name])
 
                 for spec in write_paths:
                     if isinstance(spec, tuple):
@@ -271,6 +299,16 @@ def _jsonable(obj):
     if isinstance(obj, dict): return {str(k): _jsonable(v) for k, v in obj.items()}
     if isinstance(obj, list): return [_jsonable(x) for x in obj]
     return obj
+
+
+def _is_num(v) -> bool:
+    """数字类型校验,排除 bool(True 是 int 子类)与字符串。"""
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _is_int(v) -> bool:
+    """整数类型校验,排除 bool。"""
+    return isinstance(v, int) and not isinstance(v, bool)
 
 
 def _find_tshark(explicit=None):
@@ -400,20 +438,22 @@ def _detect_attacks_ek(pcap_path, tshark_path, max_packets=0):
                 content_type, file_data = fields[4].strip(), fields[6].strip()
                 if not method: continue
 
-                key = f"{method}:{uri[:100]}:{len(file_data)}"
-                if key in seen: continue
-                seen.add(key)
-
-                body = file_data.encode('utf-8', errors='ignore') if file_data else None
+                # 先构造 body:file_data 为冒号分隔 hex,还原明文;失败回退 URI 派生
+                body = _http_body_from_file_data(file_data)
                 if not body and '?' in uri: body = uri.split('?', 1)[1].encode('utf-8', errors='ignore')
                 if not body: body = uri.encode('utf-8', errors='ignore')
                 if not body or len(body) < 3: continue
+
+                # 去重 key 基于内容指纹(body 必须先于 key 构造,防 URI 派生请求算出 md5(b"") 相同 key 被误合并)
+                key = f"{method}:{uri[:100]}:{hashlib.md5(body).hexdigest()[:16]}"
+                if key in seen: continue
+                seen.add(key)
 
                 det = detector.detect(data=body, method=method, uri=uri, content_type=content_type)
                 if det.get('detected') and det.get('total_weight', 0) >= 20:
                     attacks.append({
                         "packet_number": int(frame) if frame.isdigit() else 0,
-                        "attack_type": det.get("attack_types", ["unknown"])[0] if det.get("attack_types") else "unknown",
+                        "attack_type": det.get("detection_type") or "unknown",  # detect() 字段名是 detection_type
                         "threat_level": det.get("risk_level", "low"),
                         "weight": det.get("total_weight", 0),
                         "method": method, "uri": uri[:200],
@@ -1255,10 +1295,24 @@ def analyze_pcap(pcap_path: str, tshark_path: Optional[str] = None, max_packets:
     返回 recommended_actions 字段，根据实际检测结果动态列出建议的后续分析步骤（含工具名、参数和优先级），
     调用方应按 priority（high→medium→low）顺序依次执行建议的工具调用以完成深入分析。
 
+    工具边界（按问题选最短路径，不要无意义走完整流程）：
+    本工具为总入口：协议全景 + 已知攻击 + 后续建议，一般性问题优先本工具，一步出结果。
+    仅需已知攻击汇总表格 → 用 summarize_detections；
+    寻找隐藏/加密/未知异常数据（熵扫描）→ 用 scan_pcap_entropy（TCP/UDP 载荷熵）。
+    无需在调用本工具之前先做熵扫描。
+
+    深挖与研判（本工具之后，汇报前必做）：
+    深挖：零检出但流量可疑时，优先 scan_pcap_entropy 熵分析 → dequeue_packet 取数 → auto_decode。
+    禁用 Bash tshark 盲扫；仅两类场景允许 Bash：定向全流提取（dequeue 按流取数无法满足时）、自定义字段查询。
+    研判：不得只罗列检测项 —— 必须按 MITRE 战术串联攻击链、评估危害等级、给出处置建议；
+    依据不足（证据截断、类型 unknown）时，先 get_packet_data/dequeue 补证或 WebSearch 查 CVE 再下结论。
+
     pcap_path: 文件路径
     tshark_path: tshark路径（可选）
     max_packets: 最大包数，0表示默认10000
     """
+    if not _is_int(max_packets) or max_packets < 0:
+        return {"ok": False, "error": "max_packets 必须是非负整数"}
     t0 = time.time()
     warnings: List[str] = []
 
@@ -1573,14 +1627,18 @@ def auto_decode(data: str, crib: Optional[str] = None, max_depth: int = 10) -> D
 
 @mcp.tool()
 @pcap_tool(requires_modules=[(AttackDetector, "attack_detector")])
-def detect_attack(data: str, attack_type: Optional[str] = None) -> Dict[str, Any]:
-    """检测OWASP攻击签名：SQLi/XSS/XXE/RCE/SSRF/目录穿越等"""
+def detect_attack(data: str, method: str = "GET", uri: str = "/",
+                  content_type: str = "") -> Dict[str, Any]:
+    """检测OWASP攻击签名：SQLi/XSS/XXE/RCE/SSRF/目录穿越等。
+    method/uri/content_type 为请求上下文参数,检测器按上下文判定提升准确率。"""
     if AttackDetector is None:
         return {"ok": False, "error": "attack_detector 模块不可用"}
 
     try:
         detector = AttackDetector()
-        result = detector.detect(data.encode('utf-8', errors='ignore'))
+        result = detector.detect(data.encode('utf-8', errors='ignore'),
+                                 method=method or "GET", uri=uri or "/",
+                                 content_type=content_type or "")
 
         matches_brief = []
         for ind in result.get('indicators', [])[:20]:
@@ -2002,7 +2060,8 @@ def analyze_dns_covert(pcap_path: str, tshark_path: Optional[str] = None,
 
 
 @mcp.tool()
-@pcap_tool(read_paths=["pcap_path"], requires_modules=[(CobaltStrikeAnalyzer, "protocol_analyzer")])
+@pcap_tool(read_paths=["pcap_path", ("key_file_path", "any_ext")],
+           requires_modules=[(CobaltStrikeAnalyzer, "protocol_analyzer")])
 def analyze_cobalt_strike(pcap_path: str, tshark_path: Optional[str] = None,
                           key_file_path: Optional[str] = None) -> Dict[str, Any]:
     """分析Cobalt Strike C2流量,提取HTTP Cookie中的Metadata。
@@ -2148,7 +2207,12 @@ def fix_pcap(pcap_path: str, output_path: Optional[str] = None) -> Dict[str, Any
             try:
                 next_sig = raw_data.find(b'\x08\x00\x45', pos + 14)
                 if next_sig == -1:
-                    current_len = file_size - pos
+                    # 无下一个 IPv4 特征:剩余 40~1514 字节收尾为最后一包,否则放弃尾部垃圾
+                    # (直接 break 而非 pos += 1 步进,消除 O(n²))
+                    if 40 <= file_size - pos <= 1514:
+                        current_len = file_size - pos
+                    else:
+                        break
                 else:
                     current_len = next_sig - 12 - pos
 
@@ -2177,7 +2241,7 @@ def fix_pcap(pcap_path: str, output_path: Optional[str] = None) -> Dict[str, Any
                     os.path.realpath(PROJECT_ROOT),
                     os.path.realpath(os.path.dirname(pcap_path)),
                 ]
-                if not any(real_output.startswith(d + os.sep) or real_output.startswith(d + "/") for d in allowed_dirs):
+                if not any(real_output == d or real_output.startswith(d + os.sep) or real_output.startswith(d + "/") for d in allowed_dirs):
                     return {"ok": False, "error": f"输出路径不在允许的目录内，仅允许项目根目录或源文件所在目录"}
                 ext = os.path.splitext(real_output)[1].lower()
                 if ext not in ('.pcap', '.pcapng'):
@@ -2222,9 +2286,10 @@ def extract_files(pcap_path: str, tshark_path: Optional[str] = None, protocol: s
 
         tshark = _find_tshark(tshark_path)
 
-        # 创建输出目录
+        # 创建输出目录(拼 pcap 路径 hash,防不同目录同名 pcap 互相覆盖)
         base_name = os.path.splitext(os.path.basename(pcap_path))[0]
-        output_dir = os.path.join(PROJECT_ROOT, "output", "extracted_files", base_name, protocol)
+        path_hash = hashlib.md5(os.path.realpath(pcap_path).encode("utf-8")).hexdigest()[:8]
+        output_dir = os.path.join(PROJECT_ROOT, "output", "extracted_files", f"{base_name}_{path_hash}", protocol)
         os.makedirs(output_dir, exist_ok=True)
 
         # 执行 tshark 提取 (C5: 加超时,防止恶意 pcap 挂死)
@@ -2264,6 +2329,827 @@ def extract_files(pcap_path: str, tshark_path: Optional[str] = None, protocol: s
 
     except Exception as e:
         return _local_error(e)
+
+
+# ============================================================
+# 熵异常队列存储层(任务一)
+# 纯索引零载荷:JSON 仅存帧号/流号/熵值等指针,绝不存载荷片段。
+# 运行期以内存为准,变更后原子落盘(tmp → os.replace)。
+# ============================================================
+
+_ENTROPY_QUEUE_PREFIX = "entropy_"
+_ENTROPY_QUEUE_FILE_RE = re.compile(r"^entropy_\d{8}_\d{6}_[0-9a-f]{8}\.json$")
+_MAX_ENTROPY_QUEUES = 32
+_MAX_ENTROPY_QUEUE_FILE_SIZE = 10 * 1024 * 1024  # 单队列 JSON 大小上限,防恶意大文件
+
+# 内存态(唯一真相)
+_entropy_queues: Dict[str, Dict[str, Any]] = {}            # queue_id -> queue dict
+_entropy_index: Dict[Tuple[str, int], Set[str]] = {}       # (pcap_realpath, frame_num) -> {queue_id}
+_peek_counts: Dict[str, Dict[int, int]] = {}               # queue_id -> {frame_num: peek次数}
+_entropy_lock = threading.RLock()
+
+
+def _entropy_queue_path(queue_id: str) -> str:
+    """队列文件路径。queue_id 必须已通过正则白名单,禁止外部输入拼接路径。"""
+    return os.path.join(PROJECT_ROOT, "output", queue_id + ".json")
+
+
+def _entropy_save_locked(queue: Dict[str, Any]) -> None:
+    """原子写:临时文件 + os.replace,防止半截 JSON。调用方须已持有锁。"""
+    try:
+        os.makedirs(os.path.join(PROJECT_ROOT, "output"), exist_ok=True)
+        tmp = os.path.join(PROJECT_ROOT, "output", uuid.uuid4().hex + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(queue, f, ensure_ascii=False)
+        os.replace(tmp, _entropy_queue_path(queue["queue_id"]))
+    except Exception as e:
+        logger.warning("entropy queue persist failed id=%s: %s", queue.get("queue_id"), e)
+
+
+def _entropy_index_add_locked(pcap_path: str, frame_num: int, queue_id: str) -> None:
+    key = (pcap_path, frame_num)
+    _entropy_index.setdefault(key, set()).add(queue_id)
+
+
+def _entropy_index_remove_locked(queue: Dict[str, Any]) -> None:
+    """按队列所有条目清理倒排索引。调用方须已持有锁。
+    注意:必须在队列从 _entropy_queues 移除前/后都能工作,直接使用传入的队列数据。"""
+    pcap_path = queue.get("pcap_path", "")
+    for e in queue.get("queue", []):
+        key = (pcap_path, e["frame_num"])
+        holders = _entropy_index.get(key)
+        if holders:
+            holders.discard(queue["queue_id"])
+            if not holders:
+                _entropy_index.pop(key, None)
+
+
+def _entropy_queue_delete_locked(queue_id: str) -> None:
+    """删除队列:内存 + 倒排索引 + 磁盘文件。调用方须已持有锁。"""
+    queue = _entropy_queues.pop(queue_id, None)
+    if queue:
+        _entropy_index_remove_locked(queue)
+    _peek_counts.pop(queue_id, None)
+    try:
+        os.remove(_entropy_queue_path(queue_id))
+    except OSError:
+        pass
+
+
+def _entropy_evict_locked() -> None:
+    """全局容量 FIFO 驱逐:超过上限时删除最旧队列。调用方须已持有锁。"""
+    while len(_entropy_queues) >= _MAX_ENTROPY_QUEUES:
+        oldest = min(_entropy_queues.values(), key=lambda q: q.get("created_at", 0))
+        _entropy_queue_delete_locked(oldest["queue_id"])
+
+
+def _entropy_validate_queue(q: Any) -> bool:
+    """加载时 schema 校验,防篡改/损坏 JSON 导致异常。"""
+    if not isinstance(q, dict):
+        return False
+    for f in ("queue_id", "created_at", "pcap_path", "queue"):
+        if not isinstance(q.get(f), (str, int, float, list)):
+            return False
+    if not isinstance(q.get("queue"), list):
+        return False
+    for e in q["queue"]:
+        if not isinstance(e, dict):
+            return False
+        if not isinstance(e.get("frame_num"), int):
+            return False
+        if not isinstance(e.get("entropy"), (int, float)):
+            return False
+        if not isinstance(e.get("proto"), str):
+            return False
+    return True
+
+
+def _entropy_load_on_startup() -> None:
+    """启动恢复:扫描 output/entropy_*.json,校验后载入内存并重建倒排索引。
+    失效(pcap 不存在)/损坏/超限文件跳过并日志警告,不阻断启动。"""
+    out_dir = os.path.join(PROJECT_ROOT, "output")
+    try:
+        files = [f for f in os.listdir(out_dir) if _ENTROPY_QUEUE_FILE_RE.match(f)]
+    except OSError:
+        return
+    for fname in sorted(files):
+        path = os.path.join(out_dir, fname)
+        queue_id = fname[:-len(".json")]
+        try:
+            if os.path.islink(path) or not os.path.isfile(path):
+                logger.warning("entropy queue skip non-regular: %s", fname)
+                continue
+            if os.path.getsize(path) > _MAX_ENTROPY_QUEUE_FILE_SIZE:
+                logger.warning("entropy queue skip oversized: %s", fname)
+                continue
+            with open(path, "r", encoding="utf-8") as f:
+                q = json.load(f)
+            if not _entropy_validate_queue(q) or q.get("queue_id") != queue_id:
+                logger.warning("entropy queue skip invalid schema: %s", fname)
+                continue
+            real = os.path.realpath(q.get("pcap_path", ""))
+            if not os.path.isfile(real):
+                logger.warning("entropy queue skip missing pcap: %s -> %s", fname, q.get("pcap_path"))
+                continue
+            q["pcap_path"] = real
+            with _entropy_lock:
+                if len(_entropy_queues) >= _MAX_ENTROPY_QUEUES:
+                    _entropy_evict_locked()
+                _entropy_queues[queue_id] = q
+                for e in q.get("queue", []):
+                    _entropy_index_add_locked(real, e["frame_num"], queue_id)
+        except Exception as e:
+            logger.warning("entropy queue load failed %s: %s", fname, e)
+
+
+_entropy_load_on_startup()
+
+
+def _aggregate_flows(queue: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """队列内流聚合摘要(不重扫 pcap):按 (proto, stream_idx) 分组。
+    UDP 无 tcp.stream,统一归入 stream=None 一组。"""
+    groups: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
+    for e in queue.get("queue", []):
+        key = (e["proto"], e["stream_idx"])
+        groups.setdefault(key, []).append(e)
+    flows = []
+    for (proto, sidx), items in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        entropies = [i["entropy"] for i in items]
+        lens = [i["len"] for i in items]
+        flows.append({
+            "stream": sidx if sidx >= 0 else None,
+            "proto": proto,
+            "count": len(items),
+            "entropy_range": f"{min(entropies):.2f}-{max(entropies):.2f}",
+            "avg_len": round(sum(lens) / len(lens), 1) if lens else 0,
+            "sample_frame_num": items[0]["frame_num"],  # 该流队内熵最高的代表包
+        })
+    return flows
+
+
+def _fetch_frame_data(pcap_path: str, frame_num: int, tshark_path: Optional[str] = None,
+                      payload_max_bytes: int = 16384) -> Dict[str, Any]:
+    """按帧号从原始 pcap 实时提取单包数据。pcap_path 每次使用前重新校验
+    (_safe_read_path),防止队列 JSON 被篡改后指向任意文件。"""
+    try:
+        pcap_path = _safe_read_path(pcap_path)
+    except (FileNotFoundError, ValueError) as e:
+        return {"ok": False, "error": str(e)}
+    import subprocess
+    try:
+        tshark = _find_tshark(tshark_path)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    cmd = [tshark, "-r", pcap_path, "-Y", f"frame.number=={int(frame_num)}", "-T", "fields",
+           "-e", "frame.time_relative", "-e", "frame.len", "-e", "ip.src", "-e", "ip.dst",
+           "-e", "ip.proto", "-e", "tcp.srcport", "-e", "tcp.dstport",
+           "-e", "udp.srcport", "-e", "udp.dstport", "-e", "tcp.stream",
+           "-e", "http.request.method", "-e", "http.request.uri",
+           "-e", "tcp.payload", "-e", "udp.payload",
+           "-E", separator_arg(), "-E", "quote=d"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=120)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "tshark 超时"}
+    line = result.stdout.strip().split("\n")[0] if result.stdout.strip() else ""
+    if not line:
+        return {"ok": False, "error": f"未找到帧 {frame_num}"}
+    fields = parse_quoted_fields(line, 14)
+    payload_hex = ""
+    for i, fname in ((12, "tcp.payload"), (13, "udp.payload")):
+        if fields[i]:
+            payload_hex = fields[i].replace(":", "")
+            break
+    try:
+        raw = bytes.fromhex(payload_hex) if payload_hex else b""
+    except ValueError:
+        raw = b""
+    truncated = len(raw) > payload_max_bytes
+    import base64
+    payload_b64 = base64.b64encode(raw[:payload_max_bytes] if truncated else raw).decode("ascii")
+    return {
+        "ok": True,
+        "frame_num": int(frame_num),
+        "time_relative": float(fields[0]) if fields[0] else 0.0,
+        "frame_len": int(fields[1]) if fields[1].isdigit() else 0,
+        "src": fields[2], "dst": fields[3],
+        "ip_proto": fields[4],
+        "srcport": fields[5] or fields[7],
+        "dstport": fields[6] or fields[8],
+        "tcp_stream": int(fields[9]) if fields[9].isdigit() else -1,
+        "http_method": fields[10], "http_uri": fields[11],
+        "payload_base64": payload_b64,
+        "payload_len": len(raw),
+        "truncated": truncated,
+    }
+
+
+# ============================================================
+# 任务一:熵异常发现
+# ============================================================
+
+@mcp.tool()
+@pcap_tool(read_paths=["pcap_path"])
+def scan_pcap_entropy(pcap_path: str, tshark_path: Optional[str] = None,
+                      threshold: float = 7.0, max_results: int = 50,
+                      max_packets: int = 0, preview_len: int = 0) -> Dict[str, Any]:
+    """扫描pcap全量TCP/UDP载荷的信息熵,按熵降序保留高异常包,存入队列供后续按包取数。
+
+    队列只存索引(帧号/熵/流号),不含任何载荷内容。返回 queue_id + 流聚合摘要,
+    配合 list_entropy_queues / dequeue_packet 使用。
+
+    pcap_path: 文件路径
+    tshark_path: tshark路径(可选)
+    threshold: 熵阈值,仅保留高于此值的包(0~8)
+    max_results: 最多保留多少异常包(太多时只留最高熵的,上限500)
+    max_packets: 最多扫描多少包,0表示全部
+    preview_len: 保留参数(索引零载荷,不再返回载荷预览)
+
+    流程引导(建议按序执行,可依据流量情况裁剪):
+    1. scan 之后先调 list_entropy_queues 看流聚合摘要,判断是否加密流/C2流
+    2. 再 dequeue_packet 逐包取数,载荷用 auto_decode 解码、detect_attack 判定类型
+    3. 最后 summarize_detections 汇总已知攻击并渲染表格
+    阈值经验:7.0 抓加密/压缩;5.5 左右可抓 URL/Base64 编码型异常;扫出 0 条时先降阈值重扫,
+    仍为 0 且流量含 USB/蓝牙/DNS 等非 TCP/UDP 协议时,改用对应专用工具(熵扫描仅覆盖 TCP/UDP)。
+    """
+    if not _is_num(threshold) or not (0.0 <= threshold <= 8.0):
+        return {"ok": False, "error": "threshold 必须是 0~8 之间的数字"}
+    if not _is_int(max_results) or not (1 <= max_results <= 500):
+        return {"ok": False, "error": "max_results 必须是 1~500 之间的整数"}
+    if not _is_int(max_packets) or max_packets < 0:
+        return {"ok": False, "error": "max_packets 必须是非负整数"}
+
+    try:
+        tshark = _find_tshark(tshark_path)
+    except Exception as e:
+        return _local_error(e)
+
+    import subprocess as _sp
+    cmd = [tshark, "-r", pcap_path, "-T", "fields",
+           "-e", "frame.number", "-e", "frame.time_relative", "-e", "ip.proto",
+           "-e", "tcp.stream", "-e", "tcp.payload", "-e", "udp.payload",
+           "-E", separator_arg(), "-E", "quote=d"]
+
+    try:
+        proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.DEVNULL,
+                         text=True, encoding="utf-8", errors="replace")
+    except Exception as e:
+        return _local_error(e)
+
+    # top-N 截断:(-entropy, frame_num, seq) 堆(前两项相同时比 seq 整数,不会比较 dict)
+    # + entries_by_seq 配套容器(淘汰条目必须同步移除,防回查错乱)
+    import heapq
+    heap: List[tuple] = []
+    entries_by_seq: Dict[int, Dict[str, Any]] = {}
+    seq = 0
+    scanned = 0
+    start = time.time()
+    try:
+        for line in proc.stdout:
+            scanned += 1
+            if max_packets > 0 and scanned > max_packets:
+                break
+            if time.time() - start > _TSHARK_DEFAULT_TIMEOUT:
+                break
+            fields = parse_quoted_fields(line, 6)
+            ip_proto = fields[2].strip() if len(fields) > 2 else ""
+            if ip_proto not in ("6", "17"):
+                continue
+            payload_hex = (fields[4] if ip_proto == "6" else fields[5]).strip()
+            if not payload_hex:
+                continue
+            try:
+                payload = bytes.fromhex(payload_hex.replace(":", ""))
+            except ValueError:
+                continue
+            if not payload:
+                continue
+            entropy = EntropyAnalyzer().calculate_entropy(payload)
+            if entropy < threshold:
+                continue
+            try:
+                frame_num = int(fields[0])
+            except ValueError:
+                continue
+            timestamp = float(fields[1]) if fields[1] else 0.0
+            stream = int(fields[3]) if fields[3].isdigit() else -1
+            entry = {
+                "frame_num": frame_num,
+                "entropy": round(entropy, 4),
+                "proto": "TCP" if ip_proto == "6" else "UDP",
+                "len": len(payload),
+                "stream_idx": stream,
+                "timestamp": timestamp,
+            }
+            if len(heap) < max_results:
+                heapq.heappush(heap, (-entropy, frame_num, seq))
+            else:
+                old = heapq.heappushpop(heap, (-entropy, frame_num, seq))
+                if old is not None:
+                    entries_by_seq.pop(old[2], None)  # 淘汰条目从容器同步删除
+            entries_by_seq[seq] = entry
+            seq += 1
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.stdout.close()
+
+    # 恢复熵降序(堆不保证顺序)
+    heap.sort(key=lambda t: (-t[0], t[1]))
+    kept = [entries_by_seq[t[2]] for t in heap]
+    for i, e in enumerate(kept):
+        e["position"] = i
+
+    qid = _ENTROPY_QUEUE_PREFIX + time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
+    queue = {
+        "queue_id": qid,
+        "created_at": time.time(),
+        "pcap_path": pcap_path,
+        "pcap_size_mb": round(os.path.getsize(pcap_path) / 1024 / 1024, 1),
+        "total_packets_scanned": scanned,
+        "threshold_used": threshold,
+        "queue": kept,
+    }
+    with _entropy_lock:
+        _entropy_evict_locked()
+        _entropy_queues[qid] = queue
+        _entropy_save_locked(queue)
+        for e in kept:
+            _entropy_index_add_locked(pcap_path, e["frame_num"], qid)
+
+    return {
+        "ok": True,
+        "queue_id": qid,
+        "total_packets_scanned": scanned,
+        "saved_count": len(kept),
+        "top_entropy": kept[0]["entropy"] if kept else 0.0,
+        "top_flows": _aggregate_flows(queue),
+        "note": "队列仅存索引(帧号/熵/流号),载荷请用 dequeue_packet 或 get_packet_data 实时提取",
+    }
+
+
+@mcp.tool()
+def list_entropy_queues() -> Dict[str, Any]:
+    """列出所有熵异常队列:队列ID、创建时间、剩余条目数、关联pcap、流聚合摘要。
+    流摘要为队列内聚合(不重扫pcap),用于识别高熵加密流。每条流含样例帧号(sample_frame_num)。
+
+    流程引导:scan 之后调用本工具确认目标流。若某流(stream)大量高熵包集中,
+    用 dequeue_packet(stream_idx=N) 按流依次取数 —— 无需知道帧号;
+    仅当需要整条流的完整重组内容时,才用 Bash 执行 tshark -r <pcap> -Y "tcp.stream eq N" 提取。
+    stream 为 null 的行是 UDP 聚合组(无 tcp.stream),对应 dequeue 的 stream_idx=-1。"""
+    with _entropy_lock:
+        queues = []
+        for qid, q in sorted(_entropy_queues.items(), key=lambda kv: kv[1].get("created_at", 0)):
+            queues.append({
+                "queue_id": qid,
+                "created_at": round(q.get("created_at", 0), 2),
+                "remaining": len(q.get("queue", [])),
+                "pcap_path": q.get("pcap_path", ""),
+                "pcap_size_mb": q.get("pcap_size_mb", 0),
+                "top_flows": _aggregate_flows(q),
+            })
+    return {"ok": True, "queue_count": len(queues), "queues": queues}
+
+
+@mcp.tool()
+def dequeue_packet(queue_id: str, position: Optional[int] = None, frame_num: Optional[int] = None,
+                   stream_idx: Optional[int] = None, remove: bool = True,
+                   tshark_path: Optional[str] = None,
+                   payload_max_bytes: int = 16384) -> Dict[str, Any]:
+    """从熵异常队列取一个包并实时提取完整载荷(Base64)。
+
+    queue_id: 队列ID(scan_pcap_entropy 返回)
+    position: 条目索引(0-based,队列按熵降序);不传时按 frame_num/stream_idx 定位,都没有则取队首
+    frame_num: 精确帧号匹配(队列消费导致索引位移时用它)
+    stream_idx: 按流取数,弹出该流在队内剩余的第一个条目(熵最高的那个);
+                -1 表示 UDP 组(无 tcp.stream 的包);该流条目取尽后返回明确错误
+    remove: True=弹出该条目;False=仅窥探(不移除)
+    tshark_path: tshark路径(可选)
+    payload_max_bytes: 返回载荷上限(超出截断并标记 truncated)
+
+    建议流程:先 list_entropy_queues 看流摘要(含样例帧号) → 按流或按包取数 → remove=True 推进队列。
+    注意:frame_num / stream_idx / position 三者最多指定一个,同时传多个会报错。
+
+    流程引导:取到载荷后按序深挖 ——
+    1. auto_decode 解码(URL/Base64/Gzip 多层嵌套)
+    2. detect_attack 判定攻击类型;载荷为 PHP 代码时 analyze_php_ast 确认 webshell
+    3. 载荷含版本指纹(如 Server: Apache/2.4.39)时,用 WebSearch 查对应 CVE 及利用条件
+    4. 需要全量证据时调 get_packet_data(提高 payload_max_bytes)
+    5. remove=True 会消费条目,确认分析完毕再消费;peek 仅供快速查看,连续 peek 会被警告
+    """
+    if not _ENTROPY_QUEUE_FILE_RE.match(queue_id + ".json"):
+        return {"ok": False, "error": "非法的 queue_id 格式"}
+    # ① 互斥检查:frame_num / stream_idx / position 最多指定一个
+    if sum(p is not None for p in (frame_num, stream_idx, position)) > 1:
+        return {"ok": False, "error": "frame_num / stream_idx / position 只能指定一个定位参数"}
+    # ② 默认化:position 未指定 → 队首
+    if position is None:
+        position = 0
+    # ③ 类型校验(互斥/默认化之后再校验,避免 None 被误拒)
+    if not _is_int(position) or position < 0:
+        return {"ok": False, "error": "position 必须是非负整数"}
+    if frame_num is not None and (not _is_int(frame_num) or frame_num <= 0):
+        return {"ok": False, "error": "frame_num 必须是正整数"}
+    if stream_idx is not None and (not _is_int(stream_idx) or stream_idx < -1):
+        return {"ok": False, "error": "stream_idx 必须是 >= -1 的整数(-1 表示 UDP 组)"}
+    if not isinstance(remove, bool):
+        return {"ok": False, "error": "remove 必须是布尔值"}
+    if not _is_int(payload_max_bytes) or not (1 <= payload_max_bytes <= 1024 * 1024):
+        return {"ok": False, "error": "payload_max_bytes 必须是 1~1048576 之间的整数"}
+
+    with _entropy_lock:
+        queue = _entropy_queues.get(queue_id)
+        if not queue:
+            return {"ok": False, "error": f"队列不存在或已被清空: {queue_id}"}
+        item = None
+        if frame_num is not None:
+            for e in queue["queue"]:
+                if e["frame_num"] == frame_num:
+                    item = e
+                    break
+            if item is None:
+                return {"ok": False, "error": f"队列中无帧 {frame_num}"}
+        elif stream_idx is not None:
+            for e in queue["queue"]:
+                if e["stream_idx"] == stream_idx:
+                    item = e
+                    break
+            if item is None:
+                return {"ok": False, "error": f"队列中已无 stream_idx={stream_idx} 的条目"}
+        else:
+            if position >= len(queue["queue"]):
+                return {"ok": False, "error": f"position {position} 越界(剩余 {len(queue['queue'])} 条)"}
+            item = queue["queue"][position]
+        target = dict(item)
+        peek_hint = ""
+        if not remove:
+            cnt = _peek_counts.setdefault(queue_id, {}).get(target["frame_num"], 0) + 1
+            _peek_counts[queue_id][target["frame_num"]] = cnt
+            peek_hint = f"HINT: 该条目已窥探 {cnt} 次,请用 remove=True 消费"
+            if cnt >= 3:
+                peek_hint = f"WARNING: 已连续窥探 {cnt} 次,条目未消费。确认后用 dequeue(remove=True) 或 dequeue(frame_num={target['frame_num']}) 推进队列"
+
+    result = _fetch_frame_data(queue["pcap_path"], target["frame_num"],
+                               tshark_path=tshark_path, payload_max_bytes=payload_max_bytes)
+    if not result.get("ok"):
+        return {"ok": False, "error": result.get("error", "取数失败"), "frame_num": target["frame_num"]}
+
+    if remove:
+        with _entropy_lock:
+            q = _entropy_queues.get(queue_id)
+            if q:
+                q["queue"] = [e for e in q["queue"] if e["frame_num"] != target["frame_num"]]
+                _peek_counts.pop(queue_id, None)
+                if not q["queue"]:
+                    _entropy_queue_delete_locked(queue_id)
+                else:
+                    # 同步清理倒排索引,防止已消费帧被误标 in_entropy_queue
+                    key = (q["pcap_path"], target["frame_num"])
+                    holders = _entropy_index.get(key)
+                    if holders:
+                        holders.discard(queue_id)
+                        if not holders:
+                            _entropy_index.pop(key, None)
+                    _entropy_save_locked(q)
+
+    resp = {
+        "ok": True,
+        "queue_id": queue_id,
+        "entropy": target["entropy"],
+        "proto": target["proto"],
+        "payload_len": target["len"],
+        "stream_idx": target["stream_idx"],
+        "packet": result,
+    }
+    if peek_hint:
+        resp["hint"] = peek_hint
+    return resp
+
+
+@mcp.tool()
+@pcap_tool(read_paths=["pcap_path"])
+def get_packet_data(pcap_path: str, frame_num: int, tshark_path: Optional[str] = None,
+                    payload_max_bytes: int = 16384) -> Dict[str, Any]:
+    """无状态取包:不依赖队列,直接按帧号从 pcap 提取单包完整数据(Base64)。
+    用于 AI 独立抽查或队列外的取证。
+
+    流程引导:与 dequeue_packet 相同 —— 取到载荷后 auto_decode 解码 → detect_attack 判定
+    → 版本信息 WebSearch 查 CVE → 综合研判。适合对 summarize_detections 中证据被截断的行补拉全量。"""
+    if not _is_int(frame_num) or frame_num <= 0:
+        return {"ok": False, "error": "frame_num 必须是正整数"}
+    if not _is_int(payload_max_bytes) or not (1 <= payload_max_bytes <= 1024 * 1024):
+        return {"ok": False, "error": "payload_max_bytes 必须是 1~1048576 之间的整数"}
+    return _fetch_frame_data(pcap_path, frame_num, tshark_path=tshark_path,
+                             payload_max_bytes=payload_max_bytes)
+
+
+# ============================================================
+# 任务二:已知攻击汇总
+# ============================================================
+
+# 检测类型 → (MITRE tactic, technique)。静态映射表,15 类。
+_TACTIC_MAP: Dict[str, Tuple[str, str]] = {
+    "sqli": ("Initial Access", "T1190 (Exploit Public-Facing Application)"),
+    "xss": ("Initial Access", "T1189 (Drive-by Compromise)"),
+    "rce": ("Execution", "T1203 (Exploit Client Execution)"),
+    "xxe": ("Initial Access", "T1190 (Exploit Public-Facing Application)"),
+    "ssrf": ("Initial Access", "T1190 (Exploit Public-Facing Application)"),
+    "path_traversal": ("Initial Access", "T1190 (Exploit Public-Facing Application)"),
+    "lfi": ("Initial Access", "T1190 (Exploit Public-Facing Application)"),
+    "command_injection": ("Execution", "T1059 (Command and Scripting Interpreter)"),
+    "deserialization": ("Execution", "T1203 (Exploit Client Execution)"),
+    "file_upload": ("Initial Access", "T1190 (Exploit Public-Facing Application)"),
+    "encrypted_http": ("Command and Control", "T1071.001 (Application Layer Protocol: Web)"),
+    "antsword": ("Persistence", "T1505.003 (Web Shell)"),
+    "caidao": ("Persistence", "T1505.003 (Web Shell)"),
+    "behinder": ("Persistence", "T1505.003 (Web Shell)"),
+    "godzilla": ("Persistence", "T1505.003 (Web Shell)"),
+    "unknown": ("Unknown", ""),
+}
+
+_RULE_DESC_MAP: Dict[str, str] = {
+    "sqli": "SQL注入:恶意查询注入数据库操作",
+    "xss": "跨站脚本:注入恶意脚本执行",
+    "rce": "远程代码执行:服务端执行攻击者代码",
+    "xxe": "XML外部实体注入:读取本地文件或发起SSRF",
+    "ssrf": "服务端请求伪造:探测内网或内部服务",
+    "path_traversal": "目录穿越:读取服务器任意文件",
+    "lfi": "本地文件包含:包含服务器本地文件",
+    "command_injection": "命令注入:拼接执行系统命令",
+    "deserialization": "反序列化攻击:构造恶意对象链执行代码",
+    "file_upload": "文件上传攻击:上传恶意文件(如WebShell)",
+    "encrypted_http": "可疑加密HTTP:高熵载荷疑似加密C2通信",
+    "antsword": "蚁剑 WebShell 连接",
+    "caidao": "菜刀(China Chopper)WebShell 连接",
+    "behinder": "冰蝎加密 WebShell 连接",
+    "godzilla": "哥斯拉加密 WebShell 连接",
+    "unknown": "未分类的可疑请求",
+}
+
+
+def _http_body_from_file_data(file_data: str) -> Optional[bytes]:
+    """tshark -e http.file_data 输出冒号分隔 hex,还原明文。
+    先清冒号再截断(40000 hex 字符 = 20000 字节,保证偶数位不 ValueError);
+    失败返回 None,由调用方回退 URI 派生。"""
+    if not file_data:
+        return None
+    try:
+        return bytes.fromhex(file_data.replace(":", "")[:40000])
+    except ValueError:
+        return None
+
+
+def _looks_readable(data: bytes) -> bool:
+    """熵 < 6.0 且近无 null = 文本(兼容 ASCII/UTF-8/GBK 中文);
+    密文(熵高)或结构化二进制(含 null)判为不可读。"""
+    if not data:
+        return False
+    if EntropyAnalyzer is not None and EntropyAnalyzer().calculate_entropy(data) >= 6.0:
+        return False
+    return data.count(0) / len(data) < 0.001
+
+
+def _hex_to_text(raw: bytes) -> str:
+    """tshark 字节字段还原为可读文本。双情形:
+    A. 输入是 hex 文本(如旧数据流 b"3c:3f:70")→ fromhex 后按可读性还原或保留 hex;
+    B. 输入是原始 bytes(L1 后明文 body 的常态)→ 可读(含中文)则 decode 显示,密文/二进制显示 hex。"""
+    if not raw:
+        return ""
+    # 情形A:尝试 hex 文本解码
+    try:
+        clean = raw.decode("ascii", errors="ignore").replace(":", "")
+        decoded = bytes.fromhex(clean)
+    except ValueError:
+        decoded = None
+    if decoded:
+        if _looks_readable(decoded):
+            return decoded.decode("utf-8", errors="replace")
+        return clean  # hex 文本形式的密文 → 保留 hex
+    # 情形B:原始 bytes 输入
+    if _looks_readable(raw):
+        return raw.decode("utf-8", errors="replace")
+    return raw.hex()  # 密文/二进制 → 显示 hex,可复制可分析
+
+
+def _decode_payload_for_summary(raw_text: str) -> Tuple[str, bool]:
+    """统一解码链路:复用 AutoDecoder(URL→Base64→Gzip 多层)。
+    解出有意义返回 (明文, True);解不出返回 (原文 + [raw], False)。"""
+    if not raw_text:
+        return "", False
+    try:
+        r = auto_decode_text(raw_text)
+        if r and r.total_layers > 0 and r.is_meaningful:
+            return r.final_text[:2000], True
+    except Exception:
+        pass
+    return raw_text[:2000] + " [raw]", False
+
+
+def _collect_attacks_with_evidence(pcap_path: str, tshark_path: str,
+                                   max_packets: int = 0) -> List[Dict[str, Any]]:
+    """攻击检测(一次 tshark -T fields 调用),返回带原始载荷和帧号的结果。
+    逻辑与 _detect_attacks_ek 一致,但保留 evidence/frame_number 供汇总表使用。"""
+    import subprocess
+    attacks = []
+    try:
+        cmd = [tshark_path, "-r", pcap_path, "-Y", "http.request", "-T", "fields",
+               "-e", "frame.number", "-e", "http.request.method", "-e", "http.request.uri",
+               "-e", "http.host", "-e", "http.content_type", "-e", "http.user_agent",
+               "-e", "http.file_data", "-e", "ip.src", "-e", "ip.dst",
+               "-E", separator_arg(), "-E", "quote=d"]
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=300)
+        detector = AttackDetector()
+        seen = set()
+        limit = max_packets if max_packets > 0 else 10000
+        for line in result.stdout.strip().split("\n"):
+            if not line.strip():
+                continue
+            try:
+                fields = parse_quoted_fields(line)
+                if len(fields) < 7:
+                    continue
+                frame = fields[0].strip()
+                method, uri = fields[1].strip(), fields[2].strip()
+                content_type, file_data = fields[4].strip(), fields[6].strip()
+                if not method:
+                    continue
+                # 先构造 body:file_data 为冒号分隔 hex,还原明文;失败回退 URI 派生
+                body = _http_body_from_file_data(file_data)
+                if not body and "?" in uri:
+                    body = uri.split("?", 1)[1].encode("utf-8", errors="ignore")
+                if not body:
+                    body = uri.encode("utf-8", errors="ignore")
+                if not body or len(body) < 3:
+                    continue
+                # 去重 key 基于内容指纹(body 必须先于 key 构造)
+                key = f"{method}:{uri[:100]}:{hashlib.md5(body).hexdigest()[:16]}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                det = detector.detect(data=body, method=method, uri=uri, content_type=content_type)
+                if det.get("detected") and det.get("total_weight", 0) >= 20:
+                    atype = det.get("detection_type") or "unknown"  # detect() 字段名是 detection_type
+                    attacks.append({
+                        "frame_number": int(frame) if frame.isdigit() else 0,
+                        "detection_type": atype,
+                        "threat_level": det.get("risk_level", "low"),
+                        "weight": det.get("total_weight", 0),
+                        "method": method,
+                        "uri": uri[:200],
+                        "src": fields[7].strip(),
+                        "dst": fields[8].strip(),
+                        "body": body[:20000],
+                        "indicators": det.get("matches", [])[:5],
+                    })
+                if len(attacks) >= limit:
+                    break
+            except Exception:
+                continue
+    except Exception as e:
+        logger.warning("_collect_attacks_with_evidence error: %s", e)
+    return attacks
+
+
+@mcp.tool()
+@pcap_tool(read_paths=["pcap_path"])
+def summarize_detections(pcap_path: str, tshark_path: Optional[str] = None,
+                         max_packets: int = 0) -> Dict[str, Any]:
+    """汇总 pcap 的全部已知检测(WebShell + OWASP攻击签名),输出统一表格行。
+
+    每行: frame_number / signature_id / detection_type / action_type
+          (exec_command=可解码为命令 | data_attack=仅攻击载荷) /
+          decoded(统一解码,解不出带[raw]) / evidence(长度+200字符预览) /
+          tactic / technique / rule_description / group_count / in_entropy_queue。
+    同源重复告警按(源+目的+命令/类型+URI)分组去重,保留组内最早包并计 group_count。
+    in_entropy_queue 交叉标记:仅当该帧号也出现在同 pcap 的熵异常队列时生效。
+
+    返回的 rows 供 AI 渲染攻击告警表,并据 tactic 写一段总览攻击链。
+
+    流程引导:拿到 rows 后按序完成报告 ——
+    1. 渲染攻击告警表:exec_command 行表头用"执行命令",data_attack 行用"攻击载荷/向量"
+    2. 据 tactic/technique 列写一段总览攻击链(如 Initial Access(SQLi) → Persistence(WebShell))
+    3. in_entropy_queue=true 的行可与熵队列交叉分析(高熵+攻击签名 = 高危)
+    4. 证据被截断(evidence_len>200)的行,用 get_packet_data 或 dequeue_packet 拉全量载荷深挖
+    5. 本工具未覆盖的协议(FTP/SMTP/USB/蓝牙/MMS/RTP/DNS隐蔽通道/CS C2),用对应专用工具分析
+    6. 汇报前的综合研判(危害评估/处置建议)要求见 analyze_pcap 描述,此处不再重复
+    """
+    if not _is_int(max_packets) or max_packets < 0:
+        return {"ok": False, "error": "max_packets 必须是非负整数"}
+    try:
+        tshark = _find_tshark(tshark_path)
+    except Exception as e:
+        return _local_error(e)
+
+    # 1. 攻击检测(自带 evidence)
+    attacks = _collect_attacks_with_evidence(pcap_path, tshark, max_packets=max_packets)
+    # 2. WebShell 检测(复用现有 EK 链路)
+    #    TODO(N3优化):WebShellDetector 目前吃 pyshark wrapper,待其支持 fields 输入后可合并为一次 tshark 调用
+    webshells = _detect_webshell_ek(pcap_path, tshark, max_packets=max_packets)
+
+    rows: List[Dict[str, Any]] = []
+
+    for atk in attacks:
+        decoded, is_decoded = _decode_payload_for_summary(atk["body"].decode("utf-8", errors="ignore"))
+        rows.append({
+            "frame_number": atk["frame_number"],
+            "detection_type": atk["detection_type"],
+            "action_type": "data_attack",
+            "decoded": decoded,
+            "evidence": _hex_to_text(atk["body"][:200]),
+            "evidence_len": len(atk["body"]),  # body 已是明文,直接取真实字节数
+            "method": atk["method"],
+            "uri": atk["uri"],
+            "src": atk["src"],
+            "dst": atk["dst"],
+            "weight": atk["weight"],
+        })
+
+    for ws in webshells:
+        try:
+            frame_number = ws.packet_number or 0
+            # 解码命令:优先检测器 payloads 里的 decoded_content,再走统一解码
+            decoded = ""
+            for p in (getattr(ws, "payloads", None) or []):
+                if getattr(p, "decoded_content", ""):
+                    decoded = p.decoded_content
+                    break
+            if not decoded:
+                raw_payload = getattr(ws, "payload", None) or {}
+                if isinstance(raw_payload, dict):
+                    raw_text = json.dumps(raw_payload, ensure_ascii=False)[:2000]
+                else:
+                    raw_text = str(raw_payload)[:2000]
+                decoded, _ = _decode_payload_for_summary(raw_text)
+            evidence = getattr(ws, "indicator", "") or ""
+            rows.append({
+                "frame_number": frame_number,
+                "detection_type": _jsonable(ws.detection_type),
+                "action_type": "exec_command",
+                "decoded": decoded,
+                "evidence": evidence[:200],
+                "evidence_len": len(evidence),
+                "method": getattr(ws, "method", ""),
+                "uri": getattr(ws, "uri", "") or "",
+                "src": getattr(ws, "source_ip", "") or "",
+                "dst": getattr(ws, "dest_ip", "") or "",
+                "weight": getattr(ws, "total_weight", 0),
+            })
+        except Exception as e:
+            logger.warning("summarize webshell row failed: %s", e)
+
+    # 3. 分组去重:同源同目标的重复告警只留组内最早包
+    groups: Dict[Tuple, List[Dict[str, Any]]] = {}
+    for row in rows:
+        if row["action_type"] == "exec_command":
+            key = (row["src"], row["dst"], row["decoded"])
+        else:
+            key = (row["src"], row["dst"], row["detection_type"], row["uri"])
+        groups.setdefault(key, []).append(row)
+
+    merged: List[Dict[str, Any]] = []
+    for group in groups.values():
+        group.sort(key=lambda r: r["frame_number"])
+        first = dict(group[0])
+        first["group_count"] = len(group)
+        merged.append(first)
+    merged.sort(key=lambda r: r["frame_number"])
+
+    # 4. 补 tactic / signature_id / 熵队列交叉标记
+    pcap_real = os.path.realpath(pcap_path)
+    final_rows = []
+    for i, row in enumerate(merged):
+        dt = row["detection_type"]
+        tactic, technique = _TACTIC_MAP.get(dt, _TACTIC_MAP["unknown"])
+        with _entropy_lock:
+            in_queue = bool(_entropy_index.get((pcap_real, row["frame_number"])))
+        final_rows.append({
+            "signature_id": f"sig-{row['frame_number']}-{dt}-{i}",
+            "frame_number": row["frame_number"],
+            "detection_type": dt,
+            "action_type": row["action_type"],
+            "decoded": row["decoded"][:500],
+            "evidence": row["evidence"],
+            "evidence_len": row["evidence_len"],
+            "method": row["method"],
+            "uri": row["uri"],
+            "src": row["src"],
+            "dst": row["dst"],
+            "weight": row["weight"],
+            "tactic": tactic,
+            "technique": technique,
+            "rule_description": _RULE_DESC_MAP.get(dt, "未分类的可疑请求"),
+            "group_count": row["group_count"],
+            "in_entropy_queue": in_queue,
+        })
+
+    return {
+        "ok": True,
+        "total_rows": len(final_rows),
+        "rows": final_rows,
+        "note": "交叉标记 in_entropy_queue 仅在同一 pcap 文件内有效;完整载荷请用 dequeue_packet 或 get_packet_data 提取",
+    }
 
 
 def main():
