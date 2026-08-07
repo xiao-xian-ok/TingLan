@@ -13,8 +13,9 @@ import subprocess
 import tempfile
 import pathlib
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Any, Tuple
 from dataclasses import dataclass, field
 from collections import Counter, defaultdict
 from enum import Enum
@@ -42,6 +43,14 @@ def _prepare_tshark_args(args: List[str]) -> List[str]:
     if has_fields_output and not has_separator:
         safe_args.extend(["-E", separator_arg()])
     return safe_args
+
+
+def _split_tshark_fields(line: str) -> List[str]:
+    """Parse project-separated TShark fields while accepting legacy tabs."""
+    fields = split_fields(line)
+    if len(fields) == 1 and "\t" in line:
+        return line.rstrip("\r\n").split("\t")
+    return fields
 
 
 def _run_tshark_text(tshark_path: str, args: List[str], timeout: int = 180) -> str:
@@ -167,7 +176,10 @@ class ProtocolAnalyzer(ABC):
         """从pcap文件路径分析。默认实现：读取数据包后调用analyze()。
         USB/CS等需要文件路径的分析器可重写此方法。"""
         from utils import read_pcap
-        cap = read_pcap(pcap_path)
+        cap = read_pcap(
+            pcap_path,
+            display_filter=kwargs.get("display_filter"),
+        )
         try:
             return self.analyze(cap, **kwargs)
         finally:
@@ -1670,7 +1682,7 @@ class CobaltStrikeAnalyzer(ProtocolAnalyzer):
 
         # ---- Stage 1: 提取 Cookie ----
         print(f"\n[*] [步骤1] 正在分析 PCAP: {os.path.basename(pcap_path)}")
-        cap = read_pcap(pcap_path)
+        cap = read_pcap(pcap_path, display_filter="http")
         try:
             stage1_result = self.analyze(cap)
         finally:
@@ -2276,7 +2288,7 @@ class TLSAnalyzer(ProtocolAnalyzer):
 
         client_hellos = []
         for line in ch_stdout.strip().splitlines():
-            fields = line.split('\t')
+            fields = _split_tshark_fields(line)
             if len(fields) >= 3:
                 client_hellos.append({
                     'src': fields[0],
@@ -2309,7 +2321,7 @@ class TLSAnalyzer(ProtocolAnalyzer):
 
         server_hellos = []
         for line in sh_stdout.strip().splitlines():
-            fields = line.split('\t')
+            fields = _split_tshark_fields(line)
             if len(fields) >= 2:
                 server_hellos.append({
                     'server': fields[0],
@@ -2360,7 +2372,7 @@ class TLSAnalyzer(ProtocolAnalyzer):
 
         certs = []
         for line in cert_stdout.strip().splitlines():
-            fields = line.split('\t')
+            fields = _split_tshark_fields(line)
             if len(fields) >= 2:
                 cert = {
                     'server': fields[0],
@@ -2400,7 +2412,7 @@ class TLSAnalyzer(ProtocolAnalyzer):
 
         streams = defaultdict(lambda: {'packets': 0, 'src': '', 'dst': '', 'sport': '', 'dport': ''})
         for line in stdout.strip().splitlines():
-            fields = line.split('\t')
+            fields = _split_tshark_fields(line)
             if len(fields) >= 5:
                 sid = fields[4]
                 streams[sid]['packets'] += 1
@@ -2456,7 +2468,7 @@ class TLSAnalyzer(ProtocolAnalyzer):
 
         http_records = []
         for line in http_stdout.strip().splitlines():
-            fields = line.split('\t')
+            fields = _split_tshark_fields(line)
             if len(fields) >= 3:
                 http_records.append({
                     'frame': fields[0],
@@ -2515,7 +2527,7 @@ class TLSAnalyzer(ProtocolAnalyzer):
 
         http_records = []
         for line in http_stdout.strip().splitlines():
-            fields = line.split('\t')
+            fields = _split_tshark_fields(line)
             if len(fields) >= 3:
                 http_records.append({
                     'frame': fields[0],
@@ -2598,20 +2610,46 @@ class TLSAnalyzer(ProtocolAnalyzer):
         """
 
         # 获取所有 TCP 流编号
-        stream_stdout = self._run_tshark(tshark_path, [
+        payload_stdout = self._run_tshark(tshark_path, [
             '-r', pcap_file,
+            '-Y', 'tcp.payload',
             '-T', 'fields',
             '-e', 'tcp.stream',
+            '-e', 'tcp.payload',
         ])
 
-        stream_ids = sorted(set(
-            l.strip() for l in stream_stdout.strip().splitlines() if l.strip()
-        ))
-
-        if not stream_ids:
-            return None
-
+        stream_ids = set()
         all_keylog_lines = []
+        for line in payload_stdout.strip().splitlines():
+            fields = split_fields(line, expected=2)
+            if len(fields) < 2 or not fields[1]:
+                continue
+
+            stream_id, hex_str = fields[:2]
+            try:
+                payload_text = bytes.fromhex(hex_str.replace(':', '')).decode(
+                    'utf-8', errors='ignore'
+                )
+            except ValueError:
+                continue
+
+            matches = list(self._KEYLOG_PATTERN.finditer(payload_text))
+            for match in matches:
+                keylog_line = match.group(0)
+                if keylog_line not in all_keylog_lines:
+                    all_keylog_lines.append(keylog_line)
+
+            if not matches and any(
+                hint in payload_text
+                for hint in (
+                    'CLIENT_RANDOM',
+                    'HANDSHAKE_TRAFFIC_SECRET',
+                    'TRAFFIC_SECRET',
+                    'EXPORTER_SECRET',
+                    'EARLY_TRAFFIC_SECRET',
+                )
+            ):
+                stream_ids.add(stream_id)
 
         for sid in stream_ids:
             follow_stdout = self._run_tshark(tshark_path, [
@@ -2628,6 +2666,9 @@ class TLSAnalyzer(ProtocolAnalyzer):
                         keylog_line = match.group(0)
                         if keylog_line not in all_keylog_lines:
                             all_keylog_lines.append(keylog_line)
+
+        if not all_keylog_lines and not stream_ids:
+            return None
 
         if not all_keylog_lines:
             # 兜底: 在所有 TCP payload 的原始 hex 中搜索
@@ -2990,7 +3031,7 @@ class RDPAnalyzer(ProtocolAnalyzer):
         cookies = []
         usernames = set()
         for line in cookie_stdout.strip().splitlines():
-            fields = line.split('\t')
+            fields = _split_tshark_fields(line)
             if len(fields) >= 5:
                 cookie = fields[4]
                 cookies.append({
@@ -3028,7 +3069,7 @@ class RDPAnalyzer(ProtocolAnalyzer):
 
         negotiations = []
         for line in neg_stdout.strip().splitlines():
-            fields = line.split('\t')
+            fields = _split_tshark_fields(line)
             if len(fields) >= 3:
                 neg_type = fields[2]
                 proto = fields[3] if len(fields) > 3 else ""
@@ -3063,7 +3104,7 @@ class RDPAnalyzer(ProtocolAnalyzer):
 
         streams = defaultdict(list)
         for line in conv_stdout.strip().splitlines():
-            fields = line.split('\t')
+            fields = _split_tshark_fields(line)
             if len(fields) >= 6:
                 streams[fields[4]].append({
                     'src_ip': fields[0],
@@ -3124,7 +3165,7 @@ class RDPAnalyzer(ProtocolAnalyzer):
         auth_lines = [l for l in auth_stdout.strip().splitlines() if l.strip()]
 
         for idx, line in enumerate(auth_lines):
-            fields = line.split('\t')
+            fields = _split_tshark_fields(line)
             if len(fields) < 3:
                 continue
 
@@ -3182,7 +3223,7 @@ class RDPAnalyzer(ProtocolAnalyzer):
 
         certs = []
         for line in cert_stdout.strip().splitlines():
-            fields = line.split('\t')
+            fields = _split_tshark_fields(line)
             if len(fields) >= 2:
                 cert = {
                     'server_ip': fields[0],
@@ -3699,7 +3740,7 @@ class RedisAnalyzer(ProtocolAnalyzer):
         all_decoded = []    # 所有解码后的命令
 
         for line in payload_stdout.strip().splitlines():
-            fields = line.split('\t')
+            fields = _split_tshark_fields(line)
             if len(fields) < 5:
                 continue
 
@@ -4118,7 +4159,7 @@ class SMBAnalyzer(ProtocolAnalyzer):
         auth_lines = [l for l in auth_stdout.strip().splitlines() if l.strip()]
 
         for idx, line in enumerate(auth_lines):
-            fields = line.split('\t')
+            fields = _split_tshark_fields(line)
             if len(fields) < 4:
                 continue
 
@@ -4408,7 +4449,7 @@ class SSHAnalyzer(ProtocolAnalyzer):
 
         banners = []
         for line in banner_stdout.strip().splitlines():
-            fields = line.split('\t')
+            fields = _split_tshark_fields(line)
             if len(fields) >= 5:
                 banners.append({
                     'src_ip': fields[0],
@@ -4439,7 +4480,7 @@ class SSHAnalyzer(ProtocolAnalyzer):
 
         kex_info = []
         for line in kex_stdout.strip().splitlines():
-            fields = line.split('\t')
+            fields = _split_tshark_fields(line)
             if len(fields) >= 2:
                 info = {
                     'src_ip': fields[0],
@@ -4494,7 +4535,7 @@ class SSHAnalyzer(ProtocolAnalyzer):
 
         streams = defaultdict(list)
         for line in conv_stdout.strip().splitlines():
-            fields = line.split('\t')
+            fields = _split_tshark_fields(line)
             if len(fields) >= 6:
                 stream_id = fields[4]
                 streams[stream_id].append({
@@ -4594,7 +4635,7 @@ class SSHAnalyzer(ProtocolAnalyzer):
 
         connections = []
         for line in syn_stdout.strip().splitlines():
-            fields = line.split('\t')
+            fields = _split_tshark_fields(line)
             if len(fields) >= 3:
                 connections.append({
                     'src_ip': fields[0],
@@ -4648,7 +4689,7 @@ class SSHAnalyzer(ProtocolAnalyzer):
             stream_packets = defaultdict(int)
             stream_ips = {}
             for line in hasdata_stdout.strip().splitlines():
-                fields = line.split('\t')
+                fields = _split_tshark_fields(line)
                 if len(fields) >= 3:
                     sid = fields[0]
                     stream_packets[sid] += 1
@@ -4935,6 +4976,40 @@ class PcapRepairTool:
 
 class ProtocolAnalyzerManager:
 
+    _PROTOCOL_STAT_ALIASES = {
+        ProtocolType.ICMP: frozenset({"ICMP"}),
+        ProtocolType.DNS: frozenset({"DNS"}),
+        ProtocolType.FTP: frozenset({"FTP", "FTP-DATA"}),
+        ProtocolType.MMS: frozenset({"MMS"}),
+        ProtocolType.BLUETOOTH: frozenset({
+            "BLUETOOTH", "BTL2CAP", "BTATT", "BTLE", "BTHCI_ACL",
+            "BTHCI_CMD", "BTHCI_EVT", "L2CAP", "OBEX",
+        }),
+        ProtocolType.SMTP: frozenset({"SMTP"}),
+        ProtocolType.COBALT_STRIKE: frozenset({"HTTP"}),
+        ProtocolType.USB: frozenset({"USB", "USBHID"}),
+        ProtocolType.TLS: frozenset({"TLS", "SSL"}),
+        ProtocolType.RDP: frozenset({"RDP"}),
+        ProtocolType.REDIS: frozenset({"REDIS"}),
+        ProtocolType.SMB: frozenset({"SMB", "SMB2"}),
+        ProtocolType.SSH: frozenset({"SSH"}),
+    }
+
+    # These analyzers use ProtocolAnalyzer.analyze_pcap(), whose packet loop
+    # only examines the listed protocol layers. Filtering is therefore
+    # coverage-equivalent to a full capture pass and avoids repeated decoding.
+    _BASE_ANALYZER_FILTERS = {
+        ProtocolType.ICMP: "icmp",
+        ProtocolType.DNS: "dns",
+        ProtocolType.FTP: "ftp || ftp-data",
+        ProtocolType.MMS: "mms",
+        ProtocolType.BLUETOOTH: (
+            "bluetooth || btl2cap || btatt || btle || bthci_acl || "
+            "bthci_cmd || bthci_evt || obex"
+        ),
+        ProtocolType.SMTP: "smtp",
+    }
+
     def __init__(self):
         self._analyzers: Dict[ProtocolType, ProtocolAnalyzer] = {}
         self._utilities: Dict[str, Any] = {}
@@ -4968,6 +5043,31 @@ class ProtocolAnalyzerManager:
     def get_utility(self, name: str) -> Optional[Any]:
         return self._utilities.get(name)
 
+    @classmethod
+    def protocols_from_stats(cls, protocol_counts: Dict[str, int]) -> set:
+        """Convert tshark protocol-layer statistics to analyzer types."""
+        observed = {str(name).upper() for name in (protocol_counts or {})}
+        return {
+            protocol
+            for protocol, aliases in cls._PROTOCOL_STAT_ALIASES.items()
+            if observed.intersection(aliases)
+        }
+
+    @staticmethod
+    def _normalize_enabled_protocols(
+        enabled_protocols: Iterable[ProtocolType],
+    ) -> set:
+        normalized = set()
+        for protocol in enabled_protocols:
+            if isinstance(protocol, ProtocolType):
+                normalized.add(protocol)
+                continue
+            try:
+                normalized.add(ProtocolType(str(protocol).strip().lower()))
+            except ValueError:
+                logger.debug("Ignoring unknown enabled protocol: %r", protocol)
+        return normalized
+
     def analyze_protocol(self, protocol: ProtocolType, packets: List) -> Optional[ProtocolAnalysisResult]:
         analyzer = self.get_analyzer(protocol)
         if analyzer:
@@ -4994,14 +5094,44 @@ class ProtocolAnalyzerManager:
                 logger.error(f"{protocol.value}协议分析异常: {e}")
         return results
 
-    def analyze_all_pcap(self, pcap_path: str, **kwargs) -> Dict[ProtocolType, ProtocolAnalysisResult]:
+    def _analyze_all_pcap_legacy(
+        self,
+        pcap_path: str,
+        enabled_protocols: Optional[Iterable[ProtocolType]] = None,
+        progress_callback: Optional[Callable[[int, int, ProtocolType], None]] = None,
+        parallel: bool = False,
+        max_workers: Optional[int] = None,
+        **kwargs,
+    ) -> Dict[ProtocolType, ProtocolAnalysisResult]:
+        return self.analyze_all_pcap(
+            pcap_path,
+            enabled_protocols=enabled_protocols,
+            progress_callback=progress_callback,
+            parallel=parallel,
+            max_workers=max_workers,
+            **kwargs,
+        )
         """对pcap文件运行所有注册分析器，避免一次性物化全部数据包。"""
         results = {}
-        for protocol, analyzer in self._analyzers.items():
+        selected = None
+        if enabled_protocols is not None:
+            selected = self._normalize_enabled_protocols(enabled_protocols)
+
+        analyzers = [
+            (protocol, analyzer)
+            for protocol, analyzer in self._analyzers.items()
+            if selected is None or protocol in selected
+        ]
+        total_analyzers = len(analyzers)
+
+        def analyze_one(protocol, analyzer):
             try:
-                result = analyzer.analyze_pcap(pcap_path, **kwargs)
-                if result and result.packet_count > 0:
-                    results[protocol] = result
+                analyzer_kwargs = dict(kwargs)
+                display_filter = self._BASE_ANALYZER_FILTERS.get(protocol)
+                if display_filter and "display_filter" not in analyzer_kwargs:
+                    analyzer_kwargs["display_filter"] = display_filter
+                result = analyzer.analyze_pcap(pcap_path, **analyzer_kwargs)
+                return result
             except NotImplementedError:
                 logger.debug(f"{protocol.value}分析器不支持此调用方式")
             except Exception as e:
@@ -5012,6 +5142,70 @@ class ProtocolAnalyzerManager:
 # ============================================================
 # 便捷函数
 # ============================================================
+
+    def analyze_all_pcap(
+        self,
+        pcap_path: str,
+        enabled_protocols: Optional[Iterable[ProtocolType]] = None,
+        progress_callback: Optional[Callable[[int, int, ProtocolType], None]] = None,
+        parallel: bool = False,
+        max_workers: Optional[int] = None,
+        **kwargs,
+    ) -> Dict[ProtocolType, ProtocolAnalysisResult]:
+        """Run selected analyzers against a PCAP without materializing all packets."""
+        selected = (
+            self._normalize_enabled_protocols(enabled_protocols)
+            if enabled_protocols is not None
+            else None
+        )
+        analyzers = [
+            (protocol, analyzer)
+            for protocol, analyzer in self._analyzers.items()
+            if selected is None or protocol in selected
+        ]
+        total_analyzers = len(analyzers)
+        results: Dict[ProtocolType, ProtocolAnalysisResult] = {}
+
+        def analyze_one(protocol: ProtocolType, analyzer: ProtocolAnalyzer):
+            analyzer_kwargs = dict(kwargs)
+            display_filter = self._BASE_ANALYZER_FILTERS.get(protocol)
+            if display_filter and "display_filter" not in analyzer_kwargs:
+                analyzer_kwargs["display_filter"] = display_filter
+            try:
+                return protocol, analyzer.analyze_pcap(pcap_path, **analyzer_kwargs)
+            except NotImplementedError:
+                logger.debug("%s analyzer does not support PCAP analysis", protocol.value)
+            except Exception as error:
+                logger.error("%s protocol analysis failed: %s", protocol.value, error)
+            return protocol, None
+
+        if parallel and analyzers:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(analyze_one, protocol, analyzer)
+                    for protocol, analyzer in analyzers
+                ]
+                completed_analyzers = 0
+                for future in as_completed(futures):
+                    protocol, result = future.result()
+                    if result and result.packet_count > 0:
+                        results[protocol] = result
+                    if progress_callback:
+                        progress_callback(
+                            completed_analyzers,
+                            total_analyzers,
+                            protocol,
+                        )
+                    completed_analyzers += 1
+        else:
+            for index, (protocol, analyzer) in enumerate(analyzers):
+                _protocol, result = analyze_one(protocol, analyzer)
+                if result and result.packet_count > 0:
+                    results[protocol] = result
+                if progress_callback:
+                    progress_callback(index, total_analyzers, protocol)
+        return results
+
 
 def analyze_icmp(packets: List) -> ProtocolAnalysisResult:
     return ICMPAnalyzer().analyze(packets)

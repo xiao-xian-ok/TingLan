@@ -8,6 +8,8 @@ import shlex
 import logging
 import threading
 import weakref
+import hashlib
+from types import SimpleNamespace
 from typing import Optional, Dict, List, Tuple, Any, Set
 from dataclasses import dataclass, field
 from collections import deque
@@ -30,9 +32,12 @@ from core.tshark_stream import (
     TsharkNotFoundError,
     TsharkProcessError,
     TsharkPermissionError,
+    HTTP_REQUEST_FIELDS,
+    HTTP_RESPONSE_FIELDS,
     get_protocol_stats,
     build_hierarchy_stats
 )
+from core.tshark_locator import find_tshark
 
 from models.detection_result import (
     DetectionResult,
@@ -47,6 +52,11 @@ from models.detection_result import (
     RTPStreamInfo
 )
 from core.display_safety import safe_display_text
+from core.http_response_inspector import (
+    HttpResponseInspector,
+    content_disposition_from_response_lines,
+)
+from core.safe_paths import safe_unique_path
 
 logger = logging.getLogger(__name__)
 
@@ -130,14 +140,7 @@ class ProgressThrottler:
 
     def should_emit(self, percent: int) -> bool:
         current_time = time.time()
-        elapsed_ms = (current_time - self._last_emit_time) * 1000
-
-        if percent >= 100:
-            self._last_emit_time = current_time
-            self._last_percent = percent
-            return True
-
-        if elapsed_ms >= self._interval_ms and percent != self._last_percent:
+        if percent >= 100 or percent > self._last_percent:
             self._last_emit_time = current_time
             self._last_percent = percent
             return True
@@ -155,6 +158,13 @@ class AnalysisOptions:
     custom_keys: Dict[str, str] = field(default_factory=dict)
     throttle: ThrottleConfig = field(default_factory=ThrottleConfig)
     max_detections: int = ResourceLimits.MAX_DETECTIONS
+
+
+class _HttpEvidencePacket:
+    """Minimal PyShark-compatible view retained for protocol evidence passes."""
+
+    def __init__(self, cookie: str = "") -> None:
+        self.http = SimpleNamespace(cookie=cookie or "")
 
 
 class StreamAnalysisWorker(QThread):
@@ -192,45 +202,13 @@ class StreamAnalysisWorker(QThread):
         self._start_time = 0.0
 
         self._seen_keys: Set[str] = set()
+        self._http_evidence_packets: List[_HttpEvidencePacket] = []
+        self._http_request_uris: Dict[int, str] = {}
         self._gc_counter = 0
 
     def _find_tshark_robust(self) -> Optional[str]:
         """在常见位置找tshark"""
-        import shutil
-
-        tshark = shutil.which("tshark")
-        if tshark:
-            return tshark
-
-        if sys.platform == "win32":
-            common_paths = [
-                r"E:\internet_safe\wireshark\tshark.exe",
-                r"C:\Program Files\Wireshark\tshark.exe",
-                r"C:\Program Files (x86)\Wireshark\tshark.exe",
-                r"D:\Program Files\Wireshark\tshark.exe",
-                r"E:\wireshark\tshark.exe",
-                os.path.join(os.environ.get("ProgramFiles", ""), "Wireshark", "tshark.exe"),
-                os.path.join(os.environ.get("ProgramFiles(x86)", ""), "Wireshark", "tshark.exe"),
-            ]
-        else:
-            common_paths = [
-                "/usr/bin/tshark",
-                "/usr/local/bin/tshark",
-                "/opt/wireshark/bin/tshark",
-            ]
-
-        for path in common_paths:
-            if path and os.path.exists(path):
-                if os.access(path, os.X_OK) or sys.platform == "win32":
-                    return path
-
-        wireshark_path = os.environ.get("WIRESHARK_PATH")
-        if wireshark_path:
-            tshark_path = os.path.join(wireshark_path, "tshark.exe" if sys.platform == "win32" else "tshark")
-            if os.path.exists(tshark_path):
-                return tshark_path
-
-        return None
+        return find_tshark()
 
     def cancel(self):
         self._is_cancelled = True
@@ -303,6 +281,8 @@ class StreamAnalysisWorker(QThread):
 
         self._result_buffer.clear()
         self._seen_keys.clear()
+        self._http_evidence_packets.clear()
+        self._http_request_uris.clear()
         gc.collect()
 
         logger.debug(f"Worker 清理完成: 处理 {self._packet_count} 包, 发现 {self._detection_count} 威胁")
@@ -331,12 +311,8 @@ class StreamAnalysisWorker(QThread):
         http_results = self._run_http_stream_analysis(total_packets)
         results.extend(http_results)
 
-        if self._is_cancelled:
-            return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets, rtp_streams)
-
-        if results:
-            self._emit_progress(38, f"获取攻击响应包... ({len(results)} 条)")
-            results = self._fetch_http_responses(results)
+        self._emit_progress(38, "HTTP 响应流式扫描...")
+        extracted_files.extend(self._scan_http_responses(results))
 
         if self._is_cancelled:
             return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets, rtp_streams)
@@ -369,6 +345,7 @@ class StreamAnalysisWorker(QThread):
             return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets, rtp_streams)
 
         self._emit_progress(64, "深度协议分析 (SSH/TLS/SMB/RDP/Redis 等)...")
+        self._emit_progress(65, "深度协议分析初始化...")
         deep_findings, deep_extracted = self._run_deep_protocol_analysis()
         protocol_findings.extend(deep_findings)
         for fp in deep_extracted:
@@ -384,13 +361,6 @@ class StreamAnalysisWorker(QThread):
                     file_size=fsize,
                     pcap_path=self.pcap_path
                 ))
-
-        if self._is_cancelled:
-            return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets, rtp_streams)
-
-        self._emit_progress(64, "HTTP 对象提取...")
-        http_extracted = self._export_http_objects()
-        extracted_files.extend(http_extracted)
 
         if self._is_cancelled:
             return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets, rtp_streams)
@@ -421,20 +391,39 @@ class StreamAnalysisWorker(QThread):
             logger.warning(f"协议统计失败: {e}")
             return {}, 0, []
 
-    def _run_http_stream_analysis(self, total_packets: int) -> List[DetectionResult]:
+    @staticmethod
+    def _has_protocol(protocol_counts: Optional[Dict[str, int]], protocol: str) -> bool:
+        if not protocol_counts:
+            return False
+        wanted = protocol.upper()
+        return any(
+            str(name).upper() == wanted and int(count or 0) > 0
+            for name, count in protocol_counts.items()
+        )
+
+    def _run_http_stream_analysis(
+        self,
+        total_packets: int,
+        _allow_ek_fallback: bool = True,
+        _existing_results: Optional[List[DetectionResult]] = None,
+    ) -> List[DetectionResult]:
         """HTTP流式分析，带信号节流和结果上限"""
         logger.debug(f"_run_http_stream_analysis: total_packets={total_packets}")
-        results: List[DetectionResult] = []
-        limit_reached = False
+        results = _existing_results if _existing_results is not None else []
+        limit_reached = len(results) >= self.options.max_detections
+        self._http_evidence_packets = []
+        self._http_request_uris = {}
 
         try:
             from core.attack_detector import AttackDetector
             detector = AttackDetector()
 
+            output_format = OutputFormat.FIELDS if _allow_ek_fallback else OutputFormat.EK
             config = StreamConfig(
                 pcap_path=self.pcap_path,
                 display_filter="http.request",
-                output_format=OutputFormat.EK,
+                output_format=output_format,
+                fields=list(HTTP_REQUEST_FIELDS) if output_format is OutputFormat.FIELDS else [],
                 disable_name_resolution=True,
                 line_buffered=True
             )
@@ -455,6 +444,12 @@ class StreamAnalysisWorker(QThread):
 
                 self._trigger_gc_if_needed()
 
+                self._http_evidence_packets.append(
+                    _HttpEvidencePacket(getattr(packet, "http_cookie", ""))
+                )
+                if packet.frame_number > 0:
+                    self._http_request_uris[packet.frame_number] = packet.http_uri or ""
+
                 current_time = time.time()
                 if current_time - last_progress_time >= 0.5:
                     pct = min(15 + int((http_count / max(total_packets, 1)) * 28), 43)
@@ -462,7 +457,16 @@ class StreamAnalysisWorker(QThread):
                     last_progress_time = current_time
 
                 # 去重
-                dedup_key = f"{packet.http_method}:{packet.http_uri[:100] if packet.http_uri else ''}:{len(packet.http_request_body)}"
+                request_body = packet.http_request_body or b""
+                if len(request_body) > 65536:
+                    digest_input = request_body[:32768] + request_body[-32768:]
+                else:
+                    digest_input = request_body
+                body_digest = hashlib.sha256(digest_input).hexdigest()
+                dedup_key = (
+                    f"{packet.http_method}:{packet.http_host}:{packet.http_uri}:"
+                    f"{packet.http_content_type}:{len(request_body)}:{body_digest}"
+                )
                 if dedup_key in self._seen_keys:
                     del packet
                     continue
@@ -495,9 +499,15 @@ class StreamAnalysisWorker(QThread):
             self._emit_progress(43, f"HTTP分析完成: {http_count} 请求, {len(results)} 威胁")
 
         except TsharkError as e:
+            if _allow_ek_fallback:
+                logger.warning(f"FIELDS HTTP stream unavailable, retrying EK: {e}")
+                return self._run_http_stream_analysis(total_packets, False, results)
             self._emit_progress(43, f"HTTP分析警告: {str(e)[:40]}")
             raise
         except Exception as e:
+            if _allow_ek_fallback:
+                logger.warning(f"FIELDS HTTP stream failed, retrying EK: {e}")
+                return self._run_http_stream_analysis(total_packets, False, results)
             logger.warning(f"HTTP流式分析异常: {e}")
 
         return results
@@ -550,60 +560,282 @@ class StreamAnalysisWorker(QThread):
 
         return None
 
-    def _fetch_http_responses(self, results: List[DetectionResult]) -> List[DetectionResult]:
+    def _scan_http_responses(self, results: List[DetectionResult]) -> List[ExtractedFile]:
+        """Stream every HTTP response once for response evidence and file artifacts."""
+        if not self._handler:
+            return []
+
+        request_to_indices: Dict[int, List[int]] = {}
+        stream_to_indices: Dict[int, List[int]] = {}
+        for index, detection in enumerate(results):
+            raw_result = detection.raw_result if isinstance(detection.raw_result, dict) else {}
+            request_frame = raw_result.get("frame_number") or getattr(detection, "packet_number", 0)
+            tcp_stream = raw_result.get("tcp_stream", getattr(detection, "tcp_stream", -1))
+            try:
+                request_frame = int(request_frame or 0)
+            except (TypeError, ValueError):
+                request_frame = 0
+            try:
+                tcp_stream = int(tcp_stream)
+            except (TypeError, ValueError):
+                tcp_stream = -1
+            if request_frame > 0:
+                request_to_indices.setdefault(request_frame, []).append(index)
+            if tcp_stream >= 0:
+                stream_to_indices.setdefault(tcp_stream, []).append(index)
+
+        extracted_files: List[ExtractedFile] = []
+        seen_hashes: Set[str] = set()
+        seen_evidence_links: Set[Tuple[str, int]] = set()
+        exact_response_matches: Set[int] = set()
+        inspector = HttpResponseInspector()
+        output_dir: Optional[str] = None
+        packet_iter = None
+        config = StreamConfig(
+            pcap_path=self.pcap_path,
+            display_filter="http.response",
+            output_format=OutputFormat.FIELDS,
+            fields=list(HTTP_RESPONSE_FIELDS),
+            disable_name_resolution=True,
+            line_buffered=True,
+        )
+
+        try:
+            packet_iter = self._handler.stream_packets(config)
+            for packet in packet_iter:
+                if self._is_cancelled:
+                    break
+
+                request_in = str(getattr(packet, "http_request_in", "") or "").strip()
+                request_frame = 0
+                target_indices: Optional[List[int]] = None
+                evidence_key: Optional[Tuple[str, int]] = None
+                if request_in:
+                    try:
+                        request_frame = int(request_in)
+                    except (TypeError, ValueError):
+                        request_frame = 0
+                    target_indices = request_to_indices.get(request_frame)
+                    evidence_key = ("request", request_frame)
+                else:
+                    target_indices = stream_to_indices.get(packet.tcp_stream)
+                    evidence_key = ("stream", packet.tcp_stream)
+                    if target_indices:
+                        target_indices = [
+                            index for index in target_indices
+                            if index not in exact_response_matches
+                        ]
+                        if target_indices:
+                            first_result = results[target_indices[0]]
+                            first_raw = first_result.raw_result if isinstance(first_result.raw_result, dict) else {}
+                            try:
+                                request_frame = int(
+                                    first_raw.get("frame_number")
+                                    or getattr(first_result, "packet_number", 0)
+                                    or 0
+                                )
+                            except (TypeError, ValueError):
+                                request_frame = 0
+
+                if target_indices and evidence_key not in seen_evidence_links:
+                    seen_evidence_links.add(evidence_key)
+                    self._attach_response_evidence(packet, results, target_indices)
+                    if request_in:
+                        exact_response_matches.update(target_indices)
+
+                body = packet.http_response_body or b""
+                match = inspector.inspect(
+                    packet.frame_number,
+                    body,
+                    packet.http_content_type,
+                    self._response_content_disposition(packet),
+                    self._http_request_uris.get(request_frame, ""),
+                )
+                if not (self.options.extract_files and match and body):
+                    continue
+
+                body_hash = hashlib.sha256(body).hexdigest()
+                if body_hash in seen_hashes:
+                    continue
+                if output_dir is None:
+                    import tempfile
+
+                    output_dir = tempfile.mkdtemp("tinglan_http_")
+                file_path, filename = safe_unique_path(
+                    output_dir,
+                    match.filename,
+                    fallback=f"frame_{packet.frame_number}.bin",
+                )
+                with open(file_path, "wb") as output_file:
+                    output_file.write(body)
+                seen_hashes.add(body_hash)
+                extracted_files.append(
+                    ExtractedFile(
+                        file_path=file_path,
+                        file_name=filename,
+                        file_type=match.file_type,
+                        file_size=len(body),
+                        source_packet=packet.frame_number,
+                        content_type=match.content_type,
+                        pcap_path=self.pcap_path,
+                    )
+                )
+        except Exception as error:
+            logger.warning("HTTP response stream scan failed: %s", error)
+            self._emit_progress(70, "HTTP 响应流式扫描失败")
+        finally:
+            close = getattr(packet_iter, "close", None)
+            if close:
+                close()
+
+        if not self._is_cancelled:
+            self._emit_progress(70, f"HTTP 响应扫描完成: {len(extracted_files)} 个对象")
+        return extracted_files
+
+    @staticmethod
+    def _response_content_disposition(packet: PacketData) -> str:
+        """Return Content-Disposition without depending on a version-specific field."""
+        explicit = str(getattr(packet, "http_content_disposition", "") or "").strip()
+        if explicit:
+            return explicit
+        return content_disposition_from_response_lines(
+            getattr(packet, "http_response_lines", []) or []
+        )
+
+    def _attach_response_evidence(
+        self,
+        packet: PacketData,
+        results: List[DetectionResult],
+        target_indices: List[int],
+    ) -> None:
+        body_sample = (packet.http_response_body or b"")[:2000].decode("utf-8", errors="replace")
+        status_code = str(packet.http_response_code or "")
+        response_lines = getattr(packet, "http_response_lines", [])
+        status_line = response_lines[0] if response_lines else ""
+        if not status_line:
+            status_line = f"HTTP/1.1 {status_code}" if status_code else ""
+        response_headers = self._extract_response_headers(packet)
+        response_data = status_line
+        if response_headers:
+            response_data += "\r\n" + response_headers
+        response_data = (response_data + "\r\n\r\n" + body_sample)[:2000]
+
+        for result_index in target_indices:
+            detection = results[result_index]
+            if isinstance(detection.raw_result, dict):
+                detection.raw_result["response_status"] = status_code
+                detection.raw_result["response_sample"] = body_sample
+                detection.raw_result["response_data"] = response_data
+            detection.response_sample = body_sample
+            detection.response_data = response_data
+
+    def _fetch_http_responses(
+        self,
+        results: List[DetectionResult],
+        _allow_ek_fallback: bool = True,
+        _response_matches: Optional[List[Tuple[PacketData, List[int]]]] = None,
+        _seen_response_links: Optional[Set[Tuple[str, int]]] = None,
+    ) -> List[DetectionResult]:
         """检测完成后，按 tcp_stream 批量抓取对应的 HTTP 响应包"""
         if not results or not self._handler:
             return results
 
         stream_to_indices: Dict[int, List[int]] = {}
+        request_to_indices: Dict[int, List[int]] = {}
         for idx, det in enumerate(results):
             tcp_stream = -1
+            request_frame = 0
             if det.raw_result and isinstance(det.raw_result, dict):
                 tcp_stream = det.raw_result.get('tcp_stream', -1)
+                request_frame = det.raw_result.get("frame_number", 0)
+            if not request_frame:
+                request_frame = getattr(det, "packet_number", 0)
             if tcp_stream >= 0:
                 stream_to_indices.setdefault(tcp_stream, []).append(idx)
+            try:
+                request_frame = int(request_frame or 0)
+            except (TypeError, ValueError):
+                request_frame = 0
+            if request_frame > 0:
+                request_to_indices.setdefault(request_frame, []).append(idx)
 
         if not stream_to_indices:
             return results
 
-        stream_ids = list(stream_to_indices.keys())
-        response_map: Dict[int, 'PacketData'] = {}
-        BATCH_SIZE = 50
+        if self._is_cancelled:
+            return results
 
-        for batch_start in range(0, len(stream_ids), BATCH_SIZE):
-            if self._is_cancelled:
-                break
+        stream_ids = set(stream_to_indices.keys())
+        response_matches = _response_matches if _response_matches is not None else []
+        seen_response_links = (
+            _seen_response_links if _seen_response_links is not None else set()
+        )
+        matched_detection_indices: Set[int] = {
+            idx
+            for _packet, target_indices in response_matches
+            for idx in target_indices
+        }
+        output_format = OutputFormat.FIELDS if _allow_ek_fallback else OutputFormat.EK
+        config = StreamConfig(
+            pcap_path=self.pcap_path,
+            display_filter="http.response",
+            output_format=output_format,
+            fields=list(HTTP_RESPONSE_FIELDS) if output_format is OutputFormat.FIELDS else [],
+            disable_name_resolution=True,
+            line_buffered=True
+        )
 
-            batch = stream_ids[batch_start:batch_start + BATCH_SIZE]
-            stream_filter = " or ".join(f"tcp.stream eq {s}" for s in batch)
-            display_filter = f"http.response and ({stream_filter})"
-
-            config = StreamConfig(
-                pcap_path=self.pcap_path,
-                display_filter=display_filter,
-                output_format=OutputFormat.EK,
-                disable_name_resolution=True,
-                line_buffered=True
-            )
-
+        try:
+            packet_iter = self._handler.stream_packets(config)
             try:
-                for packet in self._handler.stream_packets(config):
+                for packet in packet_iter:
                     if self._is_cancelled:
                         break
-                    sid = packet.tcp_stream
-                    if sid not in response_map:
-                        response_map[sid] = packet
-                    else:
-                        del packet
-            except Exception as e:
-                logger.warning(f"响应包抓取失败: {e}")
 
-        for sid, resp_pkt in response_map.items():
+                    sid = packet.tcp_stream
+                    request_in = getattr(packet, "http_request_in", "")
+                    try:
+                        request_frame = int(request_in) if request_in else 0
+                    except (TypeError, ValueError):
+                        request_frame = 0
+
+                    if request_in:
+                        target_indices = request_to_indices.get(request_frame)
+                        response_key = ("request", request_frame)
+                    else:
+                        target_indices = stream_to_indices.get(sid)
+                        response_key = ("stream", sid)
+
+                    if not target_indices or response_key in seen_response_links:
+                        del packet
+                        continue
+
+                    # A populated but unknown request link must not fall back to
+                    # its TCP stream, otherwise pipelined requests are mispaired.
+                    seen_response_links.add(response_key)
+                    response_matches.append((packet, target_indices))
+                    matched_detection_indices.update(target_indices)
+                    if len(matched_detection_indices) >= len(results):
+                        break
+            finally:
+                close = getattr(packet_iter, "close", None)
+                if close:
+                    close()
+        except Exception as e:
+            if _allow_ek_fallback:
+                logger.warning(f"FIELDS response stream failed, retrying EK: {e}")
+                return self._fetch_http_responses(
+                    results,
+                    False,
+                    response_matches,
+                    seen_response_links,
+                )
+            logger.warning(f"响应包抓取失败: {e}")
+
+        for resp_pkt, target_indices in response_matches:
             status_code = resp_pkt.http_response_code or ""
 
-            body = resp_pkt.http_response_body
-            if not body:
-                body = resp_pkt.http_request_body
+            body = resp_pkt.http_response_body or b""
 
             body_str = ""
             if body:
@@ -613,14 +845,17 @@ class StreamAnalysisWorker(QThread):
                     body_str = repr(body)[:2000]
 
             resp_headers = self._extract_response_headers(resp_pkt)
-            status_line = f"HTTP/1.1 {status_code}" if status_code else ""
+            response_lines = getattr(resp_pkt, "http_response_lines", [])
+            status_line = response_lines[0] if response_lines else ""
+            if not status_line:
+                status_line = f"HTTP/1.1 {status_code}" if status_code else ""
 
             response_text = status_line
             if resp_headers:
                 response_text += "\r\n" + resp_headers
             response_text += "\r\n\r\n" + body_str
 
-            for det_idx in stream_to_indices.get(sid, []):
+            for det_idx in target_indices:
                 det = results[det_idx]
                 if det.raw_result and isinstance(det.raw_result, dict):
                     det.raw_result['response_data'] = response_text
@@ -631,7 +866,7 @@ class StreamAnalysisWorker(QThread):
 
             del resp_pkt
 
-        response_map.clear()
+        response_matches.clear()
         return results
 
     def _extract_response_headers(self, packet: 'PacketData') -> str:
@@ -663,7 +898,7 @@ class StreamAnalysisWorker(QThread):
         findings: List[ProtocolFinding] = []
         try:
             analyzer = ICMPAnalyzer()
-            result = analyzer.analyze_pcap(self.pcap_path)
+            result = analyzer.analyze_pcap(self.pcap_path, display_filter="icmp")
             for af in result.findings:
                 pf = ProtocolFinding.from_analyzer_finding(af)
                 findings.append(pf)
@@ -678,7 +913,7 @@ class StreamAnalysisWorker(QThread):
         findings: List[ProtocolFinding] = []
         try:
             analyzer = DNSCovertChannelAnalyzer()
-            result = analyzer.analyze_pcap(self.pcap_path)
+            result = analyzer.analyze_pcap(self.pcap_path, display_filter="dns")
             for af in result.findings:
                 pf = ProtocolFinding.from_analyzer_finding(af)
                 findings.append(pf)
@@ -693,7 +928,7 @@ class StreamAnalysisWorker(QThread):
         findings: List[ProtocolFinding] = []
         try:
             analyzer = CobaltStrikeAnalyzer()
-            result = analyzer.analyze_pcap(self.pcap_path)
+            result = analyzer.analyze(self._http_evidence_packets)
             for af in result.findings:
                 pf = ProtocolFinding.from_analyzer_finding(af)
                 findings.append(pf)
@@ -754,7 +989,17 @@ class StreamAnalysisWorker(QThread):
             SKIP = {ProtocolType.ICMP, ProtocolType.DNS, ProtocolType.COBALT_STRIKE}
 
             manager = ProtocolAnalyzerManager()
-            results = manager.analyze_all_pcap(self.pcap_path, generate_plot=True)
+            deep_protocols = [
+                protocol for protocol in ProtocolType if protocol not in SKIP
+            ]
+            results = manager.analyze_all_pcap(
+                self.pcap_path,
+                enabled_protocols=deep_protocols,
+                generate_plot=True,
+                progress_callback=self._emit_deep_protocol_progress,
+                parallel=True,
+                max_workers=4,
+            )
 
             total_findings = 0
             for proto_type, result in results.items():
@@ -776,7 +1021,25 @@ class StreamAnalysisWorker(QThread):
         except Exception as e:
             logger.warning(f"深度协议分析异常: {e}")
 
+        self._emit_progress(74, "深度协议分析完成")
         return findings, extracted_file_paths
+
+    def _emit_deep_protocol_progress(
+        self,
+        index: int,
+        total: int,
+        protocol: Any,
+    ) -> None:
+        """Expose per-analyzer progress while the full manager pass is running."""
+        if total <= 0:
+            return
+        completed = index + 1
+        percent = 65 + ((completed * 9 + total - 1) // total)
+        name = getattr(protocol, "value", str(protocol))
+        self._emit_progress(
+            min(percent, 74),
+            f"深度协议分析 {completed}/{total}: {name}",
+        )
 
     def _export_http_objects(self) -> List[ExtractedFile]:
         """委托给AnalysisService做智能提取"""
@@ -792,8 +1055,11 @@ class StreamAnalysisWorker(QThread):
             return extracted_files
 
         except Exception as e:
-            logger.warning(f"智能HTTP对象提取失败，回退到基础提取: {e}")
-            return self._export_http_objects_fallback()
+            # Complete object export creates arbitrary response-body artifacts
+            # and is intentionally opt-in at the service boundary.
+            logger.warning(f"智能HTTP对象提取失败，跳过 HTTP 对象导出: {e}")
+            self._emit_progress(70, "HTTP 对象提取失败，已跳过")
+            return []
 
     def _export_http_objects_fallback(self) -> List[ExtractedFile]:
         """基础HTTP对象导出，兜底用"""
@@ -1109,7 +1375,14 @@ class StreamAnalysisController(QObject):
         analysis_options = AnalysisOptions(
             detect_webshell=options.get("detect_webshell", True) if options else True,
             detect_owasp=options.get("detect_owasp", True) if options else True,
-            extract_files=options.get("extract_images", True) if options else True,
+            extract_files=(
+                options.get(
+                    "extract_files",
+                    options.get("extract_images", True),
+                )
+                if options
+                else True
+            ),
             auto_decode=options.get("auto_decode", True) if options else True,
             file_recovery=options.get("file_recovery", True) if options else True,
             custom_keys=options.get("custom_keys", {}) if options else {},

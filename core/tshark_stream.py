@@ -9,7 +9,6 @@ import signal
 import logging
 import threading
 import subprocess
-import shutil
 import time
 from typing import Iterator, Optional, Dict, Any, Callable, List, Tuple, Union
 from dataclasses import dataclass, field
@@ -18,11 +17,13 @@ from queue import Queue, Empty
 from contextlib import contextmanager
 
 try:
-    from core.tshark_fields import separator_arg
+    from core.tshark_fields import separator_arg, split_fields
     from core.http_reassembly import decode_http_body_bytes
+    from core.tshark_locator import find_tshark
 except ImportError:
-    from tshark_fields import separator_arg
+    from tshark_fields import separator_arg, split_fields
     from http_reassembly import decode_http_body_bytes
+    from tshark_locator import find_tshark
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,46 @@ class OutputFormat(Enum):
     EK = "ek"          # 每行一个完整JSON，流式处理最合适
     JSON = "json"
     FIELDS = "fields"
+
+
+# Stable field order shared by field-based HTTP request/response consumers.
+HTTP_REQUEST_FIELDS = [
+    "frame.number",
+    "frame.time",
+    "frame.protocols",
+    "ip.src",
+    "ip.dst",
+    "tcp.srcport",
+    "tcp.dstport",
+    "frame.len",
+    "tcp.stream",
+    "http.request.method",
+    "http.request.uri",
+    "http.host",
+    "http.content_type",
+    "http.user_agent",
+    "http.cookie",
+    "http.response_in",
+    "http.file_data",
+]
+
+HTTP_RESPONSE_FIELDS = [
+    "frame.number",
+    "frame.time",
+    "frame.protocols",
+    "ip.src",
+    "ip.dst",
+    "tcp.srcport",
+    "tcp.dstport",
+    "frame.len",
+    "tcp.stream",
+    "http.request_in",
+    "http.response.code",
+    "http.content_type",
+    "http.content_length",
+    "http.response.line",
+    "http.file_data",
+]
 
 
 class LayerWrapper:
@@ -194,10 +235,15 @@ class PacketData:
     http_uri: str = ""
     http_host: str = ""
     http_content_type: str = ""
+    http_content_disposition: str = ""
     http_user_agent: str = ""
+    http_cookie: str = ""
     http_request_body: bytes = b""
+    http_request_in: str = ""
+    http_response_in: str = ""
     http_response_code: str = ""
     http_response_body: bytes = b""
+    http_response_lines: List[str] = field(default_factory=list)
 
     tcp_stream: int = 0
 
@@ -451,8 +497,17 @@ class PacketParser:
                 packet.http_uri = PacketParser._get_first(http, "http_http_request_uri", "")
                 packet.http_host = PacketParser._get_first(http, "http_http_host", "")
                 packet.http_content_type = PacketParser._get_first(http, "http_http_content_type", "")
+                packet.http_content_disposition = PacketParser._get_first(
+                    http, "http_http_content_disposition", ""
+                )
                 packet.http_user_agent = PacketParser._get_first(http, "http_http_user_agent", "")
+                packet.http_cookie = PacketParser._get_first(http, "http_http_cookie", "")
+                packet.http_request_in = PacketParser._get_first(http, "http_http_request_in", "")
+                packet.http_response_in = PacketParser._get_first(http, "http_http_response_in", "")
                 packet.http_response_code = PacketParser._get_first(http, "http_http_response_code", "")
+                response_line = PacketParser._get_first(http, "http_http_response_line", "")
+                if response_line:
+                    packet.http_response_lines = [response_line]
 
                 body_bytes = decode_http_body_bytes(LayerWrapper("http", http))
                 if body_bytes:
@@ -470,6 +525,97 @@ class PacketParser:
             return None
 
     @staticmethod
+    def parse_fields_line(line: str, fields: List[str]) -> Optional[PacketData]:
+        """Parse one ``tshark -T fields`` row into the lightweight packet model."""
+        try:
+            if not line or not fields:
+                return None
+
+            values = split_fields(line, expected=len(fields))
+            if not values:
+                return None
+            record = dict(zip(fields, values))
+
+            packet = PacketData()
+            packet.frame_number = PacketParser._safe_int(record.get("frame.number", ""))
+            packet.timestamp = record.get("frame.time", "")
+            protocols = record.get("frame.protocols", "")
+            packet.protocol = protocols.split(":")[-1].upper() if protocols else ""
+            packet.src_ip = record.get("ip.src", "")
+            packet.dst_ip = record.get("ip.dst", "")
+            packet.src_port = PacketParser._safe_int(record.get("tcp.srcport", ""))
+            packet.dst_port = PacketParser._safe_int(record.get("tcp.dstport", ""))
+            packet.length = PacketParser._safe_int(record.get("frame.len", ""))
+            packet.tcp_stream = PacketParser._safe_int(record.get("tcp.stream", ""))
+
+            packet.http_method = record.get("http.request.method", "")
+            packet.http_uri = record.get("http.request.uri", "")
+            packet.http_host = record.get("http.host", "")
+            packet.http_content_type = record.get("http.content_type", "")
+            packet.http_user_agent = record.get("http.user_agent", "")
+            packet.http_cookie = record.get("http.cookie", "")
+            packet.http_request_in = record.get("http.request_in", "")
+            packet.http_response_in = record.get("http.response_in", "")
+            packet.http_response_code = record.get("http.response.code", "")
+
+            response_line = record.get("http.response.line", "")
+            if response_line:
+                packet.http_response_lines = [response_line]
+
+            file_data = PacketParser._decode_field_data(record.get("http.file_data", ""))
+            # A response reference/code identifies response payloads even if a
+            # combined field request includes the method column as well.
+            is_response = bool(
+                packet.http_response_code
+                or packet.http_request_in
+                or response_line
+                or packet.http_content_disposition
+            )
+            if file_data:
+                if is_response:
+                    packet.http_response_body = file_data
+                else:
+                    packet.http_request_body = file_data
+
+            return packet
+        except Exception as e:
+            logger.debug(f"解析 fields 行失败: {e}")
+            return None
+
+    @staticmethod
+    def _safe_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(value) if value not in (None, "") else default
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _decode_field_data(value: Any) -> bytes:
+        if value in (None, ""):
+            return b""
+        if isinstance(value, bytes):
+            return value
+
+        text = str(value).strip()
+        if not text:
+            return b""
+
+        hex_value = text.replace(":", "")
+        is_hex = len(hex_value) % 2 == 0
+        if is_hex:
+            try:
+                int(hex_value, 16)
+            except ValueError:
+                is_hex = False
+        if is_hex:
+            try:
+                return bytes.fromhex(hex_value)
+            except ValueError:
+                pass
+
+        return text.encode("utf-8", errors="replace")
+
+    @staticmethod
     def _get_first(data, key, default=""):
         value = data.get(key, default)
         if isinstance(value, list) and len(value) > 0:
@@ -480,17 +626,6 @@ class PacketParser:
 class TsharkProcessHandler:
     # 核心处理器，用subprocess跑tshark，生成器模式边读边解析边yield
 
-    # 默认搜索路径
-    DEFAULT_TSHARK_PATHS = [
-        r"E:\internet_safe\wireshark\tshark.exe",
-        r"C:\Program Files\Wireshark\tshark.exe",
-        r"C:\Program Files (x86)\Wireshark\tshark.exe",
-        r"D:\Program Files\Wireshark\tshark.exe",
-        r"D:\Wireshark\tshark.exe",
-        "/usr/bin/tshark",
-        "/usr/local/bin/tshark",
-    ]
-
     def __init__(self, tshark_path=None):
         self._tshark_path = tshark_path or self._find_tshark()
         self._process: Optional[subprocess.Popen] = None
@@ -500,13 +635,9 @@ class TsharkProcessHandler:
         self._packet_count = 0
 
     def _find_tshark(self):
-        tshark = shutil.which("tshark")
+        tshark = find_tshark()
         if tshark:
             return tshark
-
-        for path in self.DEFAULT_TSHARK_PATHS:
-            if os.path.exists(path):
-                return path
 
         raise TsharkNotFoundError(
             "未找到 tshark！请安装 Wireshark: https://www.wireshark.org/download.html"
@@ -613,7 +744,10 @@ class TsharkProcessHandler:
                 if not line_str:
                     continue
 
-                packet = PacketParser.parse_ek_line(line_str)
+                if config.output_format == OutputFormat.FIELDS:
+                    packet = PacketParser.parse_fields_line(line_str, config.fields)
+                else:
+                    packet = PacketParser.parse_ek_line(line_str)
 
                 if packet:
                     if not got_first_packet:
