@@ -12,6 +12,7 @@ import sys
 import json
 import time
 import traceback
+import shutil
 import importlib
 import threading
 import re
@@ -32,8 +33,6 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 for p in [PROJECT_ROOT, os.path.join(PROJECT_ROOT, "core"), os.path.join(PROJECT_ROOT, "models")]:
     if p not in sys.path:
         sys.path.insert(0, p)
-
-from core.tshark_locator import find_tshark
 
 def _import(name, *attrs):
     """尝试从多个路径导入模块"""
@@ -314,11 +313,20 @@ def _is_int(v) -> bool:
 
 def _find_tshark(explicit=None):
     """查找tshark路径"""
-    found = find_tshark(explicit_path=explicit, project_root=PROJECT_ROOT)
-    if found:
-        return found
     if explicit:
+        if os.path.exists(explicit): return explicit
         raise FileNotFoundError(f"tshark不存在: {explicit}")
+
+    found = shutil.which("tshark")
+    if found: return found
+
+    for p in [r"C:\Program Files\Wireshark\tshark.exe",
+              r"C:\Program Files (x86)\Wireshark\tshark.exe",
+              r"D:\Program Files\Wireshark\tshark.exe",
+              r"D:\Wireshark\tshark.exe",
+              r"E:\internet_safe\wireshark\tshark.exe",
+              "/usr/bin/tshark", "/usr/local/bin/tshark", "/opt/homebrew/bin/tshark"]:
+        if os.path.exists(p): return p
     raise FileNotFoundError("未找到TShark")
 
 
@@ -446,10 +454,16 @@ def _detect_attacks_ek(pcap_path, tshark_path, max_packets=0):
                     attacks.append({
                         "packet_number": int(frame) if frame.isdigit() else 0,
                         "attack_type": det.get("detection_type") or "unknown",  # detect() 字段名是 detection_type
-                        "threat_level": det.get("risk_level", "low"),
+                        "threat_level": det.get("threat_level", "info"),
                         "weight": det.get("total_weight", 0),
                         "method": method, "uri": uri[:200],
-                        "indicators": det.get("matches", [])[:5],
+                        "indicators": det.get("indicators", [])[:5],
+                        # AST/语义字段:detect() 返回的真实键
+                        "entropy": det.get("entropy"),
+                        "decode_chain": det.get("decode_chain"),
+                        "ast_findings": det.get("ast_findings", [])[:10],
+                        "tainted_sinks": det.get("tainted_sinks", [])[:5],
+                        "obfuscation_score": det.get("obfuscation_score"),
                     })
                 if len(attacks) >= limit: break
             except: continue
@@ -1650,6 +1664,12 @@ def detect_attack(data: str, method: str = "GET", uri: str = "/",
             "total_weight": result.get('total_weight', 0),
             "match_count": len(result.get('indicators', [])),
             "matches": matches_brief,
+            # AST/语义字段
+            "entropy": result.get("entropy"),
+            "decode_chain": result.get("decode_chain"),
+            "ast_findings": result.get("ast_findings", [])[:10],
+            "tainted_sinks": result.get("tainted_sinks", [])[:5],
+            "obfuscation_score": result.get("obfuscation_score"),
         }
     except Exception as e:
         return _local_error(e)
@@ -2986,14 +3006,20 @@ def _collect_attacks_with_evidence(pcap_path: str, tshark_path: str,
                     attacks.append({
                         "frame_number": int(frame) if frame.isdigit() else 0,
                         "detection_type": atype,
-                        "threat_level": det.get("risk_level", "low"),
+                        "threat_level": det.get("threat_level", "info"),
                         "weight": det.get("total_weight", 0),
                         "method": method,
                         "uri": uri[:200],
                         "src": fields[7].strip(),
                         "dst": fields[8].strip(),
                         "body": body[:20000],
-                        "indicators": det.get("matches", [])[:5],
+                        "indicators": det.get("indicators", [])[:5],
+                        # AST/语义字段:detect() 返回的真实键
+                        "entropy": det.get("entropy"),
+                        "decode_chain": det.get("decode_chain"),
+                        "ast_findings": det.get("ast_findings", [])[:10],
+                        "tainted_sinks": det.get("tainted_sinks", [])[:5],
+                        "obfuscation_score": det.get("obfuscation_score"),
                     })
                 if len(attacks) >= limit:
                     break
@@ -3056,6 +3082,12 @@ def summarize_detections(pcap_path: str, tshark_path: Optional[str] = None,
             "src": atk["src"],
             "dst": atk["dst"],
             "weight": atk["weight"],
+            "threat_level": atk.get("threat_level", "info"),
+            "entropy": atk.get("entropy"),
+            "decode_chain": atk.get("decode_chain"),
+            "ast_findings": atk.get("ast_findings", [])[:5],
+            "tainted_sinks": atk.get("tainted_sinks", [])[:5],
+            "obfuscation_score": atk.get("obfuscation_score"),
         })
 
     for ws in webshells:
@@ -3129,11 +3161,17 @@ def summarize_detections(pcap_path: str, tshark_path: Optional[str] = None,
             "src": row["src"],
             "dst": row["dst"],
             "weight": row["weight"],
+            "threat_level": row.get("threat_level", "info"),
             "tactic": tactic,
             "technique": technique,
             "rule_description": _RULE_DESC_MAP.get(dt, "未分类的可疑请求"),
             "group_count": row["group_count"],
             "in_entropy_queue": in_queue,
+            "entropy": row.get("entropy"),
+            "decode_chain": row.get("decode_chain"),
+            "ast_findings": row.get("ast_findings", [])[:5],
+            "tainted_sinks": row.get("tainted_sinks", [])[:5],
+            "obfuscation_score": row.get("obfuscation_score"),
         })
 
     return {
