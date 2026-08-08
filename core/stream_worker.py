@@ -68,6 +68,7 @@ class ResourceLimits:
     BATCH_SIZE = 50
     FLUSH_INTERVAL_MS = 200
     MAX_QUEUE_SIZE = 1000
+    MAX_WEBSHELL_PACKETS = 10_000
     PROGRESS_THROTTLE_MS = 100
 
 
@@ -311,6 +312,11 @@ class StreamAnalysisWorker(QThread):
         http_results = self._run_http_stream_analysis(total_packets)
         results.extend(http_results)
 
+        if self.options.detect_webshell and not self._is_cancelled:
+            self._emit_progress(44, "WebShell AST 语义分析...")
+            remaining = max(self.options.max_detections - len(results), 0)
+            results.extend(self._run_webshell_ast_detection(remaining))
+
         self._emit_progress(38, "HTTP 响应流式扫描...")
         extracted_files.extend(self._scan_http_responses(results))
 
@@ -400,6 +406,68 @@ class StreamAnalysisWorker(QThread):
             str(name).upper() == wanted and int(count or 0) > 0
             for name, count in protocol_counts.items()
         )
+
+    def _run_webshell_ast_detection(self, max_results: int) -> List[DetectionResult]:
+        """Run the existing WebShellDetector with its AST engine enabled."""
+        if max_results <= 0 or self._is_cancelled or not self.tshark_path:
+            return []
+
+        packets = []
+        handler = None
+        results: List[DetectionResult] = []
+        converters = {
+            "antsword": DetectionResult.from_antsword_result,
+            "caidao": DetectionResult.from_caidao_result,
+            "behinder": DetectionResult.from_behinder_result,
+            "godzilla": DetectionResult.from_godzilla_result,
+        }
+
+        try:
+            from core.webshell_detect import WebShellDetector
+
+            handler = TsharkProcessHandler(self.tshark_path)
+            config = StreamConfig(
+                pcap_path=self.pcap_path,
+                display_filter="http",
+                output_format=OutputFormat.EK,
+                max_packets=ResourceLimits.MAX_WEBSHELL_PACKETS,
+                disable_name_resolution=True,
+                line_buffered=True,
+            )
+            for wrapper in handler.stream_pyshark_compatible(config):
+                if self._is_cancelled:
+                    return []
+                if wrapper.has_layer("http"):
+                    packets.append(wrapper)
+
+            if not packets:
+                return []
+
+            detector = WebShellDetector()
+            detector.enable_ast(True)
+            detection_results = detector.detect(packets)
+            for tool_name, converter in converters.items():
+                for raw_result in detection_results.get(tool_name, []):
+                    if self._is_cancelled or len(results) >= max_results:
+                        break
+                    detection = converter(raw_result)
+                    results.append(detection)
+                    self._detection_count += 1
+                    batch = self._result_buffer.add(detection)
+                    if batch:
+                        self.batchResultsReady.emit(batch)
+
+            remaining = self._result_buffer.flush()
+            if remaining:
+                self.batchResultsReady.emit(remaining)
+            return results
+        except Exception as error:
+            logger.warning("WebShell AST analysis skipped: %s", error)
+            return []
+        finally:
+            packets.clear()
+            if handler:
+                handler.stop()
 
     def _run_http_stream_analysis(
         self,

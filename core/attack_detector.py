@@ -1992,9 +1992,6 @@ class AttackDetector:
 
     def _execute_shared_ast(self, code: str):
         """直接调用AST，不走线程池(Windows上submit开销太大)"""
-        if len(code) > ResourceLimits.MAX_AST_CODE_LEN:
-            logger.debug(f"AST skipped: code too long ({len(code)})")
-            return None
         return self._ast_engine.analyze(code)
 
 

@@ -9,14 +9,31 @@ import logging
 from typing import Dict, List, Optional, Any, Tuple
 from urllib.parse import unquote
 
-from http_formatter import burp_format_request, hex_to_string
-from statistical_analyzer import StatisticalAnalyzer, StatisticalConfig
 try:
+    from core.http_formatter import burp_format_request
+    from core.statistical_analyzer import StatisticalAnalyzer, StatisticalConfig
     from core.http_reassembly import decode_http_body_text
 except ImportError:
+    from http_formatter import burp_format_request
+    from statistical_analyzer import StatisticalAnalyzer, StatisticalConfig
     from http_reassembly import decode_http_body_text
 
 logger = logging.getLogger(__name__)
+
+
+def hex_to_string(hex_data: Any) -> str:
+    """Decode tshark-style hexadecimal text used by legacy WebShell helpers."""
+    if hex_data is None:
+        return ""
+    if isinstance(hex_data, bytes):
+        return hex_data.decode("utf-8", errors="replace")
+
+    text = str(hex_data).strip()
+    compact = re.sub(r"(?i)0x", "", text)
+    compact = re.sub(r"[\s:,-]+", "", compact)
+    if not compact or len(compact) % 2 or not re.fullmatch(r"[0-9a-fA-F]+", compact):
+        return text
+    return bytes.fromhex(compact).decode("utf-8", errors="replace")
 
 
 class DetectionConfig:
