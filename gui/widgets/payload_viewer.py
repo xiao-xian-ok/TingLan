@@ -723,6 +723,9 @@ class BurpStyleViewer(QFrame):
         self._full_text = ""
         lines = []
 
+        # 证据被卸载过的条目，点开时回原始 pcap 取回来
+        self._ensureEvidenceLoaded(detection)
+
         # 优先使用真实的 HTTP 请求数据
         raw_http = None
         if detection.raw_result and isinstance(detection.raw_result, dict):
@@ -881,6 +884,46 @@ class BurpStyleViewer(QFrame):
         from PySide6.QtWidgets import QApplication
         clipboard = QApplication.clipboard()
         clipboard.setText(self.text_edit.toPlainText())
+
+    def _ensureEvidenceLoaded(self, detection: DetectionResult):
+        """把被卸载的证据从原始 pcap 里取回来
+
+        检测数超过 ResourceLimits.FULL_EVIDENCE_DETECTIONS 之后，stream_worker
+        不再把原始报文留在内存里，只写一条带帧号的占位。以前**没有任何代码去取**，
+        于是大流量 pcap 里 2000 条之后的证据在界面上就等于没了。这里补上。
+
+        取不到时保留占位并把原因写进去 —— 不能让"取失败"看起来像"本来就没有"。
+        """
+        raw = detection.raw_result if isinstance(detection.raw_result, dict) else None
+        if not raw or not raw.get('evidence_lazy'):
+            return
+        if raw.get('_evidence_fetched'):
+            return
+
+        pcap_path = raw.get('pcap_path') or ''
+        frame = raw.get('frame_number') or getattr(detection, 'packet_number', 0)
+
+        try:
+            from controllers.analysis_controller import get_http_request_evidence
+            evidence = get_http_request_evidence(pcap_path, int(frame or 0))
+        except Exception as e:
+            evidence = {"error": str(e)}
+
+        raw['_evidence_fetched'] = True
+
+        if evidence.get('error') or not evidence.get('full'):
+            reason = evidence.get('error') or '未取到内容'
+            raw['raw_http_request'] = (
+                f"{raw.get('raw_http_request', '')}\n"
+                f"[回原始 pcap 取证据失败：{reason}]")
+            return
+
+        raw['raw_request_headers'] = evidence['headers']
+        raw['raw_request_body'] = evidence['body'][:50000]
+        raw['raw_request_body_full'] = evidence['body']
+        raw['raw_http_request'] = evidence['full'][:100000]
+        raw['raw_http_request_full'] = evidence['full']
+        raw['evidence_lazy'] = False
 
     def _buildFullExportText(self, detection: DetectionResult, preview_text: str) -> str:
         """Return the non-preview Burp text when full request fields were preserved."""

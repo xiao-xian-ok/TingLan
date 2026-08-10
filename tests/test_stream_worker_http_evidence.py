@@ -119,7 +119,7 @@ def _stub_analysis_boundaries(
 ) -> tuple[Mock, Mock, Mock, Mock]:
     dns_analysis = Mock(return_value=[])
     rtp_analysis = Mock(return_value=[])
-    deep_analysis = Mock(wraps=lambda: ([], []))
+    deep_analysis = Mock(wraps=lambda *_args, **_kwargs: ([], []))
     http_export = Mock(return_value=[])
 
     monkeypatch.setattr(
@@ -166,7 +166,8 @@ def test_protocol_counts_do_not_skip_dns_rtp_or_deep_analysis(
 
     dns_analysis.assert_called_once_with()
     rtp_analysis.assert_called_once_with()
-    deep_analysis.assert_called_once_with()
+    # 协议分级统计要原样传给深度分析，它靠这个决定哪些分析器跑了也没用
+    deep_analysis.assert_called_once_with({"UDP": 1})
 
 
 def test_deep_manager_does_not_repeat_already_run_protocols(
@@ -174,8 +175,12 @@ def test_deep_manager_does_not_repeat_already_run_protocols(
 ) -> None:
     worker = StreamAnalysisWorker("capture.pcap", tshark_path="test-tshark")
     captured = {}
+    real_manager = protocol_analyzer.ProtocolAnalyzerManager
 
     class RecordingManager:
+        # 门控逻辑用真的那一份，这样这个测试同时锁住"统计怎么影响选型"
+        select_runnable_protocols = real_manager.select_runnable_protocols
+
         def analyze_all_pcap(self, pcap_path, **kwargs):
             captured["pcap_path"] = pcap_path
             captured.update(kwargs)
@@ -183,13 +188,46 @@ def test_deep_manager_does_not_repeat_already_run_protocols(
 
     monkeypatch.setattr(protocol_analyzer, "ProtocolAnalyzerManager", RecordingManager)
 
-    assert worker._run_deep_protocol_analysis() == ([], [])
+    # 统计里只有 HTTP：ICMP/DNS/CS 由前面的独立阶段跑过，不该重复；
+    # FTP/SMTP/USB 这些协议层压根不存在，跑了也必然匹配 0 个包。
+    assert worker._run_deep_protocol_analysis({"HTTP": 12}) == ([], [])
     assert captured["pcap_path"] == "capture.pcap"
-    assert protocol_analyzer.ProtocolType.ICMP not in captured["enabled_protocols"]
-    assert protocol_analyzer.ProtocolType.DNS not in captured["enabled_protocols"]
-    assert protocol_analyzer.ProtocolType.COBALT_STRIKE not in captured["enabled_protocols"]
+    enabled = captured["enabled_protocols"]
+    assert protocol_analyzer.ProtocolType.ICMP not in enabled
+    assert protocol_analyzer.ProtocolType.DNS not in enabled
+    assert protocol_analyzer.ProtocolType.COBALT_STRIKE not in enabled
+    assert protocol_analyzer.ProtocolType.FTP not in enabled
+    assert protocol_analyzer.ProtocolType.USB not in enabled
+    # 带裸端口/裸 SYN 路径的分析器不受协议层门控
+    assert protocol_analyzer.ProtocolType.SSH in enabled
+    assert protocol_analyzer.ProtocolType.TLS in enabled
     assert captured["parallel"] is True
     assert captured["max_workers"] == 4
+
+
+def test_deep_analysis_runs_everything_when_stats_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """协议统计失败时不许门控——"统计没出来"和"没有这个协议"是两回事"""
+    worker = StreamAnalysisWorker("capture.pcap", tshark_path="test-tshark")
+    captured = {}
+    real_manager = protocol_analyzer.ProtocolAnalyzerManager
+
+    class RecordingManager:
+        select_runnable_protocols = real_manager.select_runnable_protocols
+
+        def analyze_all_pcap(self, pcap_path, **kwargs):
+            captured.update(kwargs)
+            return {}
+
+    monkeypatch.setattr(protocol_analyzer, "ProtocolAnalyzerManager", RecordingManager)
+
+    worker._run_deep_protocol_analysis({})
+
+    enabled = captured["enabled_protocols"]
+    assert protocol_analyzer.ProtocolType.FTP in enabled
+    assert protocol_analyzer.ProtocolType.USB in enabled
+    assert protocol_analyzer.ProtocolType.SMB in enabled
 
 
 def test_extract_files_disabled_skips_http_object_export(

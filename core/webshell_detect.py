@@ -292,6 +292,8 @@ class DetectionConfig:
     # 参数限制
     MAX_PARAM_NAME_LENGTH = 128
     MIN_PARAM_VALUE_LENGTH = 4
+    # 保留给外部调用方，analyze_params 已不再用它做跳过：
+    # "参数值超过 N 就整个不解码"是攻击者填充即可触发的静默漏检。
     MAX_PARAM_VALUE_LENGTH = 100000
 
     SUPPORTED_METHODS = {'POST', 'PUT', 'PATCH'}
@@ -965,15 +967,35 @@ def parse_request_params(body_str: str) -> Dict[str, str]:
     return params
 
 
+def _record_partial_coverage(reason: str, payload_len: int, scanned_len: int) -> None:
+    """把"没有完整分析"的情况记进覆盖率审计
+
+    取证工具里"我没看全"必须是可查询的结论，不能只落在日志里。
+    fast_filter 的 _CoverageAudit 已经是这个契约的载体，直接复用；
+    拿不到就静默降级，不影响检测主流程。
+    """
+    try:
+        from core.fast_filter import get_coverage_audit
+    except ImportError:
+        try:
+            from fast_filter import get_coverage_audit
+        except ImportError:
+            return
+    except Exception:
+        return
+    try:
+        get_coverage_audit().record(reason, payload_len, scanned_len)
+    except Exception as e:
+        logger.debug(f"覆盖率审计记录失败: {e}")
+
+
 def analyze_params(params: Dict[str, str]) -> Dict[str, Dict]:
     """对每个参数尝试多种解码(URL/Base64/Hex/双层)，识别payload"""
     decoded_payloads = {}
 
     for key, val in params.items():
-        # 跳过太短或太长的值
+        # 跳过太短的值
         if len(val) < DetectionConfig.MIN_PARAM_VALUE_LENGTH:
-            continue
-        if len(val) > DetectionConfig.MAX_PARAM_VALUE_LENGTH:
             continue
 
         val_clean = val.strip()
@@ -1028,7 +1050,13 @@ def analyze_params(params: Dict[str, str]) -> Dict[str, Dict]:
                 'type': param_type,
                 'method': decode_method,
                 'encoded_sample': val_clean[:50] + '...' if len(val_clean) > 50 else val_clean,
-                'decoded': decoded_content[:500] if len(decoded_content) > 500 else decoded_content
+                # 'decoded' 保留**全量**。这里原来是 decoded_content[:500]，
+                # 而 _apply_ast_validation 读的正是这个字段 —— 等于 AST 永远
+                # 只看到被截断的前 500 字符，既漏检又误判（截断处括号不闭合
+                # 会让 AST builder 提前收尾）。展示侧改用 decoded_preview，
+                # 各个 viewer 本身也都自带切片。
+                'decoded': decoded_content,
+                'decoded_preview': decoded_content[:500],
             }
 
     return decoded_payloads
@@ -2427,7 +2455,20 @@ class WebShellDetector:
         return non_printable / len(data)
 
     def _apply_ast_validation(self, result: Dict, payloads: Dict, tool_name: str = '') -> int:
-        """AST语义分析验证，检查污点传播和危险函数调用"""
+        """AST语义分析验证，检查污点传播和危险函数调用
+
+        这里原来有两个"填充即绕过"的上限，已删除：
+
+          MAX_PAYLOADS = 3    请求里先放 3 个无害参数，真 payload 排第 4 就
+                              永远不进 AST。参数顺序完全由攻击者决定。
+          MAX_CODE_LENGTH     超过就 continue，只打一条 debug 日志。把 shell
+                              撑过阈值即可让语义分析整个消失。
+
+        两者和 commit d144e93 修掉的 attack_detector._execute_shared_ast 是
+        同一个 bug。现在：参数全跑（按解码长度降序，先看最可能是代码的），
+        超长走 PHPASTEngine.analyze_windowed 的滑动窗口而不是跳过，并且一旦
+        走了窗口就必须留痕 —— "分段看的"和"看全了"是两个不同的结论。
+        """
         # AST 未启用
         if not self._ast_enabled or not self.ast_engine:
             return 0
@@ -2437,47 +2478,51 @@ class WebShellDetector:
 
         total_adjustment = 0
         ast_analysis_results = []
+        windowed_params = []
 
-        MAX_PAYLOADS = 3
-        MAX_CODE_LENGTH = 5000
-        payload_count = 0
+        # 长的先分析：解码后越长越可能是整段 shell 代码，短的多半是命令参数。
+        # 这只影响顺序，不影响是否分析 —— 所有参数都会跑完。
+        def _decoded_of(item):
+            _name, info = item
+            if isinstance(info, dict):
+                return (info.get('decoded', '') or info.get('decoded_content', '')
+                        or info.get('decrypted', '') or '')
+            if isinstance(info, str):
+                return info
+            return ''
 
-        for param_name, payload_info in payloads.items():
-            if payload_count >= MAX_PAYLOADS:
-                break
+        ordered = sorted(payloads.items(), key=lambda kv: -len(_decoded_of(kv)))
 
-            # 获取解码后的内容
-            decoded_content = ''
-            if isinstance(payload_info, dict):
-                decoded_content = (
-                    payload_info.get('decoded', '') or
-                    payload_info.get('decoded_content', '') or
-                    payload_info.get('decrypted', '')
-                )
-            elif isinstance(payload_info, str):
-                decoded_content = payload_info
+        for param_name, payload_info in ordered:
+            decoded_content = _decoded_of((param_name, payload_info))
 
-            # 跳过太短或太长的
+            # 太短装不下任何 sink+taint 组合，这个跳过是可证明安全的
             if not decoded_content or len(decoded_content) < 15:
-                continue
-            if len(decoded_content) > MAX_CODE_LENGTH:
-                logger.debug(f"[{tool_name}][AST] 跳过过长代码 ({len(decoded_content)} > {MAX_CODE_LENGTH})")
                 continue
 
             # 是否像PHP
             if not self._looks_like_php(decoded_content):
                 continue
 
-            payload_count += 1
-
             try:
-                ast_result = self.ast_engine.analyze(decoded_content)
+                ast_result, windowed = self.ast_engine.analyze_windowed(decoded_content)
+                if windowed:
+                    windowed_params.append((param_name, len(decoded_content)))
+                    logger.warning(
+                        "[%s][AST] 参数 %s 解码后 %d 字节，超过一次过分析上限，"
+                        "已改用滑动窗口分段分析（跨窗口的污点链可能不完整）",
+                        tool_name, param_name, len(decoded_content),
+                    )
+                    _record_partial_coverage(
+                        "ast_windowed", len(decoded_content),
+                        self.ast_engine.DIRECT_LIMIT)
 
                 if ast_result.findings or ast_result.dangerous_calls:
                     ast_analysis_results.append({
                         'param': param_name,
                         'obfuscation_score': ast_result.obfuscation_score,
                         'is_likely_webshell': ast_result.is_likely_webshell,
+                        'windowed': windowed,
                         'dangerous_calls': [
                             {
                                 'func': c.function_name,
@@ -2528,6 +2573,12 @@ class WebShellDetector:
                 'results': ast_analysis_results,
                 'total_adjustment': total_adjustment
             }
+            if windowed_params:
+                # 报告里要能看出哪几个参数是分段分析的
+                result['ast_analysis']['windowed_params'] = [
+                    {'param': name, 'decoded_len': size}
+                    for name, size in windowed_params
+                ]
 
         return total_adjustment
 

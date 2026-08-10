@@ -1686,6 +1686,8 @@ class MainWindow(QMainWindow):
         self.analysis_controller.analysisFinished.connect(self._onAnalysisFinished)
         self.analysis_controller.analysisError.connect(self._onAnalysisError)
         self.analysis_controller.analysisCancelled.connect(self._onAnalysisCancelled)
+        if hasattr(self.analysis_controller, "memoryWarning"):
+            self.analysis_controller.memoryWarning.connect(self._onMemoryWarning)
 
         # 导出控制器信号
         self.export_controller.exportFinished.connect(self._onExportFinished)
@@ -1886,9 +1888,41 @@ class MainWindow(QMainWindow):
         self.status_bar.setStatus(f"使用 {engine} 引擎分析...")
         self.analysis_controller.startAnalysis(file_path, options)
 
+    def _onMemoryWarning(self, file_path: str, level: str, text: str):
+        """内存告警：状态栏常驻 + 弹窗提示一次
+
+        弹窗只在**每个文件每个等级**出现一次（去重在这里做，worker 侧也有一层），
+        否则大包分析时会被刷屏。分析在后台线程跑，模态框不会阻塞分析本身。
+        """
+        name = os.path.basename(file_path) if file_path else ""
+        key = (file_path, level)
+        if not hasattr(self, "_memory_warned"):
+            self._memory_warned = set()
+
+        short = "内存告急" if level == "critical" else "内存偏高"
+        self.status_bar.setStatus(f"⚠ {short}（{name}）")
+
+        if key in self._memory_warned:
+            return
+        self._memory_warned.add(key)
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Critical if level == "critical"
+                    else QMessageBox.Warning)
+        box.setWindowTitle(f"内存{'告急' if level == 'critical' else '预警'}")
+        box.setText(f"分析 {name} 时{short}")
+        box.setInformativeText(text)
+        box.setStandardButtons(QMessageBox.Ok)
+        box.exec()
+
     def _onAnalysisStarted(self, file_path: str):
         """分析开始，初始化该文件的UI状态"""
         logger.debug(f"_onAnalysisStarted: {file_path}")
+
+        # 重新分析同一个文件时，内存告警要能再弹一次
+        if hasattr(self, "_memory_warned"):
+            self._memory_warned = {k for k in self._memory_warned
+                                   if k[0] != file_path}
 
         item = self.file_panel.getFileItem(file_path)
         if item:
@@ -1920,23 +1954,21 @@ class MainWindow(QMainWindow):
         self.detail_table.addDetection(detection)
 
     def _onBatchResultsFound(self, results: List[DetectionResult]):
-        """批量结果先收集，分析完后再统一更新UI"""
-        logger.debug(f"_onBatchResultsFound: results={len(results)}")
+        """分析期间只累计计数，UI 在 _onAnalysisFinished 里一次性刷新
 
+        这里原来把每一批结果都 extend 进 self._pending_detections，但那个列表
+        从头到尾没有任何人读 —— _onAnalysisFinished 用的是 summary.detections。
+        于是每条 DetectionResult（连同它持有的完整请求体）都被永久钉在内存里，
+        跨文件分析还会一直往上叠。既然只需要个数，就只留个数。
+        """
         if not results:
             return
 
-        # 分析期间只收集结果，不更新UI
-        # UI更新会在 _onAnalysisFinished 中一次性完成
-        if not hasattr(self, '_pending_detections'):
-            self._pending_detections = []
+        self._display_count += len(results)
 
-        self._pending_detections.extend(results)
-        self._display_count = len(self._pending_detections)
-
-        # 只更新状态栏显示进度
-        if self._display_count % 20 == 0:
-            self.status_bar.setStatus(f"已检测到 {self._display_count} 个攻击行为...")
+        # 状态栏是唯一的即时反馈，别用 %20==0 —— 批大小不固定，取模很容易
+        # 永远命不中，界面就一直不动
+        self.status_bar.setStatus(f"已检测到 {self._display_count} 个攻击行为...")
 
     def _onProtocolFindingFound(self, finding: ProtocolFinding):
         """发现协议分析结果"""
@@ -1998,6 +2030,15 @@ class MainWindow(QMainWindow):
         self.status_bar.setThreatCount(total_attacks)
 
         self.function_bar._onButtonClicked("analysis")
+
+        # 还有别的文件在跑时不要弹模态框。exec() 会开一个嵌套事件循环把主窗口
+        # 整个锁住；等另一个文件也跑完，它的 _onAnalysisFinished 会在这个嵌套
+        # 循环里再弹一个，两层模态叠在一起，用户看到的就是"界面点不动"。
+        # 批量分析时只在最后一个文件完成后汇报一次。
+        if self.analysis_controller.is_running:
+            self.status_bar.setStatus(
+                f"{os.path.basename(file_path)} 分析完成，其余文件仍在分析中...")
+            return
 
         dialog = AnalysisCompleteDialog(summary, parent=self)
         dialog.exportRequested.connect(self._onExport)
@@ -2104,17 +2145,25 @@ class MainWindow(QMainWindow):
 
         file_path, selected_filter = QFileDialog.getSaveFileName(
             self, "导出报告", "",
-            "HTML报告 (*.html);;JSON数据 (*.json)"
+            "攻击溯源图 (*.html);;HTML报告 (*.html);;JSON数据 (*.json)"
         )
-        if file_path:
-            if "html" in selected_filter.lower():
-                if not file_path.endswith(".html"):
-                    file_path += ".html"
-                self.export_controller.exportToHtml(self._current_summary, file_path)
-            else:
-                if not file_path.endswith(".json"):
-                    file_path += ".json"
-                self.export_controller.exportToJson(self._current_summary, file_path)
+        if not file_path:
+            return
+
+        # 溯源图和普通报告都是 .html，只能按选中的过滤器区分，不能看后缀
+        if "溯源" in selected_filter:
+            if not file_path.endswith(".html"):
+                file_path += ".html"
+            self.export_controller.exportToProvenanceHtml(
+                self._current_summary, file_path)
+        elif "html" in selected_filter.lower():
+            if not file_path.endswith(".html"):
+                file_path += ".html"
+            self.export_controller.exportToHtml(self._current_summary, file_path)
+        else:
+            if not file_path.endswith(".json"):
+                file_path += ".json"
+            self.export_controller.exportToJson(self._current_summary, file_path)
 
     def _onExportFinished(self, file_path: str):
         """导出完成"""

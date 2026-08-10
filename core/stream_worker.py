@@ -3,6 +3,7 @@
 import sys
 import os
 import gc
+import re
 import time
 import shlex
 import logging
@@ -58,17 +59,94 @@ from core.http_response_inspector import (
 )
 from core.safe_paths import safe_unique_path
 
+# 会话上下文追踪是可选依赖：拿不到就退化成"逐包独立判定"，不影响主流程
+try:
+    from core.session_tracker import (
+        RequestEvent, SessionTracker, extract_uploaded_names,
+    )
+except ImportError:  # pragma: no cover - 缺模块时静默降级
+    RequestEvent = None
+    SessionTracker = None
+    extract_uploaded_names = None
+
+# 观测中心同样是可选依赖
+try:
+    from core.observability import get_observability_hub
+except ImportError:  # pragma: no cover
+    get_observability_hub = None
+
+# 内存看护。psutil 缺失时 MemoryGuard 自己会降级成"永远 ok"
+try:
+    from core.memory_guard import (
+        MemoryGuard, LEVEL_OK, LEVEL_WARN, LEVEL_CRITICAL,
+    )
+except ImportError:  # pragma: no cover
+    MemoryGuard = None
+    LEVEL_OK, LEVEL_WARN, LEVEL_CRITICAL = "ok", "warn", "critical"
+
+# 成功研判引擎。拿不到就退化成"只报攻击不判成败"，主流程照常跑完。
+try:
+    from core.success_adjudicator import (
+        Outcome, RequestLedger, build_adjudicator,
+    )
+except ImportError:  # pragma: no cover
+    Outcome = None
+    RequestLedger = None
+    build_adjudicator = None
+
 logger = logging.getLogger(__name__)
+
+# payload_viewer 里"完整请求"的上限。见 _detect_packet 里的说明。
+_FULL_BODY_LIMIT = 1_000_000
+
+# IPv4 / IPv6 字面量。只用来给 display filter 做白名单校验。
+_IP_LITERAL_RE = re.compile(r"^[0-9a-fA-F:.]{3,45}$")
 
 
 class ResourceLimits:
-    MAX_DETECTIONS = 5000
+    # 这里原来有一个 MAX_DETECTIONS = 5000。它已被彻底删除，不是调大。
+    #
+    # 任何"最多记 N 条检测"的设计都是可绕过的：攻击者先用扫描器灌满 N 条
+    # 噪声（这甚至不需要刻意为之，一次 dirb 就够了），真正的攻击排在 N+1
+    # 位就永远不会被记录。取证工具漏掉的那一条，往往正是唯一重要的那一条。
+    #
+    # 内存不靠"少检测"来控，靠"证据字段按需驻留"—— 见下面
+    # FULL_EVIDENCE_DETECTIONS：条目全留，重的原始报文按阈值卸载。
+    #
+    # 保留**完整证据**（原始请求头/体、响应体样本）的检测条数上限。
+    #
+    # 注意这不是"检测上限"：超过之后检测照做、条目照留，只是不再把原始
+    # 报文驻留在内存里 —— 那个字段才是内存大头，一条可能上百 KB。
+    # 用户点开某条时按帧号回 pcap 重取即可（_fetch_request_evidence）。
+    #
+    # 之所以不能用"检测上限"来控内存：那是可绕过的。攻击者先用扫描器灌满
+    # 名额，后面真正的攻击就永远不会被看到。丢证据顶多是点开时慢一点，
+    # 丢检测是直接漏报。
+    FULL_EVIDENCE_DETECTIONS = 2000
     MAX_MEMORY_MB = 1024
+    # 内存看护阈值（进程 RSS，MB）。
+    # 上面那个 MAX_MEMORY_MB 历史上声明了但从没被使用，真正生效的是这两个。
+    # 越过 WARN 只告警不改行为；越过 CRITICAL 自动转降级模式（证据不再驻留、
+    # WebShell 采集提前收口），检测本身始终全量，不会因为内存而漏报。
+    MEMORY_WARN_MB = 1500
+    MEMORY_CRITICAL_MB = 2500
     GC_INTERVAL = 100               # 每N个包触发一次GC
     BATCH_SIZE = 50
     FLUSH_INTERVAL_MS = 200
     MAX_QUEUE_SIZE = 1000
-    MAX_WEBSHELL_PACKETS = 10_000
+    # WebShell AST 分析收集的 **HTTP 包** 上限（不是原始包数）。
+    # 千万别把它当 tshark 的 -c 用：-c 限制的是读取量，会让文件后半段
+    # 完全不被检查。详见 _run_webshell_ast_detection 的 docstring。
+    #
+    # 这只是个兜底的条数上限，**真正起作用的是下面的内存预算**：
+    # 这条路径用 EK 格式（WebShellDetector 需要 PyShark 风格的包对象），
+    # 实测每包约 20KB 常驻内存，是 FIELDS 格式的 16.7 倍。单纯按条数卡
+    # 20 万会吃掉 3.7GB —— 所以按字节卡才是对的。
+    MAX_WEBSHELL_HTTP_PACKETS = 200_000
+    # 累积包的内存预算。EK JSON 文本解析成 Python 对象后约膨胀 4.5 倍，
+    # 所以按文本字节数 × 该系数估算常驻内存。
+    WEBSHELL_MEMORY_BUDGET_BYTES = 1024 * 1024 * 1024
+    EK_MEMORY_EXPANSION = 4.5
     PROGRESS_THROTTLE_MS = 100
 
 
@@ -132,21 +210,53 @@ class ResultBuffer:
 
 
 class ProgressThrottler:
-    """进度信号节流，防止发太快把UI卡住"""
+    """进度信号节流
+
+    要同时满足两个互相拉扯的诉求，旧实现只顾了前一个：
+
+    1. 进度条不能倒退。_run_analysis 里 AST 阶段发 44，紧接着响应扫描发 38，
+       条子往回跳看着像出错。
+    2. 消息文本必须能刷新。HTTP 阶段的百分比在大包里可能几十秒停在同一个整数
+       上，但"已处理 N 请求, M 威胁"一直在变。
+
+    旧实现的做法是"百分比没变大就整条丢弃"，于是第 2 点被牺牲得很彻底：
+    HTTP 阶段几分钟里界面收不到任何信号，看上去就是死了。而且 38 < 44 那条
+    以及它之后所有小于 44 的消息被永久丢弃，"HTTP 响应流式扫描"这个阶段名
+    根本没机会显示。
+
+    正确解法是把两件事拆开：**百分比对外钳制成只增不减，消息照发**。
+    压制的唯一理由是"离上次发送太近"。
+    """
 
     def __init__(self, interval_ms: int = ResourceLimits.PROGRESS_THROTTLE_MS):
         self._interval_ms = interval_ms
         self._last_emit_time = 0.0
-        self._last_percent = -1
+        self._peak_percent = -1
+
+    def next_percent(self, percent: int) -> Optional[int]:
+        """返回本次该显示的百分比；None 表示这次压掉不发"""
+        now = time.time()
+
+        # 100% 是终态，任何情况下都要送达
+        if percent >= 100:
+            self._peak_percent = 100
+            self._last_emit_time = now
+            return 100
+
+        shown = percent if percent > self._peak_percent else self._peak_percent
+        advanced = shown > self._peak_percent
+        due = (now - self._last_emit_time) * 1000.0 >= self._interval_ms
+
+        if not advanced and not due:
+            return None
+
+        self._peak_percent = shown
+        self._last_emit_time = now
+        return shown
 
     def should_emit(self, percent: int) -> bool:
-        current_time = time.time()
-        if percent >= 100 or percent > self._last_percent:
-            self._last_emit_time = current_time
-            self._last_percent = percent
-            return True
-
-        return False
+        """旧接口：只回答放不放行，不做钳制"""
+        return self.next_percent(percent) is not None
 
 
 @dataclass
@@ -158,7 +268,6 @@ class AnalysisOptions:
     file_recovery: bool = True
     custom_keys: Dict[str, str] = field(default_factory=dict)
     throttle: ThrottleConfig = field(default_factory=ThrottleConfig)
-    max_detections: int = ResourceLimits.MAX_DETECTIONS
 
 
 class _HttpEvidencePacket:
@@ -180,6 +289,8 @@ class StreamAnalysisWorker(QThread):
     analysisComplete = Signal(object)           # AnalysisSummary
     error = Signal(str)
     cancelled = Signal()
+    # 内存告警：(等级, 说明文本)。等级为 "warn" / "critical"
+    memoryWarning = Signal(str, str)
 
     def __init__(
         self,
@@ -198,6 +309,14 @@ class StreamAnalysisWorker(QThread):
         self._result_buffer = ResultBuffer(self.options.throttle)
         self._progress_throttler = ProgressThrottler()
 
+        # 内存看护。psutil 缺失或构造失败时退化成"永远 ok"，不影响主流程
+        self._memory_guard = (
+            MemoryGuard(warn_mb=ResourceLimits.MEMORY_WARN_MB,
+                        critical_mb=ResourceLimits.MEMORY_CRITICAL_MB)
+            if MemoryGuard is not None else None
+        )
+        self._memory_degraded = False
+
         self._packet_count = 0
         self._detection_count = 0
         self._start_time = 0.0
@@ -205,7 +324,21 @@ class StreamAnalysisWorker(QThread):
         self._seen_keys: Set[str] = set()
         self._http_evidence_packets: List[_HttpEvidencePacket] = []
         self._http_request_uris: Dict[int, str] = {}
+        self._http_frame_estimate = 0   # 协议统计给的 http 帧数，进度条分母
         self._gc_counter = 0
+        self._packet_tick = 0           # record_packet 的本地攒批计数
+
+        # 会话追踪器**每个 worker 一个**，不能用进程级单例：同时分析两个 pcap
+        # 时，后启动的 worker 一 reset 就把前一个正在累积的会话状态清空了，
+        # "上传→访问"这类跨请求的链会直接断掉；而且两个线程还要在同一把
+        # RLock 上逐请求争用，主线程跟着一起卡。
+        self._session_tracker = SessionTracker() if SessionTracker is not None else None
+
+        # 全量 HTTP 请求的路径索引，供成功研判的维度 B 做"上传后回访"关联。
+        # 同样每 worker 一份，理由和上面的会话追踪器一致。
+        self._request_ledger = RequestLedger() if RequestLedger is not None else None
+        # 帧号 -> 研判结论，_build_summary 时挂到 summary 上
+        self._verdicts: Dict[int, Any] = {}
 
     def _find_tshark_robust(self) -> Optional[str]:
         """在常见位置找tshark"""
@@ -213,8 +346,25 @@ class StreamAnalysisWorker(QThread):
 
     def cancel(self):
         self._is_cancelled = True
-        if self._handler:
-            self._handler.stop()
+        handler = self._handler
+        if handler:
+            # handler.stop() 里要同步跑 taskkill /F /T（5 秒超时）、等子进程
+            # 退出、再 join stderr 监控线程，最坏十几秒。而 cancel() 是被 UI
+            # 线程直接调用的（用户点"停止分析"、关窗口、控制器批量停止），
+            # 同步执行等于把界面锁死 —— 两个文件一起停就是十几秒的"未响应"。
+            # _is_cancelled 已经能让工作线程的循环立刻退出，进程回收纯属善后，
+            # 丢到后台线程去做即可。
+            threading.Thread(
+                target=self._safe_stop_handler, args=(handler,),
+                name="tshark-stop", daemon=True,
+            ).start()
+
+    @staticmethod
+    def _safe_stop_handler(handler) -> None:
+        try:
+            handler.stop()
+        except Exception as e:  # 善后失败不该反过来影响界面
+            logger.debug(f"tshark 停止异常: {e}")
 
     def run(self):
         self._start_time = time.time()
@@ -241,7 +391,13 @@ class StreamAnalysisWorker(QThread):
                 self.cancelled.emit()
                 return
 
-            summary = self._run_analysis()
+            # 取消和异常都会从 _run_analysis 里提前跳出，引用计数必须在这一层
+            # 用 try/finally 配对，否则漏掉一次之后就再也不会重置指标了
+            self._begin_observability_run()
+            try:
+                summary = self._run_analysis()
+            finally:
+                self._end_observability_run()
 
             if self._is_cancelled:
                 self.cancelled.emit()
@@ -266,9 +422,82 @@ class StreamAnalysisWorker(QThread):
             self._flush_remaining_results()
             self._cleanup()
 
+    # ObservabilityHub 是进程级单例，但 start_run() 会把上一轮指标清空。
+    # 同时分析两个 pcap 时，后启动的 worker 一调就把先跑那个正在累积的数据
+    # 抹掉了。并发是在这一层管的，引用计数就放在这一层。
+    _obs_runs = 0
+    _obs_lock = threading.Lock()
+
+    @classmethod
+    def _begin_observability_run(cls) -> None:
+        if get_observability_hub is None:
+            return
+        with cls._obs_lock:
+            cls._obs_runs += 1
+            first = cls._obs_runs == 1
+        if first:
+            get_observability_hub().start_run()
+
+    @classmethod
+    def _end_observability_run(cls) -> None:
+        if get_observability_hub is None:
+            return
+        with cls._obs_lock:
+            cls._obs_runs = max(0, cls._obs_runs - 1)
+            last = cls._obs_runs == 0
+        if last:
+            get_observability_hub().end_run()
+
     def _emit_progress(self, percent: int, message: str):
-        if self._progress_throttler.should_emit(percent):
-            self.progress.emit(percent, message)
+        shown = self._progress_throttler.next_percent(percent)
+        if shown is not None:
+            self.progress.emit(shown, message)
+
+    # HTTP 流式分析占进度条 15%~43% 这一段
+    _HTTP_STAGE_START = 15
+    _HTTP_STAGE_SPAN = 28
+
+    def _http_stage_percent(self, http_count: int) -> int:
+        """HTTP 阶段的进度百分比
+
+        旧实现是 `15 + int(http_count / total_packets * 28)`：分子是 **HTTP
+        请求数**，分母是 **全部包数**。真实抓包里 HTTP 请求只占总包数的百分之
+        几 —— 26327/1500000*28 = 0.49，int() 一抹就是 0，百分比恒等于 15。
+        配上原来"百分比没变大就丢弃"的节流器，整个 HTTP 阶段几分钟里界面一个
+        信号都收不到，看起来就是卡死。
+
+        分母改用协议统计里的 http 帧数（含请求和响应，请求数约为其一半）。
+        """
+        estimate = getattr(self, "_http_frame_estimate", 0) or 0
+        if estimate > 0:
+            expected_requests = max(estimate / 2.0, 1.0)
+            # 留出 10% 余量，估算偏小时不至于早早顶到头
+            ratio = min(http_count / expected_requests, 1.0) * 0.9
+        else:
+            # 拿不到估算值（协议统计失败等）就走渐近曲线兜底：
+            # 一直在动、永远逼近但不越过本阶段上限
+            ratio = 1.0 - 1.0 / (1.0 + http_count / 5000.0)
+        return self._HTTP_STAGE_START + int(min(ratio, 1.0) * self._HTTP_STAGE_SPAN)
+
+    def _mark_stage(self, name: Optional[str]):
+        """标记进入新阶段，顺带结束上一个阶段的计时
+
+        流水线本来就是顺序执行的，所以用"线性标记"而不是给每段套 with——
+        后者要把十来个代码块整体重新缩进，改动面大且容易出错。
+        传 None 表示收尾（结束最后一个阶段）。
+        """
+        if get_observability_hub is None:
+            return
+        try:
+            now = time.perf_counter()
+            prev = getattr(self, "_cur_stage", None)
+            if prev:
+                started = getattr(self, "_cur_stage_start", now)
+                get_observability_hub()._record_stage(prev, now - started, 0)
+            self._cur_stage = name
+            self._cur_stage_start = now
+        except Exception as e:
+            logger.debug(f"阶段计时失败: {e}")
 
     def _flush_remaining_results(self):
         remaining = self._result_buffer.flush()
@@ -294,6 +523,29 @@ class StreamAnalysisWorker(QThread):
             gc.collect(0)  # 只回收0代，快
             self._gc_counter = 0
 
+    def _check_memory(self) -> str:
+        """采样内存，越阈值时告警 + 自动降级
+
+        可以放心在热循环里调，MemoryGuard 内部有双重节流（按次数 + 按时间）。
+
+        降级只影响**证据驻留**和**跨包累积**，不影响检测覆盖：
+        检测永远全量跑完，不会因为内存紧张而漏报 —— 漏报是取证工具的死罪，
+        证据慢一点（点开时回 pcap 重取）只是体验问题。
+        """
+        guard = self._memory_guard
+        if guard is None:
+            return LEVEL_OK
+
+        level = guard.check()
+        if level == LEVEL_CRITICAL and not self._memory_degraded:
+            self._memory_degraded = True
+            gc.collect()
+            logger.warning("内存达到 %.0f MB，转入降级模式（证据不再驻留内存）",
+                           guard.rss_mb)
+        if level != LEVEL_OK and guard.should_report(level):
+            self.memoryWarning.emit(level, guard.describe(level))
+        return level
+
     def _run_analysis(self) -> AnalysisSummary:
         results: List[DetectionResult] = []
         protocol_findings: List[ProtocolFinding] = []
@@ -302,57 +554,98 @@ class StreamAnalysisWorker(QThread):
         extracted_files: List[ExtractedFile] = []
         rtp_streams: List[RTPStreamInfo] = []
 
+        # 会话追踪器是本 worker 私有的，开跑前清干净即可，
+        # 不会影响同时在跑的另一个文件
+        if self._session_tracker is not None:
+            self._session_tracker.clear()
+
+        # 指标是进程级共享的，start/end 由 run() 用 try/finally 配对管理
+        self._cur_stage = None
+        self._cur_stage_start = 0.0
+
+        # 内存看护按轮重置，否则上一轮的告警记录会压掉这一轮的弹窗
+        self._memory_degraded = False
+        if self._memory_guard is not None:
+            self._memory_guard.reset()
+
         self._emit_progress(5, "协议分级统计...")
+        self._mark_stage("协议分级统计")
         protocol_counts, total_packets, protocol_hierarchy = self._run_protocol_stats()
+
+        # HTTP 阶段进度条的分母。io,phs 统计出来的是 http 帧数（请求+响应），
+        # 请求数约为其一半 —— 详见 _http_stage_percent
+        self._http_frame_estimate = int((protocol_counts or {}).get("http", 0) or 0)
 
         if self._is_cancelled:
             return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets, rtp_streams)
 
         self._emit_progress(15, "HTTP 流式分析...")
+        self._mark_stage("HTTP 流式分析")
         http_results = self._run_http_stream_analysis(total_packets)
         results.extend(http_results)
 
-        if self.options.detect_webshell and not self._is_cancelled:
-            self._emit_progress(44, "WebShell AST 语义分析...")
-            remaining = max(self.options.max_detections - len(results), 0)
-            results.extend(self._run_webshell_ast_detection(remaining))
-
-        self._emit_progress(38, "HTTP 响应流式扫描...")
+        # 响应扫描被提到了 AST 前面（原来排在它后面）。这不是顺手调的：
+        # 成功研判的维度 A 全靠响应体指纹（uid=0(root)、root:x:0:0…），
+        # 而 AST 现在只挖研判认为"打进来了"的那些流。响应还没挂上就先研判，
+        # 维度 A 恒为空，AST 的候选集也就跟着塌了。
+        self._emit_progress(40, "HTTP 响应流式扫描...")
+        self._mark_stage("HTTP 响应流式扫描")
         extracted_files.extend(self._scan_http_responses(results))
 
         if self._is_cancelled:
             return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets, rtp_streams)
 
-        self._emit_progress(45, "ICMP 隐写检测...")
+        self._emit_progress(43, "攻击成功研判...")
+        self._mark_stage("攻击成功研判")
+        ast_streams = self._run_success_adjudication(results)
+
+        if self.options.detect_webshell and not self._is_cancelled:
+            self._emit_progress(46, "WebShell AST 语义分析...")
+            self._mark_stage("WebShell AST 语义分析")
+            ast_results = self._run_webshell_ast_detection(ast_streams)
+            if ast_results:
+                # 这批是响应扫描跑完之后才产生的，得单独把响应证据补挂上，
+                # 否则 payload_viewer 里这些条目的响应侧会是空的。
+                self._fetch_http_responses(ast_results)
+                results.extend(ast_results)
+
+        if self._is_cancelled:
+            return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets, rtp_streams)
+
+        self._emit_progress(54, "ICMP 隐写检测...")
+        self._mark_stage("ICMP 隐写检测")
         icmp_findings = self._run_icmp_analysis()
         protocol_findings.extend(icmp_findings)
 
         if self._is_cancelled:
             return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets, rtp_streams)
 
-        self._emit_progress(56, "DNS 隧道分析...")
+        self._emit_progress(58, "DNS 隧道分析...")
+        self._mark_stage("DNS 隧道分析")
         dns_findings = self._run_dns_analysis()
         protocol_findings.extend(dns_findings)
 
         if self._is_cancelled:
             return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets, rtp_streams)
 
-        self._emit_progress(59, "CS 通信检测...")
+        self._emit_progress(62, "CS 通信检测...")
+        self._mark_stage("CS 通信检测")
         cs_findings = self._run_cs_detection()
         protocol_findings.extend(cs_findings)
 
         if self._is_cancelled:
             return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets, rtp_streams)
 
-        self._emit_progress(61, "RTP 音视频流检测...")
+        self._emit_progress(66, "RTP 音视频流检测...")
+        self._mark_stage("RTP 音视频流检测")
         rtp_streams = self._run_rtp_analysis()
 
         if self._is_cancelled:
             return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets, rtp_streams)
 
-        self._emit_progress(64, "深度协议分析 (SSH/TLS/SMB/RDP/Redis 等)...")
-        self._emit_progress(65, "深度协议分析初始化...")
-        deep_findings, deep_extracted = self._run_deep_protocol_analysis()
+        self._emit_progress(70, "深度协议分析 (SSH/TLS/SMB/RDP/Redis 等)...")
+        self._mark_stage("深度协议分析")
+        deep_findings, deep_extracted = self._run_deep_protocol_analysis(protocol_counts)
         protocol_findings.extend(deep_findings)
         for fp in deep_extracted:
             if os.path.isfile(fp):
@@ -373,6 +666,7 @@ class StreamAnalysisWorker(QThread):
 
         if self.options.auto_decode:
             self._emit_progress(75, f"自动解码 ({len(results)} 条结果)...")
+            self._mark_stage("自动解码")
             decoding_results = self._run_auto_decoding(results)
 
         if self._is_cancelled:
@@ -380,10 +674,15 @@ class StreamAnalysisWorker(QThread):
 
         if self.options.file_recovery:
             self._emit_progress(88, f"文件还原 ({len(extracted_files)} 个文件)...")
+            self._mark_stage("文件还原")
             recovered_files = self._run_file_recovery(extracted_files)
 
         self._emit_progress(95, "生成分析报告...")
+        self._mark_stage("生成分析报告")
         protocol_stats = self._build_protocol_stats(protocol_counts, total_packets, protocol_hierarchy)
+
+        # 收尾：结束最后一个阶段的计时
+        self._mark_stage(None)
 
         return self._build_summary(
             results, protocol_stats, protocol_findings,
@@ -397,6 +696,68 @@ class StreamAnalysisWorker(QThread):
             logger.warning(f"协议统计失败: {e}")
             return {}, 0, []
 
+    def _run_success_adjudication(self, results: List[DetectionResult]) -> Optional[Set[str]]:
+        """跑 A/B/C 三维成功研判，顺带算出 AST 阶段值得深挖的主机集合。
+
+        返回一组"攻击者 IP"。**返回 None 表示研判不可用**，调用方必须退回
+        全量扫描 —— 宁可慢，不可漏。
+
+        为什么候选集的单位是主机而不是单条请求：一个攻击者探测失败 500 次、
+        成功 1 次是常态，按请求筛会把他前面那些失败请求排除掉，而攻击链的
+        上下文（他试过哪些路径、什么时候换的手法）恰恰在那些失败请求里。
+        所以只要某个来源 IP 有**任意一条**非 failed 的检测，他的全部流量都
+        进 AST；反过来，通篇只有 404 的扫描器就整个跳过 —— 那才是真正的
+        资源浪费大头。
+        """
+        if build_adjudicator is None or not results:
+            return None
+
+        try:
+            adjudicator = build_adjudicator(
+                results,
+                ledger=self._request_ledger,
+                pcap_path=self.pcap_path,
+                tshark_path=self.tshark_path or "",
+                is_cancelled=lambda: self._is_cancelled,
+            )
+            verdicts = adjudicator.adjudicate_all(results)
+        except Exception as error:
+            logger.warning("成功研判失败，AST 退回全量扫描: %s", error)
+            return None
+
+        confirmed = suspected = failed = 0
+        hosts: Set[str] = set()
+        for index, verdict in verdicts.items():
+            detection = results[index]
+            frame = getattr(detection, "packet_number", 0) or 0
+            if frame:
+                self._verdicts[frame] = verdict
+
+            outcome = getattr(verdict.outcome, "value", str(verdict.outcome))
+            if outcome == "confirmed":
+                confirmed += 1
+            elif outcome == "suspected":
+                suspected += 1
+            elif outcome == "failed":
+                failed += 1
+
+            if outcome != "failed":
+                src = str(getattr(detection, "source_ip", "") or "")
+                if src:
+                    hosts.add(src)
+
+        # 没有任何主机入选时返回空集（而不是 None）：那是"研判确实认为
+        # 无事发生"，跳过 AST 是正确结论，跟"研判没跑起来"必须区分开。
+        logger.info(
+            "成功研判完成：确认 %d 条 / 疑似 %d 条 / 明确失败 %d 条，"
+            "AST 深挖 %d 个来源主机",
+            confirmed, suspected, failed, len(hosts),
+        )
+        self._emit_progress(
+            44, f"成功研判：确认 {confirmed} 条，疑似 {suspected} 条，"
+                f"排除失败 {failed} 条")
+        return hosts
+
     @staticmethod
     def _has_protocol(protocol_counts: Optional[Dict[str, int]], protocol: str) -> bool:
         if not protocol_counts:
@@ -407,9 +768,72 @@ class StreamAnalysisWorker(QThread):
             for name, count in protocol_counts.items()
         )
 
-    def _run_webshell_ast_detection(self, max_results: int) -> List[DetectionResult]:
-        """Run the existing WebShellDetector with its AST engine enabled."""
-        if max_results <= 0 or self._is_cancelled or not self.tshark_path:
+    @staticmethod
+    def _build_ast_display_filter(ast_hosts: Optional[Set[str]]) -> str:
+        """把研判圈出的主机翻译成 tshark display filter。
+
+        用 ip.addr 而不是 tcp.stream：一个攻击者动辄开几百条连接，流号列表
+        会把命令行撑爆，而主机集合通常只有个位数。ip.addr 同时匹配 src 和
+        dst，所以攻击者发出的请求和服务器回给他的响应都会被带上 —— 冰蝎/
+        哥斯拉的握手识别要靠这一对才成立。
+
+        主机太多时（一场大规模扫描能有上千个来源）过滤器本身就不划算了，
+        直接退回全量 http，让 tshark 少做点无用的比较。
+        """
+        if not ast_hosts:
+            return "http"
+        if len(ast_hosts) > 64:
+            logger.info("可疑来源主机 %d 个，过滤器收益不大，AST 退回全量 HTTP 扫描",
+                        len(ast_hosts))
+            return "http"
+        # IP 是从 tshark 自己解析出来的字段，不存在注入风险；仍然做一次
+        # 白名单校验，防止上游哪天塞进来一个畸形值把整条命令搞坏。
+        safe = [ip for ip in sorted(ast_hosts) if _IP_LITERAL_RE.match(ip)]
+        if not safe:
+            return "http"
+        addrs = " || ".join(f"ip.addr=={ip}" for ip in safe)
+        return f"http && ({addrs})"
+
+    def _run_webshell_ast_detection(
+        self, ast_hosts: Optional[Set[str]] = None
+    ) -> List[DetectionResult]:
+        """Run the existing WebShellDetector with its AST engine enabled.
+
+        注意这里**不能**给 tshark 传 -c(max_packets)。tshark 的 -c 限制的是
+        「从文件里读多少个包」，display filter 只在这前 N 个包里筛 —— 实测
+        一个 100 包的文件里 HTTP 全在 #90 之后，加 `-c 50` 的命中数是 0。
+        也就是说 -c 10000 的真实语义是「只看抓包文件的前 1 万个包，之后全不看」，
+        几十 MB 的包就会触发，攻击者什么都不用做，后半段流量直接隐形。
+
+        听澜是取证工具，这种静默漏检不可接受。改成：tshark 扫完整个文件，
+        由 display filter 负责筛选，上限只加在 Python 收集侧（因此计的是
+        HTTP 包数，不是原始包数），并且一旦截断必须留下明确告警。
+
+        不做分批的原因：detect() 里有 pair_http_requests_responses、冰蝎密钥
+        协商扫描、哥斯拉会话扫描这些**跨包关联**，切批会把握手和后续加密流量
+        分到不同批里，正好毁掉"还原攻击路径"的能力。
+
+        ── ast_hosts：把这一趟从「全量」收窄成「按研判结果深挖」 ──
+
+        这个阶段真正的开销不是 AST 本身（AST 只跑在已命中 webshell 特征的
+        结果上，见 webshell_detect._apply_ast_validation），而是**把整个文件
+        用 EK/JSON 再解一遍**并为每个 HTTP 包造一个 Python 包装对象 —— 实测
+        174MB 的抓包要 4.7 分钟，绝大部分花在给正常浏览流量建对象上。
+
+        所以现在由成功研判先圈定「有非 failed 检测的来源主机」，display filter
+        直接在 tshark 侧按 ip.addr 收窄，Python 侧根本不会看到无关流量。
+        通篇只有 404 的扫描器整个跳过，这正是资源浪费的大头。
+
+        三种入参语义必须分清：
+          None      研判不可用 → 全量扫描（宁可慢，不可漏）
+          非空集合  只深挖这些主机
+          空集合    研判认为确实无事发生 → 跳过，不是 bug
+        """
+        if self._is_cancelled or not self.tshark_path:
+            return []
+        if ast_hosts is not None and not ast_hosts:
+            logger.info("成功研判未发现任何得手迹象，跳过 WebShell AST 深挖")
+            self._emit_progress(46, "WebShell AST：无得手迹象，跳过")
             return []
 
         packets = []
@@ -426,33 +850,86 @@ class StreamAnalysisWorker(QThread):
             from core.webshell_detect import WebShellDetector
 
             handler = TsharkProcessHandler(self.tshark_path)
+            display_filter = self._build_ast_display_filter(ast_hosts)
             config = StreamConfig(
                 pcap_path=self.pcap_path,
-                display_filter="http",
+                display_filter=display_filter,
                 output_format=OutputFormat.EK,
-                max_packets=ResourceLimits.MAX_WEBSHELL_PACKETS,
+                # 故意不设 max_packets：见上面 docstring
                 disable_name_resolution=True,
                 line_buffered=True,
             )
-            for wrapper in handler.stream_pyshark_compatible(config):
+            scope = ("全量 HTTP" if ast_hosts is None
+                     else f"{len(ast_hosts)} 个可疑来源主机")
+            http_limit = ResourceLimits.MAX_WEBSHELL_HTTP_PACKETS
+            budget = ResourceLimits.WEBSHELL_MEMORY_BUDGET_BYTES
+            expansion = ResourceLimits.EK_MEMORY_EXPANSION
+            est_bytes = 0
+            truncated = ""
+            # 这个循环要把整个文件用 EK(JSON) 格式再扫一遍，在大包上是分钟级。
+            # 之前它全程不发任何进度，界面就一直显示"44% WebShell AST 语义分析"
+            # 一动不动 —— 实测 174MB 的包卡了 4.7 分钟，用户只会认为程序死了。
+            #
+            # 用 stream_packets 而不是 stream_pyshark_compatible：后者只给
+            # wrapper，拿不到 ek_bytes，就没法按内存预算收口。EK 每包实测约
+            # 20KB 常驻（FIELDS 的 16.7 倍），光按条数卡会直接吃穿内存。
+            last_tick = time.time()
+            for packet in handler.stream_packets(config):
                 if self._is_cancelled:
                     return []
+                wrapper = packet.wrapper
                 if wrapper.has_layer("http"):
                     packets.append(wrapper)
+                    est_bytes += int((packet.ek_bytes or 0) * expansion)
+                    now = time.time()
+                    if now - last_tick >= 0.5:
+                        self._emit_progress(
+                            46, f"WebShell AST 采集中（{scope}）... "
+                                f"({len(packets)} 个 HTTP 包, "
+                                f"{est_bytes / 1024 / 1024:.0f}MB)")
+                        last_tick = now
+                    if est_bytes >= budget:
+                        truncated = "memory"
+                        break
+                    if self._check_memory() == LEVEL_CRITICAL:
+                        truncated = "rss"
+                        break
+                    if len(packets) >= http_limit:
+                        truncated = "count"
+                        break
+
+            if truncated:
+                # 截断了就必须说出来，别让"少看了"看起来像"看完没事"
+                why = (f"内存预算 {budget // 1024 // 1024}MB"
+                       if truncated == "memory"
+                       else "进程内存告急" if truncated == "rss"
+                       else f"条数上限 {http_limit}")
+                logger.warning(
+                    "WebShell AST 分析在收满 %d 个 HTTP 包后停止（触发%s，"
+                    "估算已占用 %.0fMB）。该抓包文件的剩余 HTTP 流量未做 AST "
+                    "语义分析 —— 主检测链路(_run_http_stream_analysis)仍覆盖全量。",
+                    len(packets), why, est_bytes / 1024 / 1024)
+                self._emit_progress(
+                    46, f"WebShell AST：已收 {len(packets)} 个 HTTP 包（{why}），剩余未分析")
 
             if not packets:
                 return []
 
             detector = WebShellDetector()
             detector.enable_ast(True)
+            self._emit_progress(
+                47, f"WebShell AST 检测中... ({len(packets)} 个 HTTP 包，{scope})")
             detection_results = detector.detect(packets)
             for tool_name, converter in converters.items():
                 for raw_result in detection_results.get(tool_name, []):
-                    if self._is_cancelled or len(results) >= max_results:
+                    if self._is_cancelled:
                         break
                     detection = converter(raw_result)
                     results.append(detection)
                     self._detection_count += 1
+                    if get_observability_hub is not None:
+                        get_observability_hub().record_detection(
+                            getattr(detection, 'threat_level', None))
                     batch = self._result_buffer.add(detection)
                     if batch:
                         self.batchResultsReady.emit(batch)
@@ -478,7 +955,6 @@ class StreamAnalysisWorker(QThread):
         """HTTP流式分析，带信号节流和结果上限"""
         logger.debug(f"_run_http_stream_analysis: total_packets={total_packets}")
         results = _existing_results if _existing_results is not None else []
-        limit_reached = len(results) >= self.options.max_detections
         self._http_evidence_packets = []
         self._http_request_uris = {}
 
@@ -507,21 +983,48 @@ class StreamAnalysisWorker(QThread):
                 self._packet_count += 1
                 http_count += 1
 
+                # record_packet 每次都要抢 ObservabilityHub 的 RLock，而这把锁
+                # 是进程级共享的 —— 两个 worker 逐包争用时，主线程也被拖着一起
+                # 抢 GIL。指标只是诊断用途，攒够一批再记，锁的频率降两个数量级。
+                self._packet_tick += 1
+                if self._packet_tick >= 256:
+                    if get_observability_hub is not None:
+                        get_observability_hub().record_packet(self._packet_tick)
+                    self._packet_tick = 0
+
                 if http_count % 50 == 0:
                     logger.debug(f"已处理 {http_count} 个 HTTP 请求, 检测到 {len(results)} 威胁")
 
                 self._trigger_gc_if_needed()
+                self._check_memory()
 
-                self._http_evidence_packets.append(
-                    _HttpEvidencePacket(getattr(packet, "http_cookie", ""))
-                )
+                # CS 检测只看 Cookie，没有 Cookie 的请求存进去纯属浪费 ——
+                # 大包里 HTTP 请求是百万级，每条一个对象足以吃掉几百 MB。
+                cookie = getattr(packet, "http_cookie", "")
+                if cookie:
+                    self._http_evidence_packets.append(_HttpEvidencePacket(cookie))
                 if packet.frame_number > 0:
                     self._http_request_uris[packet.frame_number] = packet.http_uri or ""
 
+                # 流水账要记在**去重之前**。成功研判的维度 B 数的就是"上传后
+                # 又回访了几次"，而回访往往是一模一样的 GET —— 正好会被下面
+                # 的 dedup_key 全部合并掉。记在去重后面，这个维度就永远只能
+                # 看到 1 次访问，"确认落地"降级成"疑似"，等于白做。
+                if self._request_ledger is not None:
+                    self._request_ledger.add(
+                        frame=packet.frame_number,
+                        ts=packet.timestamp_epoch,
+                        src_ip=packet.src_ip,
+                        dst_ip=packet.dst_ip,
+                        uri=packet.http_uri or "",
+                        method=packet.http_method or "",
+                    )
+
                 current_time = time.time()
                 if current_time - last_progress_time >= 0.5:
-                    pct = min(15 + int((http_count / max(total_packets, 1)) * 28), 43)
-                    self._emit_progress(pct, f"HTTP分析中... ({http_count} 请求, {len(results)} 威胁)")
+                    self._emit_progress(
+                        self._http_stage_percent(http_count),
+                        f"HTTP分析中... ({http_count} 请求, {len(results)} 威胁)")
                     last_progress_time = current_time
 
                 # 去重
@@ -530,7 +1033,11 @@ class StreamAnalysisWorker(QThread):
                     digest_input = request_body[:32768] + request_body[-32768:]
                 else:
                     digest_input = request_body
-                body_digest = hashlib.sha256(digest_input).hexdigest()
+                # 去重只需要一个抗碰撞的指纹，不需要密码学强度的 SHA-2。
+                # blake2b 限定 16 字节摘要在纯 Python 侧比 sha256 明显快，
+                # 而这是**每个 HTTP 请求都要走一次**的热路径。
+                body_digest = hashlib.blake2b(
+                    digest_input, digest_size=16).hexdigest()
                 dedup_key = (
                     f"{packet.http_method}:{packet.http_host}:{packet.http_uri}:"
                     f"{packet.http_content_type}:{len(request_body)}:{body_digest}"
@@ -540,19 +1047,20 @@ class StreamAnalysisWorker(QThread):
                     continue
                 self._seen_keys.add(dedup_key)
 
-                if len(results) >= self.options.max_detections:
-                    if not limit_reached:
-                        limit_reached = True
-                        logger.warning(f"检测结果已达上限 {self.options.max_detections}，跳过后续检测")
-                    del packet
-                    continue
-
+                # 这里原来有一个 `len(results) >= max_detections: continue`。
+                # 它是可绕过的安全洞：攻击者只要先灌满 N 条噪声（扫描器流量
+                # 天然就能做到），后面真正的攻击就一个都不会被检测。
+                # 现在改成全量检测，靠"证据字段按需懒加载"控内存
+                # —— 见 _keep_full_evidence / _detect_packet。
                 detection = self._detect_packet(detector, packet)
                 del packet  # 检测完释放
 
                 if detection:
                     results.append(detection)
                     self._detection_count += 1
+                    if get_observability_hub is not None:
+                        get_observability_hub().record_detection(
+                            getattr(detection, 'threat_level', None))
 
                     batch = self._result_buffer.add(detection)
                     if batch:
@@ -561,6 +1069,11 @@ class StreamAnalysisWorker(QThread):
             remaining = self._result_buffer.flush()
             if remaining:
                 self.batchResultsReady.emit(remaining)
+
+            # 把攒着还没记的那批包数补上，否则统计会少最多 255 个
+            if self._packet_tick and get_observability_hub is not None:
+                get_observability_hub().record_packet(self._packet_tick)
+            self._packet_tick = 0
 
             self._seen_keys.clear()
 
@@ -579,6 +1092,22 @@ class StreamAnalysisWorker(QThread):
             logger.warning(f"HTTP流式分析异常: {e}")
 
         return results
+
+    def _keep_full_evidence(self) -> bool:
+        """还要不要把原始报文留在内存里
+
+        检测本身**不设上限**（上限可被噪声灌满绕过），但证据字段是内存大头，
+        一条可能上百 KB。超过阈值后只留身份字段，点开时按帧号回 pcap 重取
+        （见 controllers.analysis_controller.get_http_request_evidence）。
+
+        两个触发条件，满足任一就停止驻留：
+          1. 条数超过 FULL_EVIDENCE_DETECTIONS —— 静态预算
+          2. 进程 RSS 越过 MEMORY_CRITICAL_MB —— 动态兜底，因为条数是坏代理，
+             同样 2000 条，全是小 GET 和全是大文件上传能差两个数量级
+        """
+        if self._memory_degraded:
+            return False
+        return self._detection_count < ResourceLimits.FULL_EVIDENCE_DETECTIONS
 
     def _detect_packet(self, detector, packet: PacketData) -> Optional[DetectionResult]:
         try:
@@ -599,27 +1128,64 @@ class StreamAnalysisWorker(QThread):
                 content_type=packet.http_content_type
             )
 
+            # 会话上下文。**每个请求都要喂给追踪器**，不能只喂命中的：
+            # "上传 webshell → 随后访问它"这类攻击路径里，上传请求本身
+            # 往往看着无害，只有把它记下来，后面那次访问才能被关联出来。
+            signal = self._track_session(packet, body, detection)
+            if signal is not None and signal.triggered:
+                detection['total_weight'] = detection.get('total_weight', 0) + signal.bonus
+                detection['session_signals'] = signal.to_dict()
+                detection['tags'] = list(detection.get('tags') or []) + signal.tags
+                if detection['total_weight'] >= 40:
+                    detection['detected'] = True
+
             if detection.get('detected', False) and detection.get('total_weight', 0) >= 20:
-                raw_headers = f"{packet.http_method} {packet.http_uri} HTTP/1.1\r\n"
-                raw_headers += f"Host: {packet.http_host}\r\n"
-                if packet.http_user_agent:
-                    raw_headers += f"User-Agent: {packet.http_user_agent}\r\n"
-                if packet.http_content_type:
-                    raw_headers += f"Content-Type: {packet.http_content_type}\r\n"
-                raw_headers += "\r\n"
-
-                raw_body_full = body.decode('utf-8', errors='replace')
-                raw_body_str = safe_display_text(body, max_length=50000)
-
-                detection['raw_request_headers'] = raw_headers
-                detection['raw_request_body'] = raw_body_str[:50000]
-                detection['raw_http_request'] = (raw_headers + raw_body_str)[:100000]
-                detection['raw_request_body_full'] = raw_body_full
-                detection['raw_http_request_full'] = raw_headers + raw_body_full
+                # 身份字段永远保留：它们很轻，而且是回 pcap 重取证据的钥匙
                 detection['frame_number'] = packet.frame_number
                 detection['src_ip'] = packet.src_ip
                 detection['dst_ip'] = packet.dst_ip
                 detection['tcp_stream'] = packet.tcp_stream
+                detection['host'] = packet.http_host
+                detection['timestamp'] = packet.timestamp
+
+                if self._keep_full_evidence():
+                    raw_headers = f"{packet.http_method} {packet.http_uri} HTTP/1.1\r\n"
+                    raw_headers += f"Host: {packet.http_host}\r\n"
+                    if packet.http_user_agent:
+                        raw_headers += f"User-Agent: {packet.http_user_agent}\r\n"
+                    if packet.http_content_type:
+                        raw_headers += f"Content-Type: {packet.http_content_type}\r\n"
+                    raw_headers += "\r\n"
+
+                    raw_body_str = safe_display_text(body, max_length=50000)
+
+                    # "_full" 这两个字段是给 payload_viewer 看完整请求用的。
+                    # 原来完全不截断 —— 一次几 MB 的上传就原样留在内存里，
+                    # 而且 raw_http_request_full = headers + body 又复制了一份。
+                    # 1MB 足够覆盖真实场景里要人工看的请求。
+                    raw_body_full = body[:_FULL_BODY_LIMIT].decode('utf-8', errors='replace')
+                    if len(body) > _FULL_BODY_LIMIT:
+                        raw_body_full += (
+                            f"\n\n...[已截断，原始 body 共 {len(body)} 字节]")
+
+                    detection['raw_request_headers'] = raw_headers
+                    detection['raw_request_body'] = raw_body_str[:50000]
+                    detection['raw_http_request'] = (raw_headers + raw_body_str)[:100000]
+                    detection['raw_request_body_full'] = raw_body_full
+                    detection['raw_http_request_full'] = raw_headers + raw_body_full
+                else:
+                    # 超过阈值：只留一条能自解释的占位，点开时按帧号回 pcap 重取。
+                    # pcap_path / frame_number 必须一起带上，否则 UI 无从重取
+                    # —— 这正是之前"承诺了但没实现"的那一环。
+                    detection['evidence_lazy'] = True
+                    detection['pcap_path'] = self.pcap_path
+                    detection['raw_request_headers'] = (
+                        f"{packet.http_method} {packet.http_uri} HTTP/1.1\r\n"
+                        f"Host: {packet.http_host}\r\n\r\n")
+                    detection['raw_http_request'] = (
+                        f"[证据未驻留内存 — 本次分析检测数已超过 "
+                        f"{ResourceLimits.FULL_EVIDENCE_DETECTIONS} 条]\n"
+                        f"帧号 #{packet.frame_number}，点开时会自动回原始 pcap 取回完整请求")
 
                 return DetectionResult.from_attack_result(detection)
 
@@ -627,6 +1193,41 @@ class StreamAnalysisWorker(QThread):
             logger.debug(f"检测失败: {e}")
 
         return None
+
+    def _track_session(self, packet: PacketData, body: bytes, detection: Dict):
+        """把一次请求喂给会话追踪器，拿回跨请求的上下文信号
+
+        这是"还原攻击路径"的那一环：单看一个包判断不了的东西
+        （上传后访问、探测→升级、固定周期的心跳），要靠同一会话里
+        前后请求的关系才能看出来。追踪器只加分不减分，且有上限。
+        """
+        if self._session_tracker is None or RequestEvent is None:
+            return None
+        try:
+            names = []
+            if extract_uploaded_names is not None:
+                names = extract_uploaded_names(body or b"",
+                                               packet.http_content_type or "")
+            event = RequestEvent(
+                frame_number=packet.frame_number,
+                ts=packet.timestamp_epoch,
+                src_ip=packet.src_ip,
+                dst_ip=packet.dst_ip,
+                host=packet.http_host,
+                method=packet.http_method,
+                uri=packet.http_uri,
+                content_type=packet.http_content_type,
+                body_len=len(body or b""),
+                entropy=float(detection.get('entropy') or 0.0),
+                rule_weight=int(detection.get('total_weight') or 0),
+                detected=bool(detection.get('detected')),
+                attack_type=detection.get('detection_type') or "",
+                uploaded_names=names,
+            )
+            return self._session_tracker.process(event)
+        except Exception as e:
+            logger.debug(f"会话追踪跳过: {e}")
+            return None
 
     def _scan_http_responses(self, results: List[DetectionResult]) -> List[ExtractedFile]:
         """Stream every HTTP response once for response evidence and file artifacts."""
@@ -670,9 +1271,25 @@ class StreamAnalysisWorker(QThread):
 
         try:
             packet_iter = self._handler.stream_packets(config)
+            resp_count = 0
+            last_tick = time.time()
             for packet in packet_iter:
                 if self._is_cancelled:
                     break
+
+                # 这一阶段要把整个文件的 HTTP 响应再过一遍，大包上是分钟级。
+                # 不发进度的话界面就停在"46% HTTP 响应流式扫描"不动，
+                # 和之前卡在 15% 是同一类问题。
+                resp_count += 1
+                now = time.time()
+                if now - last_tick >= 0.5:
+                    # 46~52 这一段。拿不到响应总数，用渐近曲线保证只增不越界
+                    pct = 46 + int((1.0 - 1.0 / (1.0 + resp_count / 20000.0)) * 6)
+                    self._emit_progress(
+                        pct,
+                        f"HTTP 响应扫描中... ({resp_count} 个响应, "
+                        f"{len(extracted_files)} 个对象)")
+                    last_tick = now
 
                 request_in = str(getattr(packet, "http_request_in", "") or "").strip()
                 request_frame = 0
@@ -750,14 +1367,14 @@ class StreamAnalysisWorker(QThread):
                 )
         except Exception as error:
             logger.warning("HTTP response stream scan failed: %s", error)
-            self._emit_progress(70, "HTTP 响应流式扫描失败")
+            self._emit_progress(52, "HTTP 响应流式扫描失败")
         finally:
             close = getattr(packet_iter, "close", None)
             if close:
                 close()
 
         if not self._is_cancelled:
-            self._emit_progress(70, f"HTTP 响应扫描完成: {len(extracted_files)} 个对象")
+            self._emit_progress(52, f"HTTP 响应扫描完成: {len(extracted_files)} 个对象")
         return extracted_files
 
     @staticmethod
@@ -790,12 +1407,19 @@ class StreamAnalysisWorker(QThread):
 
         for result_index in target_indices:
             detection = results[result_index]
+            # 请求侧证据被省掉的那些条目，响应侧同样只留状态码。
+            # 状态码很轻（几个字节）但信息量最大 —— 200 和 404 直接决定
+            # 这次攻击有没有打成，后面的成功判定就靠它起步。
+            lazy = bool(isinstance(detection.raw_result, dict)
+                        and detection.raw_result.get("evidence_lazy"))
             if isinstance(detection.raw_result, dict):
                 detection.raw_result["response_status"] = status_code
-                detection.raw_result["response_sample"] = body_sample
-                detection.raw_result["response_data"] = response_data
-            detection.response_sample = body_sample
-            detection.response_data = response_data
+                if not lazy:
+                    detection.raw_result["response_sample"] = body_sample
+                    detection.raw_result["response_data"] = response_data
+            if not lazy:
+                detection.response_sample = body_sample
+                detection.response_data = response_data
 
     def _fetch_http_responses(
         self,
@@ -971,7 +1595,7 @@ class StreamAnalysisWorker(QThread):
                 pf = ProtocolFinding.from_analyzer_finding(af)
                 findings.append(pf)
                 self.protocolFindingFound.emit(pf)
-            self._emit_progress(55, f"ICMP分析完成: {len(findings)} 个发现")
+            self._emit_progress(56, f"ICMP分析完成: {len(findings)} 个发现")
         except Exception as e:
             logger.warning(f"ICMP 分析异常: {e}")
         return findings
@@ -986,7 +1610,7 @@ class StreamAnalysisWorker(QThread):
                 pf = ProtocolFinding.from_analyzer_finding(af)
                 findings.append(pf)
                 self.protocolFindingFound.emit(pf)
-            self._emit_progress(58, f"DNS分析完成: {len(findings)} 个发现")
+            self._emit_progress(60, f"DNS分析完成: {len(findings)} 个发现")
         except Exception as e:
             logger.warning(f"DNS 分析异常: {e}")
         return findings
@@ -1001,7 +1625,7 @@ class StreamAnalysisWorker(QThread):
                 pf = ProtocolFinding.from_analyzer_finding(af)
                 findings.append(pf)
                 self.protocolFindingFound.emit(pf)
-            self._emit_progress(60, f"CS检测完成: {len(findings)} 个发现")
+            self._emit_progress(64, f"CS检测完成: {len(findings)} 个发现")
         except Exception as e:
             logger.warning(f"CS 分析异常: {e}")
         return findings
@@ -1022,7 +1646,7 @@ class StreamAnalysisWorker(QThread):
 
             streams = list_rtp_streams(self.pcap_path, self.tshark_path)
             if not streams:
-                self._emit_progress(64, "未发现 RTP 音视频流")
+                self._emit_progress(68, "未发现 RTP 音视频流")
                 return []
 
             has_dynamic = any(s.payload_type >= 96 for s in streams)
@@ -1035,15 +1659,22 @@ class StreamAnalysisWorker(QThread):
                         s.media_type = mtype
                         s.sample_rate = rate
 
-            self._emit_progress(63, f"发现 {len(streams)} 条 RTP 音视频流")
+            self._emit_progress(68, f"发现 {len(streams)} 条 RTP 音视频流")
             return streams
 
         except Exception as e:
             logger.warning(f"RTP 分析异常: {e}")
             return []
 
-    def _run_deep_protocol_analysis(self) -> Tuple[List[ProtocolFinding], List[str]]:
+    def _run_deep_protocol_analysis(
+        self, protocol_counts: Optional[Dict[str, int]] = None
+    ) -> Tuple[List[ProtocolFinding], List[str]]:
         """运行 ProtocolAnalyzerManager 中所有注册的协议分析器
+
+        `protocol_counts` 是 5% 阶段那趟 `-z io,phs` 的产物，用来把"跑了也
+        必然扫不出东西"的分析器摘掉 —— 详见
+        ProtocolAnalyzerManager.select_runnable_protocols 的说明。拿不到统计
+        时**全部照跑**，不做任何假设。
 
         Returns:
             (findings, extracted_file_paths) 双元组
@@ -1060,9 +1691,18 @@ class StreamAnalysisWorker(QThread):
             deep_protocols = [
                 protocol for protocol in ProtocolType if protocol not in SKIP
             ]
+            runnable, gated = ProtocolAnalyzerManager.select_runnable_protocols(
+                deep_protocols, protocol_counts)
+            if gated:
+                names = ", ".join(sorted(p.value for p in gated))
+                logger.info(
+                    "协议分级统计里没有这些协议层，跳过对应分析器（跑了也必然"
+                    "匹配 0 个包）：%s", names)
+                self._emit_progress(70, f"深度协议分析：按协议统计跳过 {len(gated)} 个分析器")
+
             results = manager.analyze_all_pcap(
                 self.pcap_path,
-                enabled_protocols=deep_protocols,
+                enabled_protocols=runnable,
                 generate_plot=True,
                 progress_callback=self._emit_deep_protocol_progress,
                 parallel=True,
@@ -1084,7 +1724,7 @@ class StreamAnalysisWorker(QThread):
                     f for f in result.extracted_files if os.path.isfile(f)
                 )
 
-            self._emit_progress(64, f"深度协议分析完成: {len(results)} 个协议, {total_findings} 个发现")
+            self._emit_progress(74, f"深度协议分析完成: {len(results)} 个协议, {total_findings} 个发现")
 
         except Exception as e:
             logger.warning(f"深度协议分析异常: {e}")
@@ -1109,113 +1749,14 @@ class StreamAnalysisWorker(QThread):
             f"深度协议分析 {completed}/{total}: {name}",
         )
 
-    def _export_http_objects(self) -> List[ExtractedFile]:
-        """委托给AnalysisService做智能提取"""
-        try:
-            from services.analysis_service import AnalysisService
-            service = AnalysisService()
-            service._tshark_path = self._handler.tshark_path
-
-            self._emit_progress(64, "HTTP 对象智能提取中...")
-            extracted_files = service.extract_http_objects(self.pcap_path)
-
-            self._emit_progress(70, f"智能提取了 {len(extracted_files)} 个HTTP对象")
-            return extracted_files
-
-        except Exception as e:
-            # Complete object export creates arbitrary response-body artifacts
-            # and is intentionally opt-in at the service boundary.
-            logger.warning(f"智能HTTP对象提取失败，跳过 HTTP 对象导出: {e}")
-            self._emit_progress(70, "HTTP 对象提取失败，已跳过")
-            return []
-
-    def _export_http_objects_fallback(self) -> List[ExtractedFile]:
-        """基础HTTP对象导出，兜底用"""
-        import tempfile
-        import subprocess
-
-        extracted_files = []
-        export_dir = tempfile.mkdtemp(prefix=f"tinglan_http_{os.getpid()}_")
-
-        try:
-            cmd = [
-                self._handler.tshark_path,
-                "-r", self.pcap_path,
-                "-q",
-                "--export-objects", f"http,{export_dir}"
-            ]
-
-            popen_kwargs = {
-                "capture_output": True,
-                "timeout": 120,
-                "encoding": "utf-8",
-                "errors": "replace",
-            }
-
-            if sys.platform == "win32":
-                popen_kwargs["creationflags"] = 0x08000000
-
-            result = subprocess.run(cmd, **popen_kwargs)
-
-            if result.returncode != 0 and result.stderr:
-                logger.warning(f"HTTP对象导出警告: {result.stderr[:200]}")
-
-            if os.path.exists(export_dir):
-                for filename in os.listdir(export_dir):
-                    filepath = os.path.join(export_dir, filename)
-                    if os.path.isfile(filepath):
-                        ext = os.path.splitext(filename)[1].lower()
-                        content_type = self._guess_content_type(ext)
-
-                        if content_type == "text/html":
-                            continue
-
-                        ef = ExtractedFile(
-                            file_path=filepath,
-                            file_name=filename,
-                            file_type=self._get_file_type(ext),
-                            file_size=os.path.getsize(filepath),
-                            source_packet=0,
-                            content_type=content_type,
-                            pcap_path=self.pcap_path
-                        )
-                        extracted_files.append(ef)
-
-                        if len(extracted_files) >= 100:
-                            break
-
-            self._emit_progress(70, f"提取了 {len(extracted_files)} 个HTTP对象")
-
-        except subprocess.TimeoutExpired:
-            logger.warning("HTTP对象导出超时")
-        except Exception as e:
-            logger.warning(f"HTTP对象导出异常: {e}")
-
-        return extracted_files
-
-    def _guess_content_type(self, ext: str) -> str:
-        content_types = {
-            ".html": "text/html", ".htm": "text/html",
-            ".php": "application/x-php", ".js": "application/javascript",
-            ".css": "text/css", ".json": "application/json",
-            ".xml": "application/xml", ".png": "image/png",
-            ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-            ".gif": "image/gif", ".ico": "image/x-icon",
-            ".txt": "text/plain", ".pdf": "application/pdf",
-            ".zip": "application/zip",
-        }
-        return content_types.get(ext, "application/octet-stream")
-
-    def _get_file_type(self, ext: str) -> str:
-        if ext in {".png", ".jpg", ".jpeg", ".gif", ".ico", ".bmp", ".webp"}:
-            return "image"
-        elif ext in {".pdf", ".doc", ".docx", ".xls", ".xlsx"}:
-            return "document"
-        elif ext in {".zip", ".rar", ".7z", ".tar", ".gz"}:
-            return "archive"
-        elif ext in {".php", ".js", ".css", ".html", ".xml", ".json"}:
-            return "code"
-        return "other"
+    # 这里原来有 _export_http_objects / _export_http_objects_fallback 两个方法
+    # （连同它们私有的 _guess_content_type / _get_file_type），共约 110 行。
+    # 主流程早已改走 _scan_http_responses —— 响应扫描那一趟里顺便用
+    # HttpResponseInspector 判定值不值得落盘，不需要再单独跑一次
+    # tshark --export-objects。全库唯一的引用是一个测试的 monkeypatch
+    # (raising=False)，属于死代码，删除。
+    # controllers/analysis_controller.py 里那份同名方法是旧流水线自己的，
+    # 仍在使用，不要一起删。
 
     def _run_auto_decoding(self, detections: List[DetectionResult]) -> List[AutoDecodingResult]:
         results: List[AutoDecodingResult] = []
@@ -1411,6 +1952,8 @@ class StreamAnalysisController(QObject):
     analysisFinished = Signal(object)           # AnalysisSummary
     analysisError = Signal(str, str)            # file_path, 错误消息
     analysisCancelled = Signal(str)             # file_path
+    # 内存告警：(file_path, 等级, 说明文本)
+    memoryWarning = Signal(str, str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1454,7 +1997,6 @@ class StreamAnalysisController(QObject):
             auto_decode=options.get("auto_decode", True) if options else True,
             file_recovery=options.get("file_recovery", True) if options else True,
             custom_keys=options.get("custom_keys", {}) if options else {},
-            max_detections=options.get("max_detections", ResourceLimits.MAX_DETECTIONS) if options else ResourceLimits.MAX_DETECTIONS
         )
 
         worker = StreamAnalysisWorker(pcap_path, analysis_options)
@@ -1469,6 +2011,8 @@ class StreamAnalysisController(QObject):
         worker.analysisComplete.connect(self._onFinished)
         worker.error.connect(lambda msg, f=fp: self._onError(f, msg))
         worker.cancelled.connect(lambda f=fp: self._onCancelled(f))
+        worker.memoryWarning.connect(
+            lambda level, text, f=fp: self.memoryWarning.emit(f, level, text))
 
         self.analysisStarted.emit(pcap_path)
         worker.start()
@@ -1497,6 +2041,7 @@ class StreamAnalysisController(QObject):
             worker.analysisComplete,
             worker.error,
             worker.cancelled,
+            worker.memoryWarning,
         ):
             try:
                 sig.disconnect()

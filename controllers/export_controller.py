@@ -108,6 +108,43 @@ class ExportController(QObject):
             self.exportError.emit(f"HTML导出失败: {str(e)}")
             return False
 
+    def exportToProvenanceHtml(self, summary: AnalysisSummary, output_path: str) -> bool:
+        """导出攻击溯源图（自包含 HTML）
+
+        和 exportToHtml 的区别：那个是一张平铺的威胁表格，回答不了"谁打的、
+        从哪进来、下一步做了什么"；这个把 summary 重组成有向图（攻击者 →
+        目标 → 端点 → 落地物），边分 flow/causal/drop/temporal，并把 A/B/C
+        成功研判的结论挂在节点上。
+
+        建图是纯内存遍历（不读 pcap、不起 tshark），复杂度对检测条数线性，
+        和现有的 exportToHtml 一样跑在 UI 线程上。
+        """
+        try:
+            self.exportStarted.emit()
+            self.exportProgress.emit(10, "构建攻击溯源图...")
+
+            try:
+                from core.provenance_html import export_provenance_html
+            except ImportError as e:
+                self.exportError.emit(f"溯源图模块不可用: {e}")
+                return False
+
+            self.exportProgress.emit(50, "渲染并写入文件...")
+            graph = export_provenance_html(summary, output_path)
+
+            stats = graph.stats or {}
+            self.exportProgress.emit(
+                100,
+                f"溯源图完成: {stats.get('nodes', 0)} 个节点 / "
+                f"{stats.get('edges', 0)} 条边",
+            )
+            self.exportFinished.emit(output_path)
+            return True
+
+        except Exception as e:
+            self.exportError.emit(f"溯源图导出失败: {str(e)}")
+            return False
+
     def _generateHtmlReport(self, summary: AnalysisSummary) -> str:
         detections_html = ""
         for d in summary.detections:

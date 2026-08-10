@@ -227,3 +227,31 @@ def test_stream_packets_uses_fields_parser_for_fields_output(monkeypatch) -> Non
             f"separator={FIELD_SEPARATOR}",
         ]
     ]
+
+
+# ---------------------------------------------- 字节字段解码的形态判定
+#
+# tshark 的字节型字段（http.file_data 等）输出的是**冒号分隔的十六进制**。
+# 原来的判据只看"长度偶数且能被 int(,16) 解析"，于是正文里的纯数字串会被
+# 当成 hex 解成乱码字节，明文直接毁掉，后面的规则匹配自然什么都看不到。
+
+
+def test_colon_separated_hex_is_decoded():
+    assert PacketParser._decode_field_data("3c:3f:70:68:70") == b"<?php"
+
+
+def test_bare_hex_with_letters_is_decoded():
+    assert PacketParser._decode_field_data("3c3f706870") == b"<?php"
+
+
+def test_pure_decimal_text_is_not_treated_as_hex():
+    """`20250101` 既是合法 hex 也是合法正文，这种情况按正文处理"""
+    assert PacketParser._decode_field_data("20250101") == b"20250101"
+
+
+def test_odd_length_text_stays_text():
+    assert PacketParser._decode_field_data("12345") == b"12345"
+
+
+def test_plain_text_stays_text():
+    assert PacketParser._decode_field_data("cmd=whoami") == b"cmd=whoami"

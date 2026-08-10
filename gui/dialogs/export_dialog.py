@@ -13,7 +13,7 @@ class ExportDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("导出报告")
-        self.setFixedSize(450, 280)
+        self.setFixedSize(480, 320)
         self.setModal(True)
 
         self._output_path = ""
@@ -32,8 +32,13 @@ class ExportDialog(QDialog):
 
         self.format_button_group = QButtonGroup(self)
 
+        self.provenance_radio = QRadioButton(
+            "攻击溯源图 - 谁打的、从哪进来、下一步做了什么（含成功研判）")
+        self.provenance_radio.setChecked(True)
+        self.format_button_group.addButton(self.provenance_radio)
+        format_layout.addWidget(self.provenance_radio)
+
         self.html_radio = QRadioButton("HTML报告 - 可在浏览器中查看，包含样式")
-        self.html_radio.setChecked(True)
         self.format_button_group.addButton(self.html_radio)
         format_layout.addWidget(self.html_radio)
 
@@ -129,12 +134,12 @@ class ExportDialog(QDialog):
 
     def _browsePath(self):
         """浏览保存路径"""
-        if self.html_radio.isChecked():
-            filter_str = "HTML文件 (*.html)"
-            default_ext = ".html"
-        else:
+        if self.json_radio.isChecked():
             filter_str = "JSON文件 (*.json)"
             default_ext = ".json"
+        else:
+            filter_str = "HTML文件 (*.html)"
+            default_ext = ".html"
 
         file_path, _ = QFileDialog.getSaveFileName(
             self, "选择保存位置", "", filter_str
@@ -153,4 +158,6 @@ class ExportDialog(QDialog):
 
     @property
     def export_format(self) -> str:
+        if self.provenance_radio.isChecked():
+            return "provenance"
         return "html" if self.html_radio.isChecked() else "json"

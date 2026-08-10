@@ -1371,6 +1371,15 @@ class SemanticAnalyzer:
 class PHPASTEngine:
     """主入口，串起tokenizer -> ast builder -> semantic analyzer"""
 
+    # 一次过分析的长度上限。这以内保持污点追踪的完整保真度（赋值和 sink
+    # 在同一棵树里）。给到 256KB 是因为真实 webshell 载荷解码后基本都在这
+    # 之内，窗口化是给异常大的载荷兜底用的，不是常规路径。
+    DIRECT_LIMIT = 256 * 1024
+    # 超过上限后的滑动窗口。重叠区要足够放下一段完整的 "赋值 + 调用"，
+    # 否则跨窗口的污点链会断。
+    WINDOW_SIZE = 64 * 1024
+    WINDOW_OVERLAP = 8 * 1024
+
     def __init__(self):
         self.tokenizer = PHPTokenizer()
         self.ast_builder = PHPASTBuilder()
@@ -1391,6 +1400,65 @@ class PHPASTEngine:
 
         except Exception as e:
             return ASTAnalysisResult()
+
+    def analyze_windowed(self, code: str) -> Tuple[ASTAnalysisResult, bool]:
+        """超长代码的兜底分析路径，返回 (结果, 是否走了窗口)。
+
+        为什么不是"太长就跳过"：长度是攻击者可控的。把 webshell 填充到
+        阈值以上就能让语义分析整个消失，那是一键绕过（这个 bug 在
+        attack_detector 里出现过一次，commit d144e93 修掉；webshell_detect
+        里的复制品由本方法替换）。
+
+        窗口化确实会损失跨窗口的污点链，所以只在 DIRECT_LIMIT 以上才启用，
+        并且重叠区给得比较宽。调用方拿到 True 时应当留痕，让报告能说清
+        "这一条是分段分析的，可能不完整"，而不是假装看全了。
+        """
+        if not code or len(code.strip()) < 3:
+            return ASTAnalysisResult(), False
+
+        if len(code) <= self.DIRECT_LIMIT:
+            return self.analyze(code), False
+
+        merged = ASTAnalysisResult()
+        seen_findings = set()
+        seen_calls = set()
+        adjustments = []
+
+        step = max(self.WINDOW_SIZE - self.WINDOW_OVERLAP, 1)
+        for start in range(0, len(code), step):
+            window = code[start:start + self.WINDOW_SIZE]
+            if len(window.strip()) < 3:
+                continue
+            part = self.analyze(window)
+
+            for finding in part.findings:
+                key = (finding.type, finding.severity, finding.code_context)
+                if key in seen_findings:
+                    continue
+                seen_findings.add(key)
+                merged.findings.append(finding)
+
+            for call in part.dangerous_calls:
+                key = (call.function_name, call.is_tainted, tuple(call.arguments))
+                if key in seen_calls:
+                    continue
+                seen_calls.add(key)
+                merged.dangerous_calls.append(call)
+
+            merged.taint_sources |= part.taint_sources
+            merged.obfuscation_score = max(
+                merged.obfuscation_score, part.obfuscation_score)
+            merged.is_likely_webshell = (
+                merged.is_likely_webshell or part.is_likely_webshell)
+            adjustments.append(part.confidence_adjustment)
+
+            if start + self.WINDOW_SIZE >= len(code):
+                break
+
+        # 取最有指控力的那个窗口，而不是求和 —— 求和会随窗口数线性放大分数。
+        # 全为负时 max 取到惩罚最轻的那个，方向上偏保守（宁可少扣分）。
+        merged.confidence_adjustment = max(adjustments) if adjustments else 0
+        return merged, True
 
     def validate_detection(
         self,

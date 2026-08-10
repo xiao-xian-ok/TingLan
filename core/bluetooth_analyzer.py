@@ -1,4 +1,4 @@
-# bluetooth_analyzer.py - 向后兼容包装 (核心逻辑已移至 protocol_analyzer.py)
+# bluetooth_analyzer.py - 向后兼容包装
 
 import os
 import pathlib

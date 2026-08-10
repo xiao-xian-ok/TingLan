@@ -997,6 +997,29 @@ class AnalysisController(QObject):
         self.analysisError.emit(self._current_file, error_msg)
 
 
+def _first_frame_matching(tshark_path: str, pcap_path: str, display_filter: str) -> int:
+    """返回第一个匹配 display_filter 的帧号，找不到返回 0
+
+    专门用来替代 `-Y <filter> -c 1` 这种写法：`-c` 限制的是**读取量**，
+    不是过滤后的结果数，所以 `-c 1` 实际是"只读第一个包再过滤"，
+    过滤器命中在后面时永远拿不到东西。
+    """
+    try:
+        result = subprocess.run(
+            [tshark_path, "-r", pcap_path, "-Y", display_filter,
+             "-T", "fields", "-e", "frame.number"],
+            capture_output=True, text=True,
+            encoding='utf-8', errors='replace', timeout=30
+        )
+        for line in (result.stdout or "").splitlines():
+            line = line.strip()
+            if line.isdigit():
+                return int(line)
+    except Exception as e:
+        logger.debug(f"定位首个匹配帧失败: {e}")
+    return 0
+
+
 def get_packet_hex_dump(pcap_path: str, packet_num: int = 0) -> tuple:
     tshark_path = find_tshark()
 
@@ -1004,11 +1027,18 @@ def get_packet_hex_dump(pcap_path: str, packet_num: int = 0) -> tuple:
         return "", ["未找到 tshark"]
 
     try:
-        filter_expr = f"frame.number == {packet_num}" if packet_num > 0 else "http"
+        # 原来这里是 `-Y <filter> -c 1`。`-c` 限制 tshark 从文件里**读**多少个包，
+        # display filter 只在这前 N 个包里筛 —— 于是 `frame.number == 20` 配
+        # `-c 1` 永远取不到东西（实测：只有 #1 能取到，其余全空）。
+        # 检测证据的懒加载就是靠这个函数回 pcap 取数的，它坏了就等于证据丢了。
+        if packet_num <= 0:
+            packet_num = _first_frame_matching(tshark_path, pcap_path, "http")
+            if packet_num <= 0:
+                return "", ["无数据"]
 
         cmd = [
             tshark_path, "-r", pcap_path,
-            "-Y", filter_expr, "-V", "-x", "-c", "1"
+            "-Y", f"frame.number == {packet_num}", "-V", "-x"
         ]
 
         result = subprocess.run(
@@ -1054,6 +1084,93 @@ def get_packet_hex_dump(pcap_path: str, packet_num: int = 0) -> tuple:
         return "", ["获取超时"]
     except Exception as e:
         return "", [f"错误: {str(e)}"]
+
+
+def get_http_request_evidence(pcap_path: str, frame_number: int,
+                              max_body: int = 1_000_000) -> dict:
+    """按帧号回原始 pcap 取完整 HTTP 请求
+
+    检测数超过 ResourceLimits.FULL_EVIDENCE_DETECTIONS 之后，stream_worker
+    不再把原始报文留在内存里，只写一条"帧号 #N，可回原始 pcap 查看"的占位。
+    **但一直没有任何代码真的去取** —— 于是大流量场景下，2000 条之后的证据
+    在界面上就等于没有了。这个函数把那句承诺兑现。
+
+    返回 {"headers": str, "body": str, "full": str, "error": str}
+    """
+    out = {"headers": "", "body": "", "full": "", "error": ""}
+    if not pcap_path or not os.path.isfile(pcap_path):
+        out["error"] = "原始 pcap 不可用"
+        return out
+    if not frame_number or frame_number <= 0:
+        out["error"] = "缺少帧号"
+        return out
+
+    tshark_path = find_tshark()
+    if not tshark_path:
+        out["error"] = "未找到 tshark"
+        return out
+
+    try:
+        # 这里的 `-c frame_number` 是 **正确** 用法，和别处的误用相反：
+        # 我们已经知道要的是第 N 帧，`-c N` 读满 N 个包就停，刚好覆盖目标帧，
+        # 大文件下能省掉后面全部的读取。（错误用法是过滤器命中位置未知时用 -c
+        # 去限制"结果数"，那会让靠后的匹配永远取不到。）
+        result = subprocess.run(
+            [tshark_path, "-r", pcap_path,
+             "-c", str(frame_number),
+             "-Y", f"frame.number == {frame_number}",
+             "-T", "fields",
+             "-e", "http.request.method", "-e", "http.request.uri",
+             "-e", "http.host", "-e", "http.user_agent",
+             "-e", "http.content_type", "-e", "http.file_data",
+             "-E", "separator=\x01"],
+            capture_output=True, text=True,
+            encoding='utf-8', errors='replace', timeout=30
+        )
+        line = (result.stdout or "").strip()
+        if not line:
+            out["error"] = f"帧 #{frame_number} 在 pcap 中找不到 HTTP 请求"
+            return out
+
+        parts = line.split("\x01")
+        while len(parts) < 6:
+            parts.append("")
+        method, uri, host, ua, ctype, file_data = parts[:6]
+
+        headers = f"{method or 'GET'} {uri or '/'} HTTP/1.1\r\n"
+        if host:
+            headers += f"Host: {host}\r\n"
+        if ua:
+            headers += f"User-Agent: {ua}\r\n"
+        if ctype:
+            headers += f"Content-Type: {ctype}\r\n"
+        headers += "\r\n"
+
+        body = _decode_tshark_file_data(file_data)
+        if len(body) > max_body:
+            body = body[:max_body] + f"\n\n...[已截断，原始 body 共 {len(body)} 字节]"
+
+        out["headers"] = headers
+        out["body"] = body
+        out["full"] = headers + body
+        return out
+    except Exception as e:
+        logger.debug(f"回 pcap 取证据失败: {e}")
+        out["error"] = f"取证失败: {e}"
+        return out
+
+
+def _decode_tshark_file_data(raw: str) -> str:
+    """tshark 的 http.file_data 是冒号分隔的十六进制，转回文本"""
+    if not raw:
+        return ""
+    compact = raw.replace(":", "").replace(" ", "").strip()
+    if compact and len(compact) % 2 == 0:
+        try:
+            return bytes.fromhex(compact).decode("utf-8", errors="replace")
+        except ValueError:
+            pass
+    return raw
 
 
 def get_file_hex_content(file_path: str, max_bytes: int = 4096) -> str:

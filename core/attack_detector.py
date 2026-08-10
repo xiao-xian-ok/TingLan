@@ -47,6 +47,31 @@ except ImportError:
         SelectiveAnalyzer
     )
 
+# ML 研判是可选的：拿不到就纯规则判定，不影响主流程
+try:
+    from core.ml_scorer import get_ml_scorer
+except ImportError:
+    try:
+        from ml_scorer import get_ml_scorer
+    except ImportError:
+        get_ml_scorer = None
+
+# 观测中心可选。热路径上调用，所以包一层不抛异常的薄封装。
+try:
+    from core.observability import get_observability_hub
+except ImportError:
+    get_observability_hub = None
+
+
+def _obs_incr(name: str, n: int = 1) -> None:
+    if get_observability_hub is None:
+        return
+    try:
+        get_observability_hub().incr(name, n)
+    except Exception:
+        pass
+
+
 logger = logging.getLogger(__name__)
 
 _shared_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
@@ -118,15 +143,50 @@ def safe_decode(data: bytes, encoding: str = 'utf-8') -> str:
             return data.decode('latin-1', errors='replace')
 
 
-def safe_regex_match(pattern: Pattern, text: str, max_len: int = 100000) -> Optional[re.Match]:
-    """正则匹配，截断超长输入防ReDoS"""
-    if len(text) > max_len:
-        text = text[:max_len // 2] + text[-max_len // 2:]
+def search_full(pattern: Pattern, text: str) -> Optional[re.Match]:
+    """全量搜索：短文本直接 search，长文本分块 + 重叠扫，返回第一个命中。
 
+    这是全库唯一允许的"长文本怎么跑正则"的答案。原来的做法是
+    `text[:50KB] + text[-50KB:]`，中段永远不过正则 —— 把 payload 放在
+    50KB 之后就绕过了，而长度完全由攻击者决定。
+
+    分块会凭空造出字符串首尾，`$` / `^` 这类锚点会在人为边界上假命中
+    （比如 SQLi 的 `--\\s{0,3}$`）。解法：非末块丢弃"贴着块尾结束"的命中、
+    非首块丢弃"贴着块首开始"的命中 —— 这类命中必然完整落在相邻块的重叠区
+    里并在那一块被正常捕获，所以只是去重不是丢证据。
+    """
+    limit = ResourceLimits.MAX_REGEX_INPUT_LEN
     try:
-        return pattern.search(text)
+        if len(text) <= limit:
+            return pattern.search(text)
+
+        overlap = ResourceLimits.REGEX_CHUNK_OVERLAP
+        step = max(limit - overlap, 1)
+        total = len(text)
+
+        for start in range(0, total, step):
+            end = min(start + limit, total)
+            chunk = text[start:end]
+            is_first = start == 0
+            is_last = end >= total
+
+            for match in pattern.finditer(chunk):
+                if not is_last and match.end() == len(chunk):
+                    continue    # 贴着人为块尾，交给下一块
+                if not is_first and match.start() == 0:
+                    continue    # 贴着人为块首，上一块已经看过
+                return match
+
+            if is_last:
+                break
     except Exception:
         return None
+    return None
+
+
+def safe_regex_match(pattern: Pattern, text: str, max_len: int = 100000) -> Optional[re.Match]:
+    """兼容入口。max_len 参数保留但不再用来截断输入 —— 截断即绕过。"""
+    return search_full(pattern, text)
 
 
 class AttackType(Enum):
@@ -198,7 +258,10 @@ class ThreatLevel(Enum):
 
 
 class ResourceLimits:
-    MAX_BODY_SIZE = 1 * 1024 * 1024       # 超过1MB就抽样
+    MAX_BODY_SIZE = 1 * 1024 * 1024       # 超过1MB，递归解码改走抽样
+    # 全量字面量匹配的绝对上限，纯粹防 OOM。触顶会计入覆盖率审计并打 warning，
+    # 不会静默 —— 和 fast_filter.hard_scan_ceiling 是同一个性质的兜底。
+    FULL_TEXT_CEILING = 64 * 1024 * 1024
     MAX_DECODE_DEPTH = 15
     MAX_DECODE_SIZE = 10 * 1024 * 1024
     REGEX_TIMEOUT_MS = 100
@@ -210,6 +273,10 @@ class ResourceLimits:
     SAMPLE_OFFSETS = [0.25, 0.5, 0.75]
 
     MAX_REGEX_INPUT_LEN = 100000
+    # 分块扫描的重叠宽度。必须大于任何一条规则可能匹配到的最长串，
+    # 否则跨块的命中会两边都看不全。规则里最长的量词是 {0,500}，
+    # 再算上前后文给到 8KB 有充足余量。
+    REGEX_CHUNK_OVERLAP = 8192
     MAX_PATTERN_MATCH_LEN = 500
 
     MAX_AST_CODE_LEN = 50000
@@ -268,7 +335,13 @@ def ast_timeout_guard(timeout_ms: int):
 
 
 class SampledData:
-    """大数据量的话只取头尾64KB + 中间几个采样点"""
+    """大数据量的话只取头尾64KB + 中间几个采样点
+
+    注意采样的用途已经收窄：它只决定**递归解码**看哪几段（解码很贵，且编码
+    载荷基本都从 body 开头起），不再决定**字面量匹配**看哪几段。后者由
+    AttackDetector.detect() 用 full_text 做全量覆盖 —— 否则"把 payload 放在
+    2MB 偏移处"就是一键绕过，采样点只有 25%/50%/75% 三个 4KB 窗口。
+    """
 
     def __init__(self, data: bytes):
         self.original_size = len(data)
@@ -297,10 +370,16 @@ class SampledData:
             yield offset, sample
 
     @property
+    def combined_bytes(self) -> bytes:
+        """所有采样段拼起来。未采样时就是原始数据本身。"""
+        if len(self.samples) == 1:
+            return self.samples[0][1]
+        return b''.join(s for _, s in self.samples)
+
+    @property
     def combined_text(self) -> str:
         """合并样本为文本供正则用"""
-        combined = b''.join(s for _, s in self.samples)
-        return safe_decode(combined)
+        return safe_decode(self.combined_bytes)
 
 
 @dataclass
@@ -354,6 +433,8 @@ class DetectionContext:
 
     start_time: float = 0.0
     is_sampled: bool = False
+    # 本条载荷有没有因为触到绝对上限而没被完整匹配
+    coverage_truncated: bool = False
 
 
 @dataclass
@@ -410,16 +491,17 @@ class BaseDetector(ABC):
         pass
 
     def _match_patterns(self, text: str, context: DetectionContext) -> List[Evidence]:
-        """跑所有正则，返回匹配到的证据"""
-        evidences = []
+        """跑所有正则，返回匹配到的证据
 
-        if len(text) > ResourceLimits.MAX_REGEX_INPUT_LEN:
-            text = text[:ResourceLimits.MAX_REGEX_INPUT_LEN // 2] + \
-                   text[-ResourceLimits.MAX_REGEX_INPUT_LEN // 2:]
+        这里原来是 `text[:50KB] + text[-50KB:]` —— 中段永远不过正则，把
+        payload 放在 50KB 之后就能绕过。现在改成全量分块扫描（fast_filter
+        里已经用同一套办法解决过一次），覆盖面不再取决于载荷长度。
+        """
+        evidences = []
 
         for name, (pattern, weight) in self._patterns.items():
             try:
-                match = self._safe_regex_search(pattern, text)
+                match = self._search_full(pattern, text)
                 if match:
                     matched_text = match.group(0)
                     if len(matched_text) > ResourceLimits.MAX_PATTERN_MATCH_LEN:
@@ -437,9 +519,13 @@ class BaseDetector(ABC):
 
         return evidences
 
+    def _search_full(self, pattern: Pattern, text: str):
+        """见模块级 search_full 的说明"""
+        return search_full(pattern, text)
+
     def _safe_regex_search(self, pattern: Pattern, text: str):
-        """输入已截断，直接search就行"""
-        return pattern.search(text)
+        """保留给子类/外部调用方；全量搜索请用 _search_full"""
+        return self._search_full(pattern, text)
 
     def _check_timeout(self, context: DetectionContext) -> bool:
         """检查是否超时"""
@@ -1372,8 +1458,12 @@ class SuspiciousEncryptedHTTPDetector(BaseDetector):
     RANDOM_PARAM_RE = re.compile(r'^[a-z][a-z0-9]{9,24}$', re.IGNORECASE)
     BASE64_SEGMENT_RE = re.compile(r'^[A-Za-z0-9+/]{40,}={0,2}$')
 
-    MAX_BODY_PARSE = 64 * 1024
-    MAX_PARAMS = 32
+    # body 解析窗口。这不是"只看这么多"——超出部分仍然会被 detect() 的
+    # 全量字面量匹配覆盖，这里只是限制 parse_qsl 建列表的规模，避免一个
+    # 50MB 的表单体把内存打爆。触顶会留痕。
+    MAX_BODY_PARSE = 8 * 1024 * 1024
+    # MAX_PARAMS 已删除：原来是 params[:32]，前面垫 32 个无害参数就能把
+    # 真 payload 挤出视野，参数顺序完全由攻击者决定。
     MAX_VALUE_SAMPLE = 8192
     MIN_LONG_VALUE = 128
     HIGH_ENTROPY_THRESHOLD = 4.75
@@ -1439,7 +1529,7 @@ class SuspiciousEncryptedHTTPDetector(BaseDetector):
                 description="URL-encoded form body",
             ))
 
-        for name, value in params[:self.MAX_PARAMS]:
+        for name, value in params:
             if self.DANGEROUS_PARAM_RE.match(name):
                 dangerous_params.append(name)
 
@@ -1524,7 +1614,7 @@ class SuspiciousEncryptedHTTPDetector(BaseDetector):
             ]
         except Exception:
             params = []
-            for pair in text.split("&")[:self.MAX_PARAMS]:
+            for pair in text.split("&"):
                 if "=" not in pair:
                     continue
                 key, value = pair.split("=", 1)
@@ -1651,7 +1741,17 @@ class JSONSemanticAnalyzer:
 
 
 class ContextAnalyzer:
-    """降噪用，排除swagger/静态资源/health check等"""
+    """降噪用，排除swagger/静态资源/health check等
+
+    这些规则会**下调**权重，所以每一条都是潜在的绕过面：判据必须是攻击者
+    改不动的东西。两处加固：
+
+      1. URI 只拿 path 部分去匹配。原来是拿整条 URI（含 query）匹配
+         `\\.(js|css|png…)$`，于是 `/x.php?a=<payload>&z=.js` 直接 −100 分。
+      2. 已经有强证据（单条 ≥70 权重的指标，或污点流入 sink）时不再降权。
+         静态资源路径上出现 `union select` 这种东西，恰恰更值得看，而不是
+         更不值得看。
+    """
 
     WHITELIST_RULES = {
         'swagger_docs': {'uri_patterns': [r'/swagger', r'/api-docs', r'/openapi'], 'weight_adjustment': -50},
@@ -1676,25 +1776,48 @@ class ContextAnalyzer:
             context.is_json = is_json
             context.json_values = values
 
+    STRONG_EVIDENCE_WEIGHT = 70
+
+    @staticmethod
+    def _uri_path(uri: str) -> str:
+        """只取 path。query 和 fragment 是攻击者随手就能改的，不能进白名单判据。"""
+        if not uri:
+            return "/"
+        path = uri.split("#", 1)[0].split("?", 1)[0].strip()
+        return path or "/"
+
+    def _has_strong_evidence(self, result: DetectorResult) -> bool:
+        if result.tainted_sinks:
+            return True
+        return any(e.weight >= self.STRONG_EVIDENCE_WEIGHT for e in result.evidences)
+
     def apply_noise_reduction(self, result: DetectorResult, context: DetectionContext) -> DetectorResult:
 
         if context.is_json and not context.json_values:
             result.weight = int(result.weight * 0.5)
             result.tags.append("noise_reduced:empty_json")
 
+        strong = self._has_strong_evidence(result)
+        uri_path = self._uri_path(context.uri)
+
         for name, rule in self._compiled_rules.items():
             # Content-Type 匹配
             if rule['content_types'] and context.content_type not in rule['content_types']:
                 continue
 
-            # URI 匹配
+            # URI 匹配（只看 path）
             uri_matched = False
             for pattern in rule['uri_patterns']:
-                if pattern.search(context.uri):
+                if pattern.search(uri_path):
                     uri_matched = True
                     break
 
             if not uri_matched and rule['uri_patterns']:
+                continue
+
+            if rule['weight_adjustment'] < 0 and strong:
+                # 有硬证据时不降权，但要留痕：报告里能看出这条命中过白名单
+                result.tags.append(f"noise_rule_suppressed:{name}")
                 continue
 
             result.weight += rule['weight_adjustment']
@@ -1748,7 +1871,7 @@ class AttackDetector:
         if self._auto_decoder:
             try:
                 decode_result = self._auto_decoder.decode(
-                    sampled.samples[0][1] if sampled.samples else data,
+                    sampled.combined_bytes,
                     max_depth=ResourceLimits.MAX_DECODE_DEPTH
                 )
                 context.decoded_data = decode_result.final_data
@@ -1762,6 +1885,16 @@ class AttackDetector:
         else:
             context.decoded_data = data
             context.decoded_text = safe_decode(data)
+
+        # 采样过的话，把整段原文接回来做字面量覆盖。
+        #
+        # 递归解码只喂采样段是合理的（解码贵，且编码载荷基本从 body 开头起），
+        # 但**匹配**不能只看采样段：中间三个采样点各只有 4KB，攻击者把
+        # `union select` 放在 2MB 偏移处就整个消失了。字面量匹配是 O(n) 的，
+        # 分块扫描（_search_full）也已经不怕长文本，所以这里把原文补回去。
+        # 同一条规则最多产出一个 Evidence，重复覆盖不会重复计分。
+        if sampled.is_sampled:
+            context.decoded_text = self._extend_with_full_text(context, data)
         # 熵分析
         if self._entropy_analyzer:
             try:
@@ -1800,10 +1933,95 @@ class AttackDetector:
             except Exception as e:
                 logger.error(f"Detector {detector.ATTACK_TYPE.value} failed: {e}")
 
-        # 合并 + 降噪 + 输出
+        # 合并 + 降噪 + ML 研判 + 输出
         final_result = self._merge_results(all_results)
         final_result = self._context_analyzer.apply_noise_reduction(final_result, context)
-        return self._to_dict(final_result, context)
+        ml_verdict = self._apply_ml_fusion(final_result, context)
+        return self._to_dict(final_result, context, ml_verdict)
+
+    def _extend_with_full_text(self, context: DetectionContext, data: bytes) -> str:
+        """把整段 body 的原文接到解码结果后面，供全量字面量匹配用
+
+        超过 FULL_TEXT_CEILING 时只接前面那一段，并且**必须留痕**：
+        计进覆盖率审计 + 打 warning + 在结果里挂 tag，不能让"少看了"
+        看起来像"看完没事"。这个上限是纯粹的 OOM 兜底，不是性能开关。
+        """
+        ceiling = ResourceLimits.FULL_TEXT_CEILING
+        raw = data
+        truncated = False
+        if len(raw) > ceiling:
+            raw = raw[:ceiling]
+            truncated = True
+
+        try:
+            full_text = safe_decode(raw)
+        except Exception as e:
+            logger.debug(f"Full-body decode failed: {e}")
+            return context.decoded_text
+
+        if truncated:
+            context.coverage_truncated = True
+            logger.warning(
+                "HTTP body 共 %d 字节，超过全量匹配上限 %d，仅前 %d 字节参与"
+                "字面量匹配，本条结论不完整", len(data), ceiling, ceiling,
+            )
+            try:
+                from core.fast_filter import get_coverage_audit
+                get_coverage_audit().record(
+                    "attack_detector_full_text_ceiling", len(data), ceiling)
+            except Exception:
+                pass
+
+        if not context.decoded_text:
+            return full_text
+        return context.decoded_text + "\n" + full_text
+
+    def _apply_ml_fusion(self, result: "DetectorResult", context: DetectionContext):
+        """ML 研判：**只加分，不减分**
+
+        ml_scorer.fuse() 本身在灰区(30-70)内是可加可减的，但听澜是取证/威胁
+        狩猎工具，漏检的代价远大于误报。一个未经训练数据验证的模型（当前随包
+        发的是人工标定权重）不该有把真实检测压到告警阈值以下的权力，所以这里
+        把负向调整钳掉。
+
+        钳掉的只是"生效"，不是"记录"：ML 概率、贡献特征、以及被忽略的负向
+        建议都会完整写进结果，供人工研判参考。
+        """
+        if get_ml_scorer is None:
+            return None
+
+        try:
+            verdict = get_ml_scorer().fuse(
+                result.weight,
+                context.decoded_text,
+                method=context.method,
+                content_type=context.content_type,
+                uri=context.uri,
+            )
+        except Exception as e:
+            logger.debug(f"ML fusion skipped: {e}")
+            return None
+
+        if verdict is None:
+            return None
+
+        if verdict.applied and verdict.adjustment > 0:
+            # 这里原来是 min(result.weight + adjustment, 100)。当前撞不到这个
+            # 上限（ML 只在灰区 30-70 生效，加满 25 也才 95），但它是颗地雷：
+            # GRAY_HIGH 一旦上调，一条 weight=300 的 CRITICAL 会被"加分"操作
+            # 直接压成 100，也就是 MEDIUM。加分不该有能力降级。
+            result.weight = result.weight + verdict.adjustment
+            result.confidence = ThreatLevel.from_weight(result.weight).value
+            result.detected = result.weight >= 40
+            result.tags.append("ml_boosted")
+        elif verdict.adjustment < 0:
+            # 记录建议但不执行 —— ML 不得下调判定
+            verdict.reason = (verdict.reason
+                              + "；负向调整已忽略(ML 不得下调取证判定)")
+            verdict.applied = False
+            verdict.adjustment = 0
+
+        return verdict
 
     def _merge_results(self, results: List[DetectorResult]) -> DetectorResult:
         if not results:
@@ -1825,7 +2043,8 @@ class AttackDetector:
 
         return merged
 
-    def _to_dict(self, result: DetectorResult, context: DetectionContext) -> Dict[str, Any]:
+    def _to_dict(self, result: DetectorResult, context: DetectionContext,
+                 ml_verdict=None) -> Dict[str, Any]:
         threat_level = ThreatLevel.from_weight(result.weight)
 
         return {
@@ -1835,6 +2054,8 @@ class AttackDetector:
             'uri': context.uri,
             'total_weight': result.weight,
             'confidence': result.confidence,
+            # ML 研判留痕（只加分不减分，被忽略的负向建议也在 reason 里）
+            'ml': ml_verdict.to_dict() if ml_verdict is not None else None,
             'indicators': [e.to_indicator_dict() for e in result.evidences],
             'payloads': {
                 'decoded': {
@@ -1852,6 +2073,7 @@ class AttackDetector:
             'decode_chain': context.decode_chain,
             'decode_layers': context.decode_layers,
             'is_sampled': context.is_sampled,
+            'coverage_truncated': context.coverage_truncated,
             'is_binary_payload': context.is_binary_payload,
             'text_detection_skipped': context.text_detection_skipped,
             'skip_reason': context.skip_reason,
@@ -1942,6 +2164,7 @@ class AttackDetector:
             return
 
         context.ast_analyzed = True
+        _obs_incr("ast.attempted")
 
         if not self._ast_engine:
             return
@@ -1982,9 +2205,15 @@ class AttackDetector:
 
         # 跑AST
         try:
+            _obs_incr("ast.executed")
             ast_result = self._execute_shared_ast(text)
             if ast_result:
                 context.ast_result = ast_result
+                if getattr(ast_result, "dangerous_calls", None) or \
+                        getattr(ast_result, "findings", None):
+                    _obs_incr("ast.with_findings")
+                if getattr(ast_result, "is_likely_webshell", False):
+                    _obs_incr("ast.webshell")
                 if get_ast_cache:
                     get_ast_cache().set(text, ast_result)
         except Exception as e:

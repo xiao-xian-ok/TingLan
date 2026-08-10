@@ -7,6 +7,14 @@ import traceback
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 os.chdir(PROJECT_ROOT)
 
+# 分析跑在 QThread 里，是纯 Python 的 CPU 密集活。同时分析两个 pcap 时，
+# 两个工作线程和 UI 线程一起抢 GIL —— 实测 UI 线程的事件循环延迟 p90 能到
+# 180ms，界面就是一顿一顿的。默认切换间隔 5ms 意味着一个工作线程可以连续
+# 霸占 GIL 5ms 才被要求让出，降到 1ms 能显著压低 UI 线程的等待上限，
+# 代价是几个百分点的吞吐 —— 对界面响应来说这笔买卖很划算。
+# 只在 GUI 入口设置，不影响 MCP / 命令行用法。
+sys.setswitchinterval(0.001)
+
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 

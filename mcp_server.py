@@ -63,6 +63,7 @@ PHPASTEngine = _import('ast_engine', 'PHPASTEngine')[0]
 TsharkProcessHandler, StreamConfig, OutputFormat = _import('tshark_stream', 'TsharkProcessHandler', 'StreamConfig', 'OutputFormat')
 analyze_usb_traffic = _import('usb_analyzer', 'analyze_usb_traffic')[0]
 fix_cap_to_pcap = _import('fix_pcap', 'fix_cap_to_pcap')[0]
+find_tshark = _import('tshark_locator', 'find_tshark')[0]
 list_rtp_streams = _import('rtp_analyzer', 'list_rtp_streams')[0]
 export_rtp_stream = _import('rtp_analyzer', 'export_rtp_stream')[0]
 DNSCovertChannelAnalyzer = _import('protocol_analyzer', 'DNSCovertChannelAnalyzer')[0]
@@ -312,21 +313,32 @@ def _is_int(v) -> bool:
 
 
 def _find_tshark(explicit=None):
-    """查找tshark路径"""
+    """查找tshark路径
+
+    统一走 core/tshark_locator。它比这里内联一份硬编码路径表多做了几件事：
+    支持 WIRESHARK_PATH 环境变量、允许路径指向目录而非可执行文件本身、
+    展开 %ProgramFiles%、按平台选可执行名，而且有配套测试
+    (tests/test_tshark_locator.py)。内联表是它的子集，维护会漂移。
+
+    这里用 _import 而不是模块顶层 import：mcp_server 可能从不同 cwd 启动，
+    顶层 import 失败会直接让整个服务起不来。
+    """
+    if find_tshark:
+        found = find_tshark(explicit_path=explicit, project_root=PROJECT_ROOT)
+        if found:
+            return found
+        if explicit:
+            raise FileNotFoundError(f"tshark不存在: {explicit}")
+        raise FileNotFoundError("未找到TShark")
+
+    # 定位模块都导入不了时的最后兜底
     if explicit:
-        if os.path.exists(explicit): return explicit
+        if os.path.exists(explicit):
+            return explicit
         raise FileNotFoundError(f"tshark不存在: {explicit}")
-
     found = shutil.which("tshark")
-    if found: return found
-
-    for p in [r"C:\Program Files\Wireshark\tshark.exe",
-              r"C:\Program Files (x86)\Wireshark\tshark.exe",
-              r"D:\Program Files\Wireshark\tshark.exe",
-              r"D:\Wireshark\tshark.exe",
-              r"E:\internet_safe\wireshark\tshark.exe",
-              "/usr/bin/tshark", "/usr/local/bin/tshark", "/opt/homebrew/bin/tshark"]:
-        if os.path.exists(p): return p
+    if found:
+        return found
     raise FileNotFoundError("未找到TShark")
 
 

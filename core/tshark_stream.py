@@ -66,6 +66,7 @@ class OutputFormat(Enum):
 HTTP_REQUEST_FIELDS = [
     "frame.number",
     "frame.time",
+    "frame.time_epoch",
     "frame.protocols",
     "ip.src",
     "ip.dst",
@@ -86,6 +87,7 @@ HTTP_REQUEST_FIELDS = [
 HTTP_RESPONSE_FIELDS = [
     "frame.number",
     "frame.time",
+    "frame.time_epoch",
     "frame.protocols",
     "ip.src",
     "ip.dst",
@@ -223,6 +225,7 @@ def _packet_has_layer(packet, layer_name):  # hasattr替代方案
 class PacketData:
     frame_number: int = 0
     timestamp: str = ""
+    timestamp_epoch: float = 0.0   # frame.time_epoch，会话上下文排序用，缺失时为 0
     protocol: str = ""
     src_ip: str = ""
     dst_ip: str = ""
@@ -249,6 +252,10 @@ class PacketData:
 
     # 原始数据
     raw_ek_data: Dict[str, Any] = field(default_factory=dict)
+    # 该包 EK JSON 文本的字节数。用作"这个包在内存里占多少"的零成本代理指标：
+    # 实测解析成 Python dict 之后约为文本长度的 4~5 倍。累积大量包的路径
+    # （_run_webshell_ast_detection）靠它做内存预算，而不是拍一个包数上限。
+    ek_bytes: int = 0
     _wrapper: Optional[PacketWrapper] = field(default=None, repr=False)
 
     @property
@@ -266,6 +273,12 @@ class StreamConfig:
     output_format: OutputFormat = OutputFormat.EK
     read_timeout: float = 0.1               # 管道读取超时(秒)
     max_packets: int = 0                    # 最大包数 (0=无限)
+    # tshark 首个可解析数据包的等待上限。这是**防进程卡死**的兜底，不是性能开关。
+    # 千万别调小：带 display_filter 读大文件时，tshark 可能要扫过几十万个包
+    # 才吐出第一个匹配项。一旦误触发，读取循环会直接结束并返回 0 个包，
+    # 既不报错也不告警——分析结果会静默变成"未发现威胁"。
+    # 历史上这里是 5.0 秒，在机器有负载时就能稳定复现空结果。
+    first_data_timeout: float = 120.0
     fields: List[str] = field(default_factory=list)  # 自定义字段列表
 
     decode_as: Dict[str, str] = field(default_factory=dict)
@@ -467,11 +480,18 @@ class PacketParser:
 
             packet = PacketData()
             packet.raw_ek_data = data
+            try:
+                packet.ek_bytes = len(line)
+            except TypeError:
+                packet.ek_bytes = 0
 
             frame = layers.get("frame", {})
             fn = frame.get("frame_frame_number", [0])
             packet.frame_number = int(fn[0]) if isinstance(fn, list) and fn else 0
             packet.timestamp = PacketParser._get_first(frame, "frame_frame_time", "")
+            packet.timestamp_epoch = PacketParser._safe_float(
+                PacketParser._get_first(frame, "frame_frame_time_epoch", "")
+            )
             packet.length = int(PacketParser._get_first(frame, "frame_frame_len", 0))
             protocols = PacketParser._get_first(frame, "frame_frame_protocols", "")
             packet.protocol = protocols.split(":")[-1].upper() if protocols else ""
@@ -539,6 +559,9 @@ class PacketParser:
             packet = PacketData()
             packet.frame_number = PacketParser._safe_int(record.get("frame.number", ""))
             packet.timestamp = record.get("frame.time", "")
+            packet.timestamp_epoch = PacketParser._safe_float(
+                record.get("frame.time_epoch", "")
+            )
             protocols = record.get("frame.protocols", "")
             packet.protocol = protocols.split(":")[-1].upper() if protocols else ""
             packet.src_ip = record.get("ip.src", "")
@@ -552,6 +575,12 @@ class PacketParser:
             packet.http_uri = record.get("http.request.uri", "")
             packet.http_host = record.get("http.host", "")
             packet.http_content_type = record.get("http.content_type", "")
+            # 这个字段**不在** HTTP_RESPONSE_FIELDS 里（部分 tshark 版本没有
+            # http.content_disposition，加进字段表会让整行错列，有测试专门
+            # 盯着这一点）。这里仍然读一次：调用方如果自带了该字段，下面的
+            # is_response 判据才不是一句永远为假的死代码；拿不到时由
+            # stream_worker._response_content_disposition 从 response.line 兜底。
+            packet.http_content_disposition = record.get("http.content_disposition", "")
             packet.http_user_agent = record.get("http.user_agent", "")
             packet.http_cookie = record.get("http.cookie", "")
             packet.http_request_in = record.get("http.request_in", "")
@@ -590,7 +619,24 @@ class PacketParser:
             return default
 
     @staticmethod
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value) if value not in (None, "") else default
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
     def _decode_field_data(value: Any) -> bytes:
+        """把 `-T fields` 里的字节型字段还原成 bytes
+
+        tshark 的字节字段输出形态是**冒号分隔的十六进制**（`3c:3f:70:68:70`）。
+        原来的判据只看"长度是偶数且能被 int(,16) 解析"，于是一串纯数字的正文
+        （比如 body 里的 `20250101`）会被当成 hex 解成 4 个乱码字节 —— 明文
+        直接被毁掉，后面的规则匹配自然什么也看不到。
+
+        现在要求：要么带冒号（tshark 的真实输出形态），要么至少含一个 a-f
+        十六进制字母。纯十进制数字串一律按文本处理。
+        """
         if value in (None, ""):
             return b""
         if isinstance(value, bytes):
@@ -600,13 +646,17 @@ class PacketParser:
         if not text:
             return b""
 
+        has_separator = ":" in text
         hex_value = text.replace(":", "")
-        is_hex = len(hex_value) % 2 == 0
+        is_hex = bool(hex_value) and len(hex_value) % 2 == 0
         if is_hex:
             try:
                 int(hex_value, 16)
             except ValueError:
                 is_hex = False
+        if is_hex and not has_separator:
+            # 纯数字串既是合法 hex 也是合法正文，此时按正文处理更安全
+            is_hex = any(ch in "abcdefABCDEF" for ch in hex_value)
         if is_hex:
             try:
                 return bytes.fromhex(hex_value)
@@ -706,7 +756,7 @@ class TsharkProcessHandler:
                 if errors:
                     raise TsharkProcessError("; ".join(errors))
 
-            first_data_timeout = 5.0
+            first_data_timeout = config.first_data_timeout
             start_time = time.time()
             got_first_packet = False
             line_count = 0
@@ -722,6 +772,14 @@ class TsharkProcessHandler:
                 if not got_first_packet:
                     elapsed = time.time() - start_time
                     if elapsed >= first_data_timeout:
+                        # 静默 break 会让上层拿到 0 个包却以为"文件里没有匹配流量"。
+                        # 取证场景下这等于凭空丢证据，必须出声。
+                        logger.warning(
+                            "tshark 在 %.0fs 内没有产出可解析的数据包，提前结束读取"
+                            "(display_filter=%r)。若该文件确实含匹配流量，说明"
+                            "first_data_timeout 设小了，本次结果不完整。",
+                            first_data_timeout, config.display_filter or "<none>"
+                        )
                         break
 
                 try:
@@ -735,6 +793,11 @@ class TsharkProcessHandler:
                     continue
 
                 line_count += 1
+                # tshark 还在产出就说明没卡死，重置计时。
+                # 只用 got_first_packet 判断的话，"正在扫但还没扫到匹配项"
+                # 这种完全正常的状态会被误判成卡死。
+                if not got_first_packet:
+                    start_time = time.time()
 
                 try:
                     line_str = line.decode('utf-8', errors='replace').strip()

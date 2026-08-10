@@ -4991,9 +4991,39 @@ class ProtocolAnalyzerManager:
         ProtocolType.TLS: frozenset({"TLS", "SSL"}),
         ProtocolType.RDP: frozenset({"RDP"}),
         ProtocolType.REDIS: frozenset({"REDIS"}),
-        ProtocolType.SMB: frozenset({"SMB", "SMB2"}),
+        # NTLMSSP 不只出现在 SMB 上（HTTP NTLM 认证同样会带），而 SMBAnalyzer
+        # 的两趟 ntlmssp 扫描正是靠它抓 NetNTLM 哈希。别名里必须带上，
+        # 否则"只有 HTTP NTLM、没有 SMB"的抓包会被门控误伤。
+        ProtocolType.SMB: frozenset({"SMB", "SMB2", "NTLMSSP"}),
         ProtocolType.SSH: frozenset({"SSH"}),
     }
+
+    # 允许按协议分级统计做门控的分析器。
+    #
+    # 判据只有一条：**这个分析器的每一次 tshark 调用都带协议层过滤**。
+    # 满足了才能说"该协议层帧数为 0 → 分析器扫也扫不出东西"，跳过是
+    # "看完之后可证明安全"，而不是"没看所以不知道"。
+    #
+    # 下面四个分析器**故意不在名单里**，别顺手加进来：
+    #   TLS   —— keylog 提取跑的是 `-Y http` 和 `-Y tcp.payload`，
+    #            还有 `--export-objects http`，跟有没有 TLS 层无关
+    #   RDP   —— 有 `-Y tcp.port == 3389` 的裸端口路径
+    #   REDIS —— 有 `-Y tcp.port == 6379` 的裸端口路径
+    #   SSH   —— 有 `-Y tcp.dstport == 22 && tcp.flags.syn == 1` 的连接尝试
+    #            路径；爆破/端口扫描恰恰是**没有** ssh 握手的那种流量
+    _LAYER_GATED_ANALYZERS = frozenset({
+        ProtocolType.ICMP,
+        ProtocolType.DNS,
+        ProtocolType.FTP,
+        ProtocolType.MMS,
+        ProtocolType.BLUETOOTH,
+        ProtocolType.SMTP,
+        ProtocolType.SMB,
+        # USB 那一趟不带 -Y，但它只把长度为 8/12/16 的十六进制行当 HID
+        # 报文解释；没有 USB 层时这些行要么不存在、要么是别的协议的 data
+        # 被当成鼠标坐标的垃圾输出，跳过反而更准。
+        ProtocolType.USB,
+    })
 
     # These analyzers use ProtocolAnalyzer.analyze_pcap(), whose packet loop
     # only examines the listed protocol layers. Filtering is therefore
@@ -5053,6 +5083,46 @@ class ProtocolAnalyzerManager:
             if observed.intersection(aliases)
         }
 
+    @classmethod
+    def select_runnable_protocols(
+        cls,
+        candidates: Iterable[ProtocolType],
+        protocol_counts: Optional[Dict[str, int]] = None,
+    ) -> Tuple[set, set]:
+        """按 `-z io,phs` 的分级统计裁掉跑了也没用的分析器。
+
+        返回 (要跑的, 被跳过的)。
+
+        这是听澜里少数几个**允许**的跳过之一，理由必须站得住：
+        `io,phs` 统计的是 tshark 自己的协议树分层结果，某协议层在整个文件里
+        帧数为 0，意味着 tshark 根本没解出这一层，那么任何 `-Y <该层>` 的
+        过滤器都必然匹配 0 个包 —— 分析器跑与不跑的**结果集完全相同**，
+        省掉的是一趟全文件 tshark 解析，不是可见性。
+
+        两条安全边界：
+          1. 只对 `_LAYER_GATED_ANALYZERS` 里的分析器生效。带裸端口/裸
+             SYN 路径的（TLS/RDP/Redis/SSH）一律照跑。
+          2. 拿不到统计（`protocol_counts` 为空 = 统计失败）时**全部照跑**。
+             "统计没出来"和"确实没有这个协议"是两回事，不能混。
+        """
+        wanted = set(candidates)
+        if not protocol_counts:
+            return wanted, set()
+
+        observed = {str(name).upper() for name in protocol_counts if protocol_counts[name]}
+
+        runnable, skipped = set(), set()
+        for protocol in wanted:
+            aliases = cls._PROTOCOL_STAT_ALIASES.get(protocol)
+            if protocol not in cls._LAYER_GATED_ANALYZERS or not aliases:
+                runnable.add(protocol)      # 门控管不到的，一律照跑
+                continue
+            if observed.intersection(aliases):
+                runnable.add(protocol)
+            else:
+                skipped.add(protocol)
+        return runnable, skipped
+
     @staticmethod
     def _normalize_enabled_protocols(
         enabled_protocols: Iterable[ProtocolType],
@@ -5103,6 +5173,12 @@ class ProtocolAnalyzerManager:
         max_workers: Optional[int] = None,
         **kwargs,
     ) -> Dict[ProtocolType, ProtocolAnalysisResult]:
+        """旧名字的兼容壳，直接转发给 analyze_all_pcap。
+
+        这个 return 后面原来跟着约 25 行**不可达代码**（含一份 docstring 和
+        一个完整的 analyze_one 定义），是早期实现残留。删掉，免得后来人以为
+        那才是真正在跑的逻辑。
+        """
         return self.analyze_all_pcap(
             pcap_path,
             enabled_protocols=enabled_protocols,
@@ -5111,37 +5187,10 @@ class ProtocolAnalyzerManager:
             max_workers=max_workers,
             **kwargs,
         )
-        """对pcap文件运行所有注册分析器，避免一次性物化全部数据包。"""
-        results = {}
-        selected = None
-        if enabled_protocols is not None:
-            selected = self._normalize_enabled_protocols(enabled_protocols)
 
-        analyzers = [
-            (protocol, analyzer)
-            for protocol, analyzer in self._analyzers.items()
-            if selected is None or protocol in selected
-        ]
-        total_analyzers = len(analyzers)
-
-        def analyze_one(protocol, analyzer):
-            try:
-                analyzer_kwargs = dict(kwargs)
-                display_filter = self._BASE_ANALYZER_FILTERS.get(protocol)
-                if display_filter and "display_filter" not in analyzer_kwargs:
-                    analyzer_kwargs["display_filter"] = display_filter
-                result = analyzer.analyze_pcap(pcap_path, **analyzer_kwargs)
-                return result
-            except NotImplementedError:
-                logger.debug(f"{protocol.value}分析器不支持此调用方式")
-            except Exception as e:
-                logger.error(f"{protocol.value}协议分析异常: {e}")
-        return results
-
-
-# ============================================================
-# 便捷函数
-# ============================================================
+    # 注意：下面的 analyze_all_pcap 仍然是本类的方法。
+    # 它原本被一个顶格（列 0）的注释块隔开，Python 不因注释缩进结束类体，
+    # 所以能跑，但极易被误读成模块级函数 —— 注释块已经挪走。
 
     def analyze_all_pcap(
         self,
@@ -5205,6 +5254,11 @@ class ProtocolAnalyzerManager:
                 if progress_callback:
                     progress_callback(index, total_analyzers, protocol)
         return results
+
+
+# ============================================================
+# 便捷函数
+# ============================================================
 
 
 def analyze_icmp(packets: List) -> ProtocolAnalysisResult:

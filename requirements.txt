@@ -3,6 +3,9 @@ PySide6==6.6.0
 pyshark>=0.6
 jinja2>=3.1.0
 pyahocorasick
+# 内存看护用（core/memory_guard.py）。缺失时看护静默降级为"永远 ok"，
+# 分析照常跑，只是大包时没有内存告警和自动降级保护。
+psutil>=5.9.0
 
 # MCP Server Dependencies
 mcp>=1.0.0

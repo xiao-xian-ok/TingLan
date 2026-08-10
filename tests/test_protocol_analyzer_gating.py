@@ -152,3 +152,76 @@ def test_analyze_all_pcap_can_run_analyzers_in_parallel() -> None:
     )
 
     assert set(results) == set(protocols)
+
+
+# ------------------------------------------------ 按 io,phs 统计门控分析器
+#
+# 这是听澜里少数几个允许的"跳过"，边界必须锁死：只能跳过那些每一次 tshark
+# 调用都带协议层过滤的分析器，且统计拿不到时一律照跑。
+
+
+SELECT = ProtocolAnalyzerManager.select_runnable_protocols
+ALL_DEEP = [
+    ProtocolType.FTP, ProtocolType.MMS, ProtocolType.BLUETOOTH,
+    ProtocolType.SMTP, ProtocolType.USB, ProtocolType.SMB,
+    ProtocolType.TLS, ProtocolType.RDP, ProtocolType.REDIS, ProtocolType.SSH,
+]
+
+
+def test_missing_protocol_layer_is_skipped() -> None:
+    """纯 HTTP 抓包不该再为 FTP/SMTP/USB 各扫一趟全文件"""
+    runnable, skipped = SELECT(ALL_DEEP, {"HTTP": 500, "TCP": 900, "ETH": 900})
+
+    assert ProtocolType.FTP in skipped
+    assert ProtocolType.SMTP in skipped
+    assert ProtocolType.USB in skipped
+    assert ProtocolType.MMS in skipped
+
+
+def test_present_protocol_layer_still_runs() -> None:
+    runnable, skipped = SELECT(ALL_DEEP, {"HTTP": 10, "FTP": 3, "SMB2": 7})
+
+    assert ProtocolType.FTP in runnable
+    assert ProtocolType.SMB in runnable
+    assert ProtocolType.FTP not in skipped
+
+
+def test_port_based_analyzers_are_never_gated() -> None:
+    """TLS/RDP/Redis/SSH 有裸端口或裸 SYN 路径，不带协议层也能出东西"""
+    runnable, skipped = SELECT(ALL_DEEP, {"HTTP": 500, "ETH": 500})
+
+    for protocol in (ProtocolType.TLS, ProtocolType.RDP,
+                     ProtocolType.REDIS, ProtocolType.SSH):
+        assert protocol in runnable, f"{protocol.value} 不允许被协议层门控"
+        assert protocol not in skipped
+
+
+def test_ntlm_over_http_keeps_smb_analyzer_alive() -> None:
+    """只有 HTTP NTLM 认证、没有 SMB 时，SMB 分析器仍要跑（它抓的是哈希）"""
+    runnable, _skipped = SELECT(ALL_DEEP, {"HTTP": 20, "NTLMSSP": 4})
+
+    assert ProtocolType.SMB in runnable
+
+
+def test_missing_stats_runs_everything() -> None:
+    """统计失败 != 没有这些协议，必须全部照跑"""
+    for empty in ({}, None):
+        runnable, skipped = SELECT(ALL_DEEP, empty)
+        assert skipped == set()
+        assert runnable == set(ALL_DEEP)
+
+
+def test_zero_count_layer_is_treated_as_absent() -> None:
+    runnable, skipped = SELECT([ProtocolType.FTP], {"FTP": 0, "HTTP": 9})
+
+    assert ProtocolType.FTP in skipped
+    assert runnable == set()
+
+
+def test_unknown_protocol_without_alias_always_runs() -> None:
+    """别名表里没登记的协议要默认跑，查表落空不能变成跳过"""
+    runnable, skipped = SELECT([ProtocolType.HTTP], {"FTP": 3})
+
+    assert ProtocolType.HTTP in runnable
+    assert skipped == set()
+
