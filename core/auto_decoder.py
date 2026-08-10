@@ -12,7 +12,7 @@ import re
 import math
 import codecs
 import logging
-from typing import List, Optional, Tuple, Dict, Any
+from typing import Callable, List, Optional, Tuple, Dict, Any
 from dataclasses import dataclass, field
 from enum import Enum
 from collections import Counter
@@ -51,6 +51,9 @@ class DecodingMethod(Enum):
 class DecodingCheck:
     method: DecodingMethod
     pattern: Optional[re.Pattern] = None
+    # 有些判据用正则表达是错的（比如"至少 N 个 %XX"），给一个可调用的口子。
+    # 设了 predicate 就以它为准，不再跑 pattern。
+    predicate: Optional[Callable[[str], bool]] = None
     args: Dict[str, Any] = field(default_factory=dict)
     entropy_range: Optional[Tuple[float, float]] = None
     min_length: int = 4
@@ -153,7 +156,35 @@ HEX_PATTERNS = [
 ]
 
 # URL编码，至少4个%XX
-URL_PATTERN = re.compile(r'.*(?:%[0-9A-Fa-f]{2}.*){4}')
+# 单个 URL 转义序列。线性，没有可回溯的空间。
+URL_PATTERN = re.compile(r'%[0-9A-Fa-f]{2}')
+
+# 判据是"文本里至少有 4 个 %XX"，这件事**不该用一条正则表达**。
+#
+# 原来写的是 `.*(?:%[0-9A-Fa-f]{2}.*){4}` —— 教科书级的灾难性回溯：开头一个
+# `.*`，重复组 `{4}` 里又是 `.*`，引擎要穷举"这 4 个 %XX 分别落在哪里"的所有
+# 切分。在不含 %XX 的文本上（base64 密文、JSP 页面）61KB 输入要 **23.9 秒**，
+# 把 AttackDetector 的 5 秒预算整个烧光，10 个检测器一个都没跑起来 ——
+# 日志表现是"检测超时，以下检测器未执行：<全部>"，看着像检测器坏了。
+#
+# 第一次改写用的是 `(?:[^%]*%[0-9A-Fa-f]{2}){4}`，看着"没有嵌套 `.*`"，
+# 实际仍是 O(n²)：文本里没有 `%` 时，`[^%]*` 在**每一个起始位置**都扫到串尾
+# 才失败。64KB 上 1.3 秒。**"看起来线性"不等于线性，得量。**
+#
+# 数一遍、够了就停，才是这件事真正的复杂度。
+_MIN_URL_ESCAPES = 4
+
+
+def looks_url_encoded(text: str, need: int = _MIN_URL_ESCAPES) -> bool:
+    """文本里是否出现至少 need 个 %XX（数够就停，不扫完）"""
+    if not text:
+        return False
+    count = 0
+    for _ in URL_PATTERN.finditer(text):
+        count += 1
+        if count >= need:
+            return True
+    return False
 
 # Binary 8位一组
 BINARY_PATTERNS = [
@@ -199,10 +230,15 @@ FLAG_PATTERNS = [
     re.compile(r'flag\{[^}]+\}', re.IGNORECASE),
     re.compile(r'ctf\{[^}]+\}', re.IGNORECASE),
     re.compile(r'key\{[^}]+\}', re.IGNORECASE),
-    # MD5，排除纯二进制串
-    re.compile(r'(?=.*[2-9a-f])[a-f0-9]{32}', re.IGNORECASE),
-    # SHA256
-    re.compile(r'(?=.*[2-9a-f])[a-f0-9]{64}', re.IGNORECASE),
+    # MD5 / SHA256，排除纯二进制串（只由 0/1 组成的等长串）。
+    #
+    # 原写法是 `(?=.*[2-9a-f])[a-f0-9]{32}`：前瞻里的 `.*` 让引擎在**每一个
+    # 起始位置**都把剩余全文重扫一遍，是 O(n²)，61KB 上单条 0.5 秒。
+    # 而且语义也不对——它检查的是"这一行后面某处有非 0/1 字符"，而不是
+    # "这 32 个字符里有非 0/1 字符"，注释说的排除条件根本没生效。
+    # 改成有界前瞻：只在这一串自己的 32/64 个字符里找，线性且符合本意。
+    re.compile(r'(?=[a-f0-9]{0,31}[2-9a-f])[a-f0-9]{32}', re.IGNORECASE),
+    re.compile(r'(?=[a-f0-9]{0,63}[2-9a-f])[a-f0-9]{64}', re.IGNORECASE),
 ]
 
 # 英文字母频率，算chi-squared用
@@ -226,6 +262,41 @@ MORSE_TABLE = {
     '.....': '5', '-....': '6', '--...': '7', '---..': '8', '----.': '9',
     '-----': '0', ' ': ' '
 }
+
+
+# 高价值内容标记：解出这些东西就是有价值的结果，不该被整体乱码率淹没。
+#
+# 这是修"前缀填充打掉解码链"用的。`'A'*50 + base64(shell)` 解出来是
+# 「一堆 NUL + 真 shell」，乱码率一高就被 _output_check_passes 挡在门外、
+# 也在打分时输给"不解码"。但对取证来说，**结果里有没有 `<?php eval(`
+# 比"��体好不好看"重要得多**。
+_HIGH_VALUE_MARKERS = (
+    b"<?php", b"<?=", b"<%@", b"<script", b"eval(", b"assert(", b"system(",
+    b"exec(", b"shell_exec(", b"passthru(", b"popen(", b"proc_open(",
+    b"base64_decode(", b"gzinflate(", b"$_post", b"$_get", b"$_request",
+    b"php://input", b"flag{", b"ctf{", b"key{",
+    b"union select", b"/etc/passwd", b"cmd.exe", b"/bin/sh", b"powershell",
+)
+
+
+def contains_high_value(data: bytes) -> bool:
+    """解码结果里有没有一眼就值钱的东西"""
+    if not data:
+        return False
+    lowered = data.lower()
+    return any(marker in lowered for marker in _HIGH_VALUE_MARKERS)
+
+
+# 各编码的"候选子串"形态。用来在**整段不是一条完整编码**时捞回嵌在里面的那段。
+_EMBEDDED_RUNS = (
+    ("base64", re.compile(rb'[A-Za-z0-9+/]{24,}={0,2}'), 4),
+    ("base64url", re.compile(rb'[A-Za-z0-9\-_]{24,}={0,2}'), 4),
+    ("hex", re.compile(rb'[0-9A-Fa-f]{32,}'), 2),
+)
+
+# 这里**故意没有段数上限**。每段的开销正比于段长，总开销是 O(块数 × 总长)，
+# 与段数无关；加一个"最多看 N 段"只会变成新的可绕过上限 —— 攻击者在前面垫
+# 64 段短 base64，真 payload 就永远排在后面。
 
 
 class AutoDecoder:
@@ -299,7 +370,7 @@ class AutoDecoder:
         # URL编码
         checks.append(DecodingCheck(
             method=DecodingMethod.URL,
-            pattern=URL_PATTERN,
+            predicate=looks_url_encoded,
             min_length=4,
             priority=25
         ))
@@ -432,8 +503,11 @@ class AutoDecoder:
                     else:
                         continue
 
-            # 正则匹配
-            if check.pattern:
+            # 判据：predicate 优先
+            if check.predicate is not None:
+                if not check.predicate(text):
+                    continue
+            elif check.pattern:
                 if not check.pattern.search(text):
                     continue
             else:
@@ -564,24 +638,20 @@ class AutoDecoder:
         if max_depth is None:
             max_depth = self.MAX_DEPTH
 
-        # 纯重复字符的数据跳过，不可能是编码
-        if len(data) > 100:
-            try:
-                text = data.decode('utf-8', errors='ignore')
-                if len(text) > 100:
-                    sample = text[:500]
-                    char_counts = {}
-                    for c in sample:
-                        char_counts[c] = char_counts.get(c, 0) + 1
-                    if char_counts:
-                        max_count = max(char_counts.values())
-                        # 80%以上是同一字符就算了
-                        if max_count / len(sample) > 0.8:
-                            result = DecodingResult(original_data=data, final_data=data)
-                            self._analyze_result(result, None)
-                            return result
-            except:
-                pass
+        # 只有**整个 buffer 从头到尾都是同一个字节**时才跳过。
+        #
+        # 这里原来的判据是"前 500 字符里某个字符占比 > 80% 就整段放弃"，
+        # 是教科书级的可绕过上限：判据只看前 500 字符，结论却作用于整个 body。
+        # 攻击者在开头垫 400 个 'A'、后面挂任意长度的编码 payload，整条解码链
+        # 一次都不会跑，而且 return 的是个 chain=RAW 的正常结果，**不留任何痕迹**。
+        #
+        # 现在的判据是可证明安全的：单一字节重复到底的数据里装不下任何信息，
+        # 解出来也只能是同一个字节的重复。用 bytes.count 走 C 层，O(n) 但常数极低。
+        if len(data) > 100 and data.count(data[0:1]) == len(data):
+            logger.debug("整段数据是单一字节重复 %d 次，跳过解码", len(data))
+            result = DecodingResult(original_data=data, final_data=data)
+            self._analyze_result(result, None)
+            return result
 
         # 编译crib
         crib_pattern = None
@@ -602,12 +672,97 @@ class AutoDecoder:
                 for r in results:
                     if r.flags_found:
                         return r
-            return best
+            if best.total_layers > 0:
+                return best
+
+        # 整段没解出东西 —— 再试一次"嵌在里面的那段"
+        salvaged = self._salvage_embedded(data, crib_pattern)
+        if salvaged is not None:
+            return salvaged
+
+        if results:
+            return results[0]
 
         # 啥也解不出来
         result = DecodingResult(original_data=data, final_data=data)
         self._analyze_result(result, crib_pattern)
         return result
+
+    def _salvage_embedded(self, data: bytes,
+                          crib_pattern=None) -> Optional[DecodingResult]:
+        """整段解不出来时，捞回**嵌在里面**的那段编码内容。
+
+        为什么需要这一步：`find_matching_ops` 的判据是"**整个 buffer** 是不是
+        一条完整编码"（BASE64_PATTERNS 等都带 `^...$`）。攻击者在 payload 前面
+        垫几十个字符，两道闸门会依次关上：
+
+          1. 垫的字符数不是 4 的倍数 → 整串长度对不齐 → base64 的整串正则不匹配
+             → **这一层压根不会被尝试**（实测 20 个字符就够）
+          2. 就算对齐了，解出来是「一堆 NUL + 真 shell」，乱码率把它挡在
+             `_output_check_passes` 外面，打分时也输给"不解码"
+
+        所以这里换个提问方式：不问"整段是不是 base64"，而问"里面有没有一段
+        是 base64"。找出足够长的编码字符游程，对每种对齐方式各试一次
+        （base64 只有 4 种，hex 只有 2 种，是常数次）。
+
+        **只在解出高价值内容时才采纳**（`<?php` / `eval(` / `flag{` …），
+        避免把随机的 base64 样字符串解成垃圾当结果 —— 这条兜底是为"填充绕过"
+        准备的，不是为了扩大召回面而降低精度。
+        """
+        if not data or len(data) < 24:
+            return None
+
+        seen_runs = 0
+        for name, run_re, block in _EMBEDDED_RUNS:
+            for match in run_re.finditer(data):
+                run = match.group(0)
+                if len(run) < 24:
+                    continue
+                # 单一字符重复的游程解出来只能是单一字节的重复，装不下任何
+                # 标记（所有标记都至少有两个不同字符）。这个跳过是可证明安全的，
+                # 而且专治 `'A'*4096` 这类填充 —— 不然光解它们就要几百毫秒。
+                if run.count(run[0:1]) == len(run):
+                    continue
+                seen_runs += 1
+                for offset in range(block):
+                    decoded = self._try_run(name, run, offset, block)
+                    if decoded is None or not contains_high_value(decoded):
+                        continue
+                    step = DecodingStep(
+                        method=(DecodingMethod.HEX if name == "hex"
+                                else DecodingMethod.BASE64_URL if name == "base64url"
+                                else DecodingMethod.BASE64),
+                        input_data=run, output_data=decoded, success=True,
+                        metadata={"embedded_offset": match.start() + offset},
+                    )
+                    result = DecodingResult(
+                        original_data=data, final_data=decoded,
+                        steps=[step], total_layers=1,
+                    )
+                    self._analyze_result(result, crib_pattern)
+                    result.is_meaningful = True
+                    logger.debug(
+                        "嵌入 %s 探测命中：原文偏移 %d，解出 %d 字节",
+                        name, match.start() + offset, len(decoded))
+                    return result
+        return None
+
+    @staticmethod
+    def _try_run(name: str, run: bytes, offset: int, block: int) -> Optional[bytes]:
+        """按给定对齐方式解一段游程；解不动返回 None"""
+        chunk = run[offset:]
+        usable = len(chunk) - (len(chunk) % block)
+        if usable < 16:
+            return None
+        chunk = chunk[:usable]
+        try:
+            if name == "hex":
+                return binascii.unhexlify(chunk)
+            if name == "base64url":
+                return base64.urlsafe_b64decode(chunk + b"=" * (-len(chunk) % 4))
+            return base64.b64decode(chunk, validate=True)
+        except Exception:
+            return None
 
     def decode_text(self, text: str, max_depth: int = None, crib: str = None) -> DecodingResult:
         try:

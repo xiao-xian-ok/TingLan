@@ -88,6 +88,16 @@ class DetailTable(QWidget):
         self.type_filter.currentIndexChanged.connect(self._onTypeFilterChanged)
         toolbar.addWidget(self.type_filter)
 
+        # 研判结论过滤。真实现场里绝大多数命中是扫描器噪声，
+        # "只看得手的"是把一屏红色收敛成几条的最快办法。
+        self.outcome_filter = QComboBox()
+        self.outcome_filter.addItems([
+            "全部研判", "确认得手", "疑似得手", "得手(确认+疑似)", "未生效", "未研判",
+        ])
+        self.outcome_filter.setStyleSheet(self.type_filter.styleSheet())
+        self.outcome_filter.currentIndexChanged.connect(self._onOutcomeFilterChanged)
+        toolbar.addWidget(self.outcome_filter)
+
         layout.addLayout(toolbar)
 
         # 表格视图
@@ -210,6 +220,19 @@ class DetailTable(QWidget):
     def _onFilterTextChanged(self, text: str):
         """过滤文本变化"""
         self.proxy_model.setFilterText(text)
+        self._updateCount()
+
+    def _onOutcomeFilterChanged(self, index: int):
+        """研判结论过滤变化"""
+        outcome_map = {
+            0: [],                              # 全部
+            1: ["confirmed"],
+            2: ["suspected"],
+            3: ["confirmed", "suspected"],
+            4: ["failed"],
+            5: ["", "unknown"],                 # 没研判过 / 证据不足
+        }
+        self.proxy_model.setFilterOutcomes(outcome_map.get(index, []))
         self._updateCount()
 
     def _onTypeFilterChanged(self, index: int):

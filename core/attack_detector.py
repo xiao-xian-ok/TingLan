@@ -56,6 +56,20 @@ except ImportError:
     except ImportError:
         get_ml_scorer = None
 
+try:
+    from core.pattern_prefilter import global_plan, register_patterns
+except ImportError:
+    try:
+        from pattern_prefilter import global_plan, register_patterns
+    except ImportError:  # pragma: no cover - 拿不到就退化成全量执行
+        _PREFILTER_NAMES = set()
+
+        def register_patterns(qualified):
+            _PREFILTER_NAMES.update(qualified)
+
+        def global_plan(_text):
+            return {name: None for name in _PREFILTER_NAMES}
+
 # 观测中心可选。热路径上调用，所以包一层不抛异常的薄封装。
 try:
     from core.observability import get_observability_hub
@@ -144,44 +158,41 @@ def safe_decode(data: bytes, encoding: str = 'utf-8') -> str:
 
 
 def search_full(pattern: Pattern, text: str) -> Optional[re.Match]:
-    """全量搜索：短文本直接 search，长文本分块 + 重叠扫，返回第一个命中。
+    """全量搜索：直接在整段文本上跑，语义等价于 `pattern.search(text)`。
 
-    这是全库唯一允许的"长文本怎么跑正则"的答案。原来的做法是
-    `text[:50KB] + text[-50KB:]`，中段永远不过正则 —— 把 payload 放在
-    50KB 之后就绕过了，而长度完全由攻击者决定。
+    ── 为什么这里没有分块 ──
 
-    分块会凭空造出字符串首尾，`$` / `^` 这类锚点会在人为边界上假命中
-    （比如 SQLi 的 `--\\s{0,3}$`）。解法：非末块丢弃"贴着块尾结束"的命中、
-    非首块丢弃"贴着块首开始"的命中 —— 这类命中必然完整落在相邻块的重叠区
-    里并在那一块被正常捕获，所以只是去重不是丢证据。
+    这个函数的前身做过两件事，先后都被证明是错的：
+
+    1. 最早是 `text[:50KB] + text[-50KB:]`，中段永远不过正则 —— 把 payload
+       放在 50KB 之后即可绕过，长度完全由攻击者决定。
+
+    2. 改成"分块 + 8KB 重叠扫，丢弃贴着块边界的命中"。丢弃规则的理由是
+       "这类命中必然完整落在相邻块的重叠区里"，但那只在**命中长度 ≤ 重叠宽度**
+       时成立。实测两条真实规则（file_upload 的 `boundary=[-\\w]+` 和
+       `Content-Disposition...filename=...`）带无界量词、且匹配的是攻击者
+       完全可控的内容：命中长度超过重叠宽度就在两边都被丢，命中长度超过
+       块长时更是任何块都装不下 —— 一条 Evidence 凭空消失，合并权重掉到
+       40 以下就是**整条检测消失**。
+
+    根子在于"分块"给正确性引入了一个隐含不变量：**重叠宽度必须大于任何规则
+    可能的最长命中**。这个不变量没人守得住（任何人加一条带 `.*` 的规则就破
+    了），而且它换来的收益是负的 —— 分块要把文本复制成几百个块、重叠区被
+    反复扫描，比让 re 自己线性扫一遍还慢。
+
+    所以正确的做法是把这个不变量整个消掉：re 的 `search` 本身就没有长度上限，
+    直接用它。这样"覆盖面"不再依赖任何常量，也不会因为规则库变化而变化。
+
+    ── 仍然存在的取舍 ──
+
+    输入很大时（`_extend_with_full_text` 最多接 64MB 原文）这一趟会很慢，
+    但那是**时间**问题不是**覆盖**问题，且分块并不能减少总工作量。全局的
+    wall-clock 兜底口径见 `AttackDetector.detect` 里的 TOTAL_TIMEOUT_S。
     """
-    limit = ResourceLimits.MAX_REGEX_INPUT_LEN
     try:
-        if len(text) <= limit:
-            return pattern.search(text)
-
-        overlap = ResourceLimits.REGEX_CHUNK_OVERLAP
-        step = max(limit - overlap, 1)
-        total = len(text)
-
-        for start in range(0, total, step):
-            end = min(start + limit, total)
-            chunk = text[start:end]
-            is_first = start == 0
-            is_last = end >= total
-
-            for match in pattern.finditer(chunk):
-                if not is_last and match.end() == len(chunk):
-                    continue    # 贴着人为块尾，交给下一块
-                if not is_first and match.start() == 0:
-                    continue    # 贴着人为块首，上一块已经看过
-                return match
-
-            if is_last:
-                break
+        return pattern.search(text)
     except Exception:
         return None
-    return None
 
 
 def safe_regex_match(pattern: Pattern, text: str, max_len: int = 100000) -> Optional[re.Match]:
@@ -272,11 +283,9 @@ class ResourceLimits:
     SAMPLE_TAIL_SIZE = 64 * 1024
     SAMPLE_OFFSETS = [0.25, 0.5, 0.75]
 
+    # 保留给外部调用方读取；search_full 不再用它做截断。
+    # 历史上它是"正则只看前 100KB"的开关，那是可绕过的静默漏检。
     MAX_REGEX_INPUT_LEN = 100000
-    # 分块扫描的重叠宽度。必须大于任何一条规则可能匹配到的最长串，
-    # 否则跨块的命中会两边都看不全。规则里最长的量词是 {0,500}，
-    # 再算上前后文给到 8KB 有充足余量。
-    REGEX_CHUNK_OVERLAP = 8192
     MAX_PATTERN_MATCH_LEN = 500
 
     MAX_AST_CODE_LEN = 50000
@@ -435,6 +444,13 @@ class DetectionContext:
     is_sampled: bool = False
     # 本条载荷有没有因为触到绝对上限而没被完整匹配
     coverage_truncated: bool = False
+    # 有没有因为 TOTAL_TIMEOUT_S 而少跑了检测器，少跑了哪些
+    timed_out: bool = False
+    detectors_skipped: List[str] = field(default_factory=list)
+
+    # 正则预筛的执行计划 + 它对应的那段文本（AC 一趟算出来，全检测器共用）
+    pattern_plan: Optional[Dict[str, Any]] = None
+    pattern_plan_text: Optional[str] = None
 
 
 @dataclass
@@ -485,6 +501,14 @@ class BaseDetector(ABC):
                 logger.error(f"Failed to compile pattern {name}: {e}")
 
         self._compiled = True
+        # 登记进全局预筛器。键要全局唯一，用 `攻击类型:规则名`。
+        try:
+            register_patterns({
+                f"{self.ATTACK_TYPE.value}:{n}": p
+                for n, (p, _w) in self._patterns.items()
+            })
+        except Exception as e:      # pragma: no cover
+            logger.debug(f"预筛登记失败，该检测器退回全量匹配: {e}")
 
     @abstractmethod
     def detect(self, context: DetectionContext) -> DetectorResult:
@@ -493,15 +517,35 @@ class BaseDetector(ABC):
     def _match_patterns(self, text: str, context: DetectionContext) -> List[Evidence]:
         """跑所有正则，返回匹配到的证据
 
-        这里原来是 `text[:50KB] + text[-50KB:]` —— 中段永远不过正则，把
-        payload 放在 50KB 之后就能绕过。现在改成全量分块扫描（fast_filter
-        里已经用同一套办法解决过一次），覆盖面不再取决于载荷长度。
+        不是把 119 条规则挨个在整段文本上跑一遍 —— 那样 7.8MB 正文要 6.7 秒，
+        而 `re` 匹配期间不释放 GIL，UI 线程会被顶到几百毫秒的延迟。这里先用
+        `PatternPrefilter` 一趟 AC 算出每条规则的执行计划：
+
+          跳过        必含字面量不存在，可以证明它不可能匹配
+          开窗        只在字面量命中点周围跑，窗口宽度由该规则自己的
+                      **最大匹配长度上界**算出，保证装得下任何真命中
+          完整文本    推不出有限上界（含 `*`/`+`/`{n,}`）或没有必含字面量
+
+        注意开窗和被删掉的"分块扫描"不是一回事：分块按**固定长度**切、丢弃
+        贴边命中，命中一长就两边都丢；这里的窗口宽度是从模式推出来的上界，
+        推不出来就不开窗。取舍的对象是"规则"，不是"位置"。
         """
         evidences = []
+        plan = self._pattern_plan(text, context)
 
         for name, (pattern, weight) in self._patterns.items():
+            if name not in plan:
+                continue            # 必含字面量不出现，可证明它不可能命中
+            regions = plan[name]
             try:
-                match = self._search_full(pattern, text)
+                if regions is None:
+                    match = self._search_full(pattern, text)
+                else:
+                    match = None
+                    for start, end in regions:
+                        match = pattern.search(text, start, end)
+                        if match:
+                            break
                 if match:
                     matched_text = match.group(0)
                     if len(matched_text) > ResourceLimits.MAX_PATTERN_MATCH_LEN:
@@ -518,6 +562,29 @@ class BaseDetector(ABC):
                 logger.debug(f"Pattern match error for {name}: {e}")
 
         return evidences
+
+    def _pattern_plan(self, text: str, context: DetectionContext):
+        """取本检测器规则在这段文本上的执行计划
+
+        AC 那一趟对整段文本只跑一次，结果缓存在 context 上给所有检测器共用
+        —— 按检测器各扫一趟的话，10 个检测器就是 10 次 lower() + 10 趟 AC，
+        预筛本身会比它要省掉的正则还贵。
+        """
+        prefix = f"{self.ATTACK_TYPE.value}:"
+        cached = context.pattern_plan
+        if cached is None or context.pattern_plan_text is not text:
+            try:
+                cached = global_plan(text)
+            except Exception as e:      # 预筛坏了不能拖垮检测：退回全量
+                logger.debug(f"预筛失败，退回全量匹配: {e}")
+                cached = {f"{prefix}{n}": None for n in self._patterns}
+            context.pattern_plan = cached
+            context.pattern_plan_text = text
+        return {
+            name[len(prefix):]: regions
+            for name, regions in cached.items()
+            if name.startswith(prefix)
+        }
 
     def _search_full(self, pattern: Pattern, text: str):
         """见模块级 search_full 的说明"""
@@ -1921,13 +1988,35 @@ class AttackDetector:
             self._run_shared_ast_analysis(context)
 
         # 跑所有检测器
+        #
+        # TOTAL_TIMEOUT_S 是真生效的，而它**必须留痕**：超时被跳过的检测器
+        # 输出的结果 weight=0，不会进 all_results，最终的 dict 和"跑完了什么
+        # 也没发现"长得一模一样。而 registry 是按 PRIORITY 排序的，`break`
+        # 掉的永远是尾部那几个 —— 反序列化检测在大 body 上会被系统性跳过。
+        # 触发门槛也不高：16MB 正文过完 119 条规则就要 8 秒多。
         all_results: List[DetectorResult] = []
-        for detector in self._registry.get_all_detectors():
+        detectors = self._registry.get_all_detectors()
+        for index, detector in enumerate(detectors):
             if time.time() - start_time > ResourceLimits.TOTAL_TIMEOUT_S:
+                skipped = [d.ATTACK_TYPE.value for d in detectors[index:]]
+                context.timed_out = True
+                context.detectors_skipped = skipped
+                logger.warning(
+                    "检测超时（>%.1fs），以下检测器未执行：%s。"
+                    "本条结论不完整（uri=%s, body=%d 字节）",
+                    ResourceLimits.TOTAL_TIMEOUT_S, ", ".join(skipped),
+                    uri[:120], len(data),
+                )
                 break
 
             try:
                 result = detector.detect(context)
+                if result.error == "timeout":
+                    # 检测器自己发现超时并提前返回，同样要记下来
+                    context.timed_out = True
+                    name = detector.ATTACK_TYPE.value
+                    if name not in context.detectors_skipped:
+                        context.detectors_skipped.append(name)
                 if result.detected or result.weight > 0:
                     all_results.append(result)
             except Exception as e:
@@ -2074,6 +2163,10 @@ class AttackDetector:
             'decode_layers': context.decode_layers,
             'is_sampled': context.is_sampled,
             'coverage_truncated': context.coverage_truncated,
+            # 超时留痕：没有这两个字段，"超时少跑了检测器"和"跑完了什么也
+            # 没发现"在输出上完全一样
+            'timeout': context.timed_out,
+            'detectors_skipped': list(context.detectors_skipped),
             'is_binary_payload': context.is_binary_payload,
             'text_detection_skipped': context.text_detection_skipped,
             'skip_reason': context.skip_reason,

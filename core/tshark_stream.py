@@ -191,8 +191,16 @@ class PacketWrapper:
         # 层不存在就返回None，别炸
         return None
 
-    def __hasattr__(self, name):
-        return name in self._layers_data
+    # 这里原来有一个 `__hasattr__`。**`__hasattr__` 不是 Python 协议**：
+    # 内置的 hasattr() 只会调 getattr() 再看有没有抛 AttributeError，
+    # 永远不会调用它。所以那是零效果的死代码，更糟的是它会让读代码的人
+    # 以为"层是否存在已经被处理过了"。
+    #
+    # 事实是：本类和 LayerWrapper 的 __getattr__ 取不到都返回 None，
+    # 于是 `hasattr(wrapper, 任意名字)` **恒为 True**。判断层是否存在
+    # 一律用下面的 has_layer()；判断字段是否存在用 getattr(x, 'f', None)
+    # 的真值。已经有过一次实际损失：webshell 的请求/响应方向判定曾写成
+    # hasattr(http_layer, 'request_method')，恒真导致响应侧特征全部失效。
 
     @property
     def layers(self):

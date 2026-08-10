@@ -46,8 +46,13 @@ logger = logging.getLogger(__name__)
 
 class UILimits:
     """UI显示限制"""
-    MAX_DISPLAY_ROWS = 5000          # 详情表格最大显示行数
-    MAX_TREE_ITEMS = 3000            # 树视图最大项目数
+    # 只作用于 _onDetectionFound（旧版单条信号路径）。当前主路径是
+    # batchDetectionsFound → 分析结束时 detail_table.showFromSummary() 一次性
+    # setDetections(全部)，不受这个上限约束 —— 表格模型是虚拟化的，行数多不
+    # 等于卡。所以"真攻击被挤出可视范围"在主路径上不成立；要收敛结果请用
+    # 详情表的"研判"过滤（只看确认/疑似得手）。
+    MAX_DISPLAY_ROWS = 5000          # 详情表格最大显示行数（旧版路径）
+    MAX_TREE_ITEMS = 3000            # 树视图最大项目数（当前无人引用）
     PROGRESS_SMOOTH_INTERVAL = 50    # 进度平滑更新间隔 (毫秒)
     BATCH_UI_UPDATE_THRESHOLD = 10   # 超过此数量使用批量更新
     UI_FREEZE_TIMEOUT_MS = 100       # UI 冻结最长时间
@@ -1997,14 +2002,12 @@ class MainWindow(QMainWindow):
 
         item = self.file_panel.getFileItem(file_path)
         if item:
-            display_note = ""
-            if total_attacks > UILimits.MAX_DISPLAY_ROWS:
-                display_note = f" (显示 {UILimits.MAX_DISPLAY_ROWS})"
-
-            item.setCompleted(
-                True,
-                f"检测到 {total_attacks} 个攻击行为{display_note}"
-            )
+            # 这里原来在 total_attacks > MAX_DISPLAY_ROWS 时追加一句
+            # "(显示 5000)"。那是句错话：详情表走的是
+            # detail_table.showFromSummary() → setDetections(全部)，
+            # QAbstractTableModel + QTableView 本身是虚拟化的，多少行都照显示。
+            # 5000 那个上限只作用在 _onDetectionFound（旧版单条信号路径）。
+            item.setCompleted(True, f"检测到 {total_attacks} 个攻击行为")
 
         self.export_action.setEnabled(True)
         if not self.analysis_controller.is_running:

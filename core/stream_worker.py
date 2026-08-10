@@ -145,7 +145,7 @@ class ResourceLimits:
     MAX_WEBSHELL_HTTP_PACKETS = 200_000
     # 累积包的内存预算。EK JSON 文本解析成 Python 对象后约膨胀 4.5 倍，
     # 所以按文本字节数 × 该系数估算常驻内存。
-    WEBSHELL_MEMORY_BUDGET_BYTES = 1024 * 1024 * 1024
+    WEBSHELL_MEMORY_BUDGET_BYTES = 512 * 1024 * 1024
     EK_MEMORY_EXPANSION = 4.5
     PROGRESS_THROTTLE_MS = 100
 
@@ -337,8 +337,12 @@ class StreamAnalysisWorker(QThread):
         # 全量 HTTP 请求的路径索引，供成功研判的维度 B 做"上传后回访"关联。
         # 同样每 worker 一份，理由和上面的会话追踪器一致。
         self._request_ledger = RequestLedger() if RequestLedger is not None else None
-        # 帧号 -> 研判结论，_build_summary 时挂到 summary 上
-        self._verdicts: Dict[int, Any] = {}
+        # 这里原来有一个 `self._verdicts: Dict[int, Any] = {}`，注释写着
+        # "_build_summary 时挂到 summary 上" —— 但 AnalysisSummary 没有
+        # verdicts 字段，_build_summary 也从来没挂过，是纯死变量。
+        # 研判结论真正的出口是 detection.raw_result['success_verdict']
+        # （SuccessAdjudicator.adjudicate_all 直接写进去），详情表的研判列、
+        # 溯源图、报告读的都是那一份。
 
     def _find_tshark_robust(self) -> Optional[str]:
         """在常见位置找tshark"""
@@ -729,9 +733,6 @@ class StreamAnalysisWorker(QThread):
         hosts: Set[str] = set()
         for index, verdict in verdicts.items():
             detection = results[index]
-            frame = getattr(detection, "packet_number", 0) or 0
-            if frame:
-                self._verdicts[frame] = verdict
 
             outcome = getattr(verdict.outcome, "value", str(verdict.outcome))
             if outcome == "confirmed":
@@ -1138,6 +1139,24 @@ class StreamAnalysisWorker(QThread):
                 detection['tags'] = list(detection.get('tags') or []) + signal.tags
                 if detection['total_weight'] >= 40:
                     detection['detected'] = True
+                # 权重变了，等级必须跟着重算。
+                #
+                # `threat_level` / `confidence` 是 AttackDetector._to_dict() 在
+                # **加分之前**用 ThreatLevel.from_weight() 算好的字符串，而
+                # DetectionResult.from_attack_result() 读的就是它。不重算的话，
+                # 一条 40 分的请求被 upload_then_access(+60) 抬到 100，界面上
+                # 仍然显示 LOW —— 按等级排序时沉底、导出报告里等级也是错的。
+                # SessionTracker 的全部意义就是发现"单包看不出、跨请求才成立"
+                # 的攻击链，而这恰好让它发现的东西在界面上最不显眼。
+                #
+                # 注意用的是 **attack_detector 那个 ThreatLevel**：权重→等级的
+                # 阈值（40/80/150/200）是打分体系的一部分，归它管。
+                # models.detection_result.ThreatLevel 是展示用的枚举，没有
+                # from_weight，写错会被下面的宽 except 吞掉、整条检测变成 None。
+                from core.attack_detector import ThreatLevel as _ScaleThreatLevel
+                level = _ScaleThreatLevel.from_weight(detection['total_weight']).value
+                detection['threat_level'] = level
+                detection['confidence'] = level
 
             if detection.get('detected', False) and detection.get('total_weight', 0) >= 20:
                 # 身份字段永远保留：它们很轻，而且是回 pcap 重取证据的钥匙
@@ -1235,7 +1254,10 @@ class StreamAnalysisWorker(QThread):
             return []
 
         request_to_indices: Dict[int, List[int]] = {}
-        stream_to_indices: Dict[int, List[int]] = {}
+        # 每条 TCP 流上待配对的检测，按请求帧号升序。拿不到 http.request_in
+        # 时靠它做时序配对 —— 见下面 _claim_stream_detection 的说明。
+        stream_pending: Dict[int, deque] = {}
+        stream_frames: Dict[int, List[Tuple[int, int]]] = {}
         for index, detection in enumerate(results):
             raw_result = detection.raw_result if isinstance(detection.raw_result, dict) else {}
             request_frame = raw_result.get("frame_number") or getattr(detection, "packet_number", 0)
@@ -1251,7 +1273,10 @@ class StreamAnalysisWorker(QThread):
             if request_frame > 0:
                 request_to_indices.setdefault(request_frame, []).append(index)
             if tcp_stream >= 0:
-                stream_to_indices.setdefault(tcp_stream, []).append(index)
+                stream_frames.setdefault(tcp_stream, []).append((request_frame, index))
+        for tcp_stream, entries in stream_frames.items():
+            entries.sort(key=lambda item: (item[0], item[1]))
+            stream_pending[tcp_stream] = deque(entries)
 
         extracted_files: List[ExtractedFile] = []
         seen_hashes: Set[str] = set()
@@ -1294,7 +1319,6 @@ class StreamAnalysisWorker(QThread):
                 request_in = str(getattr(packet, "http_request_in", "") or "").strip()
                 request_frame = 0
                 target_indices: Optional[List[int]] = None
-                evidence_key: Optional[Tuple[str, int]] = None
                 if request_in:
                     try:
                         request_frame = int(request_in)
@@ -1302,31 +1326,20 @@ class StreamAnalysisWorker(QThread):
                         request_frame = 0
                     target_indices = request_to_indices.get(request_frame)
                     evidence_key = ("request", request_frame)
-                else:
-                    target_indices = stream_to_indices.get(packet.tcp_stream)
-                    evidence_key = ("stream", packet.tcp_stream)
-                    if target_indices:
-                        target_indices = [
-                            index for index in target_indices
-                            if index not in exact_response_matches
-                        ]
-                        if target_indices:
-                            first_result = results[target_indices[0]]
-                            first_raw = first_result.raw_result if isinstance(first_result.raw_result, dict) else {}
-                            try:
-                                request_frame = int(
-                                    first_raw.get("frame_number")
-                                    or getattr(first_result, "packet_number", 0)
-                                    or 0
-                                )
-                            except (TypeError, ValueError):
-                                request_frame = 0
-
-                if target_indices and evidence_key not in seen_evidence_links:
-                    seen_evidence_links.add(evidence_key)
-                    self._attach_response_evidence(packet, results, target_indices)
-                    if request_in:
+                    if target_indices and evidence_key not in seen_evidence_links:
+                        seen_evidence_links.add(evidence_key)
+                        self._attach_response_evidence(packet, results, target_indices)
                         exact_response_matches.update(target_indices)
+                else:
+                    claimed = self._claim_stream_detection(
+                        stream_pending.get(packet.tcp_stream),
+                        packet.frame_number,
+                        exact_response_matches,
+                    )
+                    if claimed is not None:
+                        request_frame, index = claimed
+                        target_indices = [index]
+                        self._attach_response_evidence(packet, results, target_indices)
 
                 body = packet.http_response_body or b""
                 match = inspector.inspect(
@@ -1378,6 +1391,42 @@ class StreamAnalysisWorker(QThread):
         return extracted_files
 
     @staticmethod
+    def _claim_stream_detection(
+        pending: Optional[deque],
+        response_frame: int,
+        already_matched: Set[int],
+    ) -> Optional[Tuple[int, int]]:
+        """拿不到 `http.request_in` 时，按时序给这个响应认领一条检测。
+
+        返回 (请求帧号, 检测下标)，没有可配的就返回 None。
+
+        原来的做法是按 `("stream", tcp_stream)` 去重：一条 keep-alive 流上
+        **只有第一个响应**会被处理，而且它的证据被挂给了该流内的**全部**
+        检测。后果是后续请求的 `response_status` 恒为空 —— 成功研判的维度 A
+        全靠响应体指纹，等于在 keep-alive 场景下整个维度失效。
+
+        HTTP/1.1 在单连接上是有序的（req1→resp1→req2→resp2…），所以按请求
+        帧号排好队之后，先进先出地认领即可：
+          - 队首检测的请求帧 >= 本响应帧 → 说明这个响应发生在它之前，
+            不可能是它的响应，停下（后面的只会更晚）
+          - 队首已经被 request_in 精确匹配过 → 弹掉继续找
+        中间夹杂的、没产生检测的普通请求不会错配：它们的响应会因为"队首
+        请求帧比自己晚"而落空，正确地跳过。
+        """
+        if not pending:
+            return None
+        while pending:
+            request_frame, index = pending[0]
+            if index in already_matched:
+                pending.popleft()
+                continue
+            if request_frame and response_frame and request_frame >= response_frame:
+                return None
+            pending.popleft()
+            return request_frame, index
+        return None
+
+    @staticmethod
     def _response_content_disposition(packet: PacketData) -> str:
         """Return Content-Disposition without depending on a version-specific field."""
         explicit = str(getattr(packet, "http_content_disposition", "") or "").strip()
@@ -1407,18 +1456,32 @@ class StreamAnalysisWorker(QThread):
 
         for result_index in target_indices:
             detection = results[result_index]
-            # 请求侧证据被省掉的那些条目，响应侧同样只留状态码。
-            # 状态码很轻（几个字节）但信息量最大 —— 200 和 404 直接决定
-            # 这次攻击有没有打成，后面的成功判定就靠它起步。
+            # `evidence_lazy` 卸载的是**请求侧**的原始报文（raw_request_*，
+            # 一条可能上百 KB）。响应侧的 status + sample 必须永远保留：
+            #
+            #   body_sample 已经被切到 2000 字节，response_data 同样 [:2000]，
+            #   省下来的是约 4KB/条 —— 而成功研判的维度 A（命令回显
+            #   uid=0(root)、root:x:0:0:、Windows IP Configuration）读的正是
+            #   response_sample / response_data。
+            #
+            # 早先这里连 sample 一起省，代价是：检测数一旦超过
+            # FULL_EVIDENCE_DETECTIONS（一次 dirb 就能灌满），后面所有条目的
+            # 维度 A 恒空 → 结论全变 unknown → 详情表"研判"列显示「证据不足」。
+            # 分析员会理解成"这些确实证据不足"，而真相是我们把证据扔了 ——
+            # 花 4KB 换掉整个"打成了没有"的主判据，且失真恰好发生在大流量
+            # 这个最需要研判的场景上。
+            #
+            # response_data 是 status line + headers + body 拼接，信息量与
+            # sample 重叠，它才是可以按 lazy 省的那个。
             lazy = bool(isinstance(detection.raw_result, dict)
                         and detection.raw_result.get("evidence_lazy"))
             if isinstance(detection.raw_result, dict):
                 detection.raw_result["response_status"] = status_code
+                detection.raw_result["response_sample"] = body_sample
                 if not lazy:
-                    detection.raw_result["response_sample"] = body_sample
                     detection.raw_result["response_data"] = response_data
+            detection.response_sample = body_sample
             if not lazy:
-                detection.response_sample = body_sample
                 detection.response_data = response_data
 
     def _fetch_http_responses(

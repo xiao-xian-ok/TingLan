@@ -208,6 +208,37 @@ class DetectionResult:
     packet_number: int = 0
     tcp_stream: int = -1
 
+    @property
+    def success_outcome(self) -> str:
+        """A/B/C 成功研判结论：confirmed / suspected / failed / unknown
+
+        结论由 SuccessAdjudicator 写在 raw_result['success_verdict'] 里
+        （见 core/success_adjudicator.adjudicate_all）。没研判过就是空串 ——
+        "没判过"和"判过但没得手"必须能区分开。
+        """
+        raw = self.raw_result if isinstance(self.raw_result, dict) else {}
+        verdict = raw.get("success_verdict")
+        if not isinstance(verdict, dict):
+            return ""
+        return str(verdict.get("outcome") or "")
+
+    @property
+    def success_outcome_label(self) -> str:
+        return {
+            "confirmed": "确认得手",
+            "suspected": "疑似得手",
+            "failed": "未生效",
+            "unknown": "证据不足",
+        }.get(self.success_outcome, "")
+
+    @property
+    def success_reasons(self) -> List[str]:
+        raw = self.raw_result if isinstance(self.raw_result, dict) else {}
+        verdict = raw.get("success_verdict")
+        if not isinstance(verdict, dict):
+            return []
+        return [str(r) for r in (verdict.get("reasons") or []) if r]
+
     def to_table_row(self) -> List[str]:
         # 特征摘要
         indicator_str = self.indicator
@@ -222,6 +253,9 @@ class DetectionResult:
 
         return [
             self.threat_level.display_name,
+            # 研判排在威胁等级right after：应急现场先问"打成了没有"，
+            # 再问"像不像攻击"
+            self.success_outcome_label,
             self.detection_type.display_name,
             self.method,
             self.uri[:50] + "..." if len(self.uri) > 50 else self.uri,
@@ -233,7 +267,7 @@ class DetectionResult:
 
     @staticmethod
     def table_headers() -> List[str]:
-        return ["威胁等级", "类型", "方法", "URI", "检测指标", "攻击标签", "权重", "时间戳"]
+        return ["威胁等级", "研判", "类型", "方法", "URI", "检测指标", "攻击标签", "权重", "时间戳"]
 
     @classmethod
     def from_webshell_result(cls, raw: Dict, detection_type: DetectionType) -> "DetectionResult":

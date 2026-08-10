@@ -230,24 +230,49 @@ def test_deep_analysis_runs_everything_when_stats_unavailable(
     assert protocol_analyzer.ProtocolType.SMB in enabled
 
 
-def test_extract_files_disabled_skips_http_object_export(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    worker = StreamAnalysisWorker(
-        "capture.pcap",
-        options=AnalysisOptions(
-            auto_decode=False,
-            extract_files=False,
-            file_recovery=False,
-        ),
-        tshark_path="test-tshark",
-    )
-    _dns_analysis, _rtp_analysis, _deep_analysis, http_export = _stub_analysis_boundaries(
-        worker,
-        monkeypatch,
-        {"HTTP": 1},
-    )
+def test_extract_files_disabled_produces_no_artifacts(tmp_path) -> None:
+    """extract_files=False 时不产出任何落盘文件
 
-    worker._run_analysis()
+    这条原来断言的是 `http_export.assert_not_called()`，而 `_export_http_objects`
+    已经作为死代码删除了 —— `monkeypatch.setattr(..., raising=False)` 只是凭空
+    建了个属性，谁也不会调它，于是断言**恒真、永不失败**。绿的、没人看、零保护，
+    比没有更糟。
 
-    http_export.assert_not_called()
+    改成断言**产出**：给一个带可落盘响应体的响应包，走真实的
+    `_scan_http_responses`，看开关有没有真的挡住文件生成。
+    """
+    body = b"PK\x03\x04" + b"A" * 512          # zip 魔数，inspector 会认
+
+    def _make_worker(extract_files: bool):
+        packet = PacketData(
+            frame_number=42,
+            tcp_stream=1,
+            http_response_code="200",
+            http_response_body=body,
+            http_content_type="application/zip",
+        )
+        packet.http_response_lines = [
+            'Content-Disposition: attachment; filename="loot.zip"'
+        ]
+        worker = StreamAnalysisWorker(
+            "capture.pcap",
+            options=AnalysisOptions(extract_files=extract_files),
+            tshark_path="test-tshark",
+        )
+        worker._handler = RecordingHandler([packet])
+        worker._is_cancelled = False
+        return worker
+
+    # 先证明这个包在开关打开时确实会产出文件，否则下面的"没产出"是假通过
+    import tempfile as _tempfile
+    original_mkdtemp = _tempfile.mkdtemp
+    try:
+        _tempfile.mkdtemp = lambda _prefix: str(tmp_path)
+        enabled = _make_worker(True)._scan_http_responses([])
+        assert len(enabled) == 1
+        assert enabled[0].file_name == "loot.zip"
+
+        disabled = _make_worker(False)._scan_http_responses([])
+        assert disabled == []
+    finally:
+        _tempfile.mkdtemp = original_mkdtemp

@@ -188,6 +188,12 @@ _SCRIPT_MAGIC = re.compile(
 # 那反而是"打中了"的迹象，不能当失败处理。
 _FAILED_STATUS = {"400", "401", "403", "404", "405", "406", "410", "501"}
 
+# 会把文件写到请求 URI 所指路径上的方法。
+# GET/POST 不算：GET /x.php 是执行它，POST /upload.php 是调用上传接口
+# （真实落地名从 multipart 的 filename= 里认），POST /uploads/x.php 是在用马。
+# 口径与 core/provenance.py 建落地物节点时保持一致。
+_WRITE_METHODS = {"PUT"}
+
 # 可执行脚本扩展名，判断"回访的是不是自己传的马"
 _SCRIPT_EXTS = (
     ".php", ".php3", ".php4", ".php5", ".php7", ".phtml", ".phar", ".pht",
@@ -462,7 +468,8 @@ class SuccessAdjudicator:
             if not match:
                 continue
             verdict.score += weight
-            verdict.dimensions.append("A")
+            if "A" not in verdict.dimensions:
+                verdict.dimensions.append("A")
             verdict.reasons.append(f"响应中出现{label}：{_snippet(match.group(0))}")
             verdict.evidence.setdefault("response_fingerprints", []).append(label)
             if weight >= 70:
@@ -550,6 +557,20 @@ class SuccessAdjudicator:
         if self.ledger is None:
             return None
 
+        # 请求本身就被服务器拒了（404/403…），它不可能"种下"任何东西 ——
+        # 维度 B 的整个前提是"这条检测投放了 X，后来 X 被访问了"，前提不成立
+        # 就不该产出结论。
+        #
+        # 这一条不是可有可无的加固：`merge` 取的是**更严重**的结论，B 一旦
+        # 给出 CONFIRMED，就会把维度 A 依据 404 得出的 FAILED 直接盖掉。
+        # 实测过一个 `GET /index.php?id=1 union select...` 返回 404 的注入探测，
+        # 因为 /index.php 在抓包里被正常访问了 4 次，最终被判成"确认得手"。
+        #
+        # 维度 C 不受这条约束：注入把页面打成 404、同时触发反弹 shell 是完全
+        # 可能的，出站连接是独立于 HTTP 响应的客观证据。
+        if _response_status(detection) in _FAILED_STATUS:
+            return None
+
         frame = _frame_of(detection)
         ts = _ts_of(detection)
         src_ip = str(getattr(detection, "source_ip", "")
@@ -611,7 +632,22 @@ class SuccessAdjudicator:
 
         两个来源：
           1. 上传表单里的 filename（要按文件名去流水账里反查真实落地目录）
-          2. 请求自身的 URI 就指向一个脚本（写文件类漏洞常见形态）
+          2. 请求**把文件写到**了自身 URI 指向的脚本路径
+
+        第 2 条必须卡方法，这里踩过一个很贵的坑：原来只要 URI 以 .php/.jsp
+        结尾就算"种下了"，于是 `GET /index.php?id=1 union select...` 被判成
+        投放了 /index.php —— 而 /index.php 是站点主入口，抓包里被访问几十次，
+        维度 B 一看"投放后同一来源多次回访"就给了 CONFIRMED。**一次注入探测
+        加上正常浏览，就凭空变成"确认得手"。**
+
+        判据应该是"这个动作会不会把文件写到这个路径上"：
+          PUT /shell.php        会      —— 直接写文件
+          GET /index.php        不会    —— 只是执行它
+          POST /upload.php      不会    —— 调用上传接口，文件落在别处，
+                                          真实落地名由上面第 1 条从 multipart
+                                          的 filename= 里认
+          POST /uploads/x.php   不会    —— 那是在**用**马，不是种马
+        `core/provenance.py` 建落地物节点时用的就是这个口径，两边保持一致。
         """
         results: List[Tuple[str, str]] = []
         raw = _raw(detection)
@@ -633,10 +669,13 @@ class SuccessAdjudicator:
             # 时给个根目录猜测，让维度 B 至少有个 key 可查，不至于整条断掉。
             results.extend(found or [(f"/{name}", f"上传文件 {name}")])
 
-        uri_path = _norm_path(str(getattr(detection, "uri", "")
-                                  or raw.get("uri", "") or ""))
-        if _is_script_name(uri_path.rsplit("/", 1)[-1]):
-            results.append((uri_path, "请求直接写入该脚本路径"))
+        method = str(getattr(detection, "method", "")
+                     or raw.get("method", "")).upper()
+        if method in _WRITE_METHODS:
+            uri_path = _norm_path(str(getattr(detection, "uri", "")
+                                      or raw.get("uri", "") or ""))
+            if _is_script_name(uri_path.rsplit("/", 1)[-1]):
+                results.append((uri_path, f"{method} 直接写入该脚本路径"))
 
         return results
 
@@ -711,7 +750,12 @@ class SuccessAdjudicator:
                 verdict.outcome = Outcome.SUSPECTED
         # 多维交叉本身就是强证据：两个独立维度同时指向成功，
         # 即使各自都不够阈值，合起来也该被人看见。
-        if len(verdict.dimensions) >= 2 and verdict.outcome is Outcome.SUSPECTED:
+        #
+        # 判据必须用 set：`dimensions` 是 list，而各分支往里 append 的路径
+        # 有好几条（A1/A2/A3 的 merge/A4），只要哪天有一条重复写入，
+        # `len(list) >= 2` 就会把**单维度**当成多维交叉，凭空虚增 CONFIRMED。
+        # SuccessVerdict.merge 本来就是按去重语义合并的，这里和它对齐。
+        if len(set(verdict.dimensions)) >= 2 and verdict.outcome is Outcome.SUSPECTED:
             if verdict.score >= _CONFIRM_SCORE - 10:
                 verdict.outcome = Outcome.CONFIRMED
         if not verdict.entry_frame:

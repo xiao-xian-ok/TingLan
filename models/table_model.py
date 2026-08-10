@@ -7,6 +7,15 @@ from PySide6.QtGui import QColor
 from models.detection_result import DetectionResult
 
 
+# 研判列的配色：确认得手要一眼看见，未生效要能被视觉忽略
+_OUTCOME_COLORS = {
+    "confirmed": "#C62828",
+    "suspected": "#EF6C00",
+    "failed": "#9E9E9E",
+    "unknown": "#757575",
+}
+
+
 class DetectionTableModel(QAbstractTableModel):
 
     def __init__(self, parent=None):
@@ -75,6 +84,14 @@ class DetectionTableModel(QAbstractTableModel):
         elif role == Qt.ForegroundRole:
             if col == 0:  # 威胁等级列
                 return QColor(detection.threat_level.color)
+            if col == 1:  # 研判列
+                return QColor(_OUTCOME_COLORS.get(detection.success_outcome, "#757575"))
+
+        elif role == Qt.ToolTipRole:
+            if col == 1:
+                reasons = detection.success_reasons
+                if reasons:
+                    return "\n".join(reasons[:5])
 
         elif role == Qt.BackgroundRole:
             if row % 2 == 0:
@@ -85,9 +102,10 @@ class DetectionTableModel(QAbstractTableModel):
             return detection
 
         elif role == Qt.TextAlignmentRole:
-            if col in [0, 1, 2]:  # 威胁等级、类型、方法列居中
+            # 威胁等级 / 研判 / 类型 / 方法 居中
+            if col in (0, 1, 2, 3):
                 return Qt.AlignCenter
-            elif col == 6:  # 权重列居中
+            elif col == 7:  # 权重列居中
                 return Qt.AlignCenter
             return Qt.AlignLeft | Qt.AlignVCenter
 
@@ -113,6 +131,7 @@ class DetectionFilterProxyModel(QSortFilterProxyModel):
         self._filter_text = ""
         self._filter_types = []      # 检测类型过滤
         self._filter_levels = []     # 置信度过滤 (high/medium/low)
+        self._filter_outcomes = []   # 研判结论过滤 (confirmed/suspected/...)
 
     def setFilterText(self, text: str):
         self._filter_text = text.lower()
@@ -124,6 +143,15 @@ class DetectionFilterProxyModel(QSortFilterProxyModel):
 
     def setFilterLevels(self, levels: List[str]):
         self._filter_levels = levels
+        self.invalidateFilter()
+
+    def setFilterOutcomes(self, outcomes: List[str]):
+        """按 A/B/C 研判结论过滤
+
+        真实取证现场里绝大多数命中来自扫描器噪声，"只看确认/疑似得手的"
+        是把一屏红色收敛成几条的最快办法。空列表 = 不过滤。
+        """
+        self._filter_outcomes = outcomes
         self.invalidateFilter()
 
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
@@ -156,6 +184,11 @@ class DetectionFilterProxyModel(QSortFilterProxyModel):
         # 置信度过滤 (使用新的confidence字段)
         if self._filter_levels:
             if detection.confidence not in self._filter_levels:
+                return False
+
+        # 研判结论过滤
+        if self._filter_outcomes:
+            if detection.success_outcome not in self._filter_outcomes:
                 return False
 
         return True

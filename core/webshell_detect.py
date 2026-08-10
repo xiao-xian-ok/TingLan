@@ -845,33 +845,82 @@ def identify_payload_type(param_name: str, decoded_content: str) -> str:
     return 'Argument (Data)'
 
 
+def _http_layer(packet):
+    """取 HTTP 层，取不到返回 None。
+
+    **不要用 `hasattr(packet, 'http')` 判断层是否存在。** 喂进来的
+    `tshark_stream.PacketWrapper` / `LayerWrapper` 在 `__getattr__` 里取不到
+    字段时**返回 None 而不抛 AttributeError**，于是 `hasattr` 对任意名字恒为
+    True —— 这类守卫一个包也拦不住，而且不报错、不让测试变红，只让某个分支
+    永远不执行。取证工具里"分支从未执行"和"扫了没发现"在输出上完全一样。
+
+    同款失效已经造成过实际损失：`pair_http_requests_responses` 的方向判定曾
+    写成 `hasattr(http_layer, 'request_method')`，恒真导致每个响应包都被当成
+    请求，四个工具的响应侧特征长期全部失效。
+    """
+    if packet is None:
+        return None
+    has_layer = getattr(packet, "has_layer", None)
+    if callable(has_layer):
+        try:
+            if not has_layer("http"):
+                return None
+        except Exception:
+            pass
+    return getattr(packet, "http", None)
+
+
 def pair_http_requests_responses(packets: List) -> List[Dict]:
-    """把同一会话的请求和响应配对，用(src/dst IP+端口+TCP流ID)做key"""
-    paired_packets = []
-    request_queue = {}
+    """把同一会话的请求和响应配对，用(src/dst IP+端口+TCP流ID)做key
+
+    这里原来有两个 bug，都会让 webshell 的交互记录大面积消失：
+
+    1. `request_queue[key] = {...}` 是**直接覆盖**。keep-alive 连接上的 N 个
+       请求共用同一个五元组，最后只剩一个进检测 —— 而 webshell 的全部命令
+       恰恰都打在同一条连接上。改成每个 key 一个队列。
+
+    2. 方向判定写的是 `hasattr(http_layer, 'request_method')`。喂进来的是
+       `tshark_stream.LayerWrapper`，它的 `__getattr__` 取不到字段时**返回
+       None 而不是抛 AttributeError**，于是 hasattr 恒为 True ——
+       **每个响应包都被当成了请求**，响应分支从来没执行过，
+       `pkt_pair['response']` 永远是 None，响应侧特征（蚁剑 [S][E] 标记、
+       菜刀 X@Y、命令回显、哥斯拉 MD5 响应格式）整个失效。
+       改成按 getattr 的真值判定。
+
+    配对按到达顺序 FIFO：HTTP/1.1 在单连接上是有序的，第 k 个响应对应第 k
+    个还没配上响应的请求。
+    """
+    request_queue: Dict[Tuple, List[Dict]] = {}
+    ordered_pairs: List[Dict] = []
 
     for packet in packets:
-        if not hasattr(packet, 'http'):
+        http_layer = _http_layer(packet)
+        if http_layer is None:
             continue
 
-        http_layer = packet.http
+        # 这几个也别用 hasattr —— 理由同 _http_layer 的 docstring。
+        # 取不到就是 None，None 参与元组 key 不影响正确性。
+        ip_layer = getattr(packet, 'ip', None)
+        tcp_layer = getattr(packet, 'tcp', None)
+        src_ip = getattr(ip_layer, 'src', None) if ip_layer is not None else None
+        dst_ip = getattr(ip_layer, 'dst', None) if ip_layer is not None else None
+        src_port = getattr(tcp_layer, 'srcport', None) if tcp_layer is not None else None
+        dst_port = getattr(tcp_layer, 'dstport', None) if tcp_layer is not None else None
+        stream_id = getattr(tcp_layer, 'stream', None) if tcp_layer is not None else None
 
-        src_ip = getattr(packet.ip, 'src', None) if hasattr(packet, 'ip') else None
-        dst_ip = getattr(packet.ip, 'dst', None) if hasattr(packet, 'ip') else None
-        src_port = getattr(packet.tcp, 'srcport', None) if hasattr(packet, 'tcp') else None
-        dst_port = getattr(packet.tcp, 'dstport', None) if hasattr(packet, 'tcp') else None
-        stream_id = getattr(packet.tcp, 'stream', None) if hasattr(packet, 'tcp') else None
-
-        if hasattr(http_layer, 'request_method'):  # 请求包
+        if getattr(http_layer, 'request_method', None):     # 请求包
             key = (src_ip, dst_ip, src_port, dst_port, stream_id)
-            request_queue[key] = {'packet': packet, 'response': None}
-        else:  # 响应包
+            pair = {'packet': packet, 'response': None}
+            request_queue.setdefault(key, []).append(pair)
+            ordered_pairs.append(pair)
+        else:                                                # 响应包
             key = (dst_ip, src_ip, dst_port, src_port, stream_id)
-            if key in request_queue:
-                request_queue[key]['response'] = packet
+            for pair in request_queue.get(key, ()):
+                if pair['response'] is None:
+                    pair['response'] = packet
+                    break
 
-    paired_packets = list(request_queue.values())
-    return paired_packets
+    return ordered_pairs
 
 
 def _get_request_body(http_layer) -> Optional[str]:
@@ -882,7 +931,7 @@ def _get_request_body(http_layer) -> Optional[str]:
 
 def _get_response_body(response_packet) -> Optional[str]:
     """从响应包取响应体"""
-    if not response_packet or not hasattr(response_packet, 'http'):
+    if _http_layer(response_packet) is None:
         return None
 
     http_layer = response_packet.http
@@ -1231,7 +1280,7 @@ class WebShellDetector:
         # 对每个包对进行检测
         for pkt_pair in paired_packets:
             packet = pkt_pair.get('packet')
-            if not packet or not hasattr(packet, 'http'):
+            if _http_layer(packet) is None:
                 continue
 
             packet_index += 1
@@ -1329,7 +1378,7 @@ class WebShellDetector:
         packet = pkt_pair.get('packet')
         response_packet = pkt_pair.get('response')
 
-        if not packet or not hasattr(packet, 'http'):
+        if _http_layer(packet) is None:
             return None
 
         try:
@@ -1424,7 +1473,7 @@ class WebShellDetector:
         packet = pkt_pair.get('packet')
         response_packet = pkt_pair.get('response')
 
-        if not packet or not hasattr(packet, 'http'):
+        if _http_layer(packet) is None:
             return None
 
         try:
@@ -1530,7 +1579,7 @@ class WebShellDetector:
             packet = pkt_pair.get('packet')
             response_packet = pkt_pair.get('response')
 
-            if not packet or not hasattr(packet, 'http'):
+            if _http_layer(packet) is None:
                 continue
 
             try:
@@ -1699,7 +1748,7 @@ class WebShellDetector:
         packet = pkt_pair.get('packet')
         response_packet = pkt_pair.get('response')
 
-        if not packet or not hasattr(packet, 'http'):
+        if _http_layer(packet) is None:
             return None
 
         try:
@@ -2105,7 +2154,7 @@ class WebShellDetector:
             packet = pkt_pair.get('packet')
             response_packet = pkt_pair.get('response')
 
-            if not packet or not hasattr(packet, 'http'):
+            if _http_layer(packet) is None:
                 continue
 
             try:
@@ -2144,7 +2193,7 @@ class WebShellDetector:
         packet = pkt_pair.get('packet')
         response_packet = pkt_pair.get('response')
 
-        if not packet or not hasattr(packet, 'http'):
+        if _http_layer(packet) is None:
             return None
 
         try:
@@ -2602,7 +2651,7 @@ class WebShellDetector:
         packet = pkt_pair.get('packet')
         response_packet = pkt_pair.get('response')
 
-        if not packet or not hasattr(packet, 'http'):
+        if _http_layer(packet) is None:
             return None
 
         try:
