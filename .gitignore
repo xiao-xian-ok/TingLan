@@ -9,6 +9,7 @@ tests/
 tests/*.json
 output/
 .claude/
+.worktrees/
 node_modules/
 services/cyberchef_magic/
 services/CyberChef-master/
@@ -229,3 +230,5 @@ CODE_REVIEW_2026-08-10.md
 
 # 听澜运行日志
 logs/
+pyproject.toml
+uv.lock
