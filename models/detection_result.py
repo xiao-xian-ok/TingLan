@@ -616,6 +616,11 @@ class ExtractedFile:
     hex_dump: str = ""              # 十六进制 dump
     protocol_layers: List[str] = field(default_factory=list)  # 协议分层信息
     pcap_path: str = ""             # 原始 pcap 文件路径（用于懒加载时查询）
+    # 懒加载是否已经**尝试过**（成功或失败都算）。
+    # 不能拿 hex_dump / protocol_layers 非空来判断：0 字节的提取文件 hex_dump
+    # 就是空串，取不到协议分层时列表也是空的 —— 用空值当"还没加载"，这两种情况
+    # 就会在每次点击时重跑一遍那个起 tshark 子进程的懒加载。
+    lazy_loaded: bool = False
 
 
 @dataclass

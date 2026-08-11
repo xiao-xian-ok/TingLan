@@ -1741,6 +1741,9 @@ class MainWindow(QMainWindow):
         if self._progress_timer:
             self._progress_timer.stop()
 
+        # 收掉载荷面板的后台线程（提取文件的协议分层是异步取的）
+        self.payload_viewer.shutdown()
+
         event.accept()
 
     def _onFunctionChanged(self, function_name: str):

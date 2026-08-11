@@ -1020,6 +1020,13 @@ def _first_frame_matching(tshark_path: str, pcap_path: str, display_filter: str)
     return 0
 
 
+# 取单帧详情的子进程超时。老值是 30 秒，而 166MB 的 pcap 实测就要 29-31 秒 ——
+# 正好骑在边界上，表现为界面冻结满 30 秒后**静默**返回空协议层，看起来就像这帧
+# 没数据。加上 `-c` 之后正常耗时已降到几百毫秒，这里留的是异常路径的余量：
+# 帧号极大或磁盘极慢时宁可多等，也不要把超时伪装成"无数据"。
+PACKET_DUMP_TIMEOUT = 120
+
+
 def get_packet_hex_dump(pcap_path: str, packet_num: int = 0) -> tuple:
     tshark_path = find_tshark()
 
@@ -1027,10 +1034,18 @@ def get_packet_hex_dump(pcap_path: str, packet_num: int = 0) -> tuple:
         return "", ["未找到 tshark"]
 
     try:
-        # 原来这里是 `-Y <filter> -c 1`。`-c` 限制 tshark 从文件里**读**多少个包，
-        # display filter 只在这前 N 个包里筛 —— 于是 `frame.number == 20` 配
-        # `-c 1` 永远取不到东西（实测：只有 #1 能取到，其余全空）。
-        # 检测证据的懒加载就是靠这个函数回 pcap 取数的，它坏了就等于证据丢了。
+        # `-c` 限制的是 tshark 从文件里**读**多少个包，不是限制结果条数。
+        # 历史上这里写的是 `-c 1`，于是 `frame.number == 20` 永远取不到东西
+        # （只有 #1 能命中）—— 检测证据的懒加载靠这个函数回 pcap 取数，它坏了
+        # 就等于证据丢了。当时的修法是把 `-c` 整个删掉。
+        #
+        # 但删掉之后 `-Y` 是 display filter，在**全量解析之后**才生效，tshark
+        # 会把整个 pcap 逐包解析一遍：44MB 实测恒定 ~5.7 秒（与帧号无关），
+        # 166MB 要 29-31 秒，而这是在 GUI 主线程上同步跑的。
+        #
+        # 正确的用法是 `-c packet_num`：目标帧号已知，读满 N 个包就停，刚好覆盖
+        # 目标帧，后面全部不用读。实测 5739ms → 216ms，输出逐字节一致。
+        # 同文件的 get_http_request_evidence 用的就是这个约定。
         if packet_num <= 0:
             packet_num = _first_frame_matching(tshark_path, pcap_path, "http")
             if packet_num <= 0:
@@ -1038,12 +1053,13 @@ def get_packet_hex_dump(pcap_path: str, packet_num: int = 0) -> tuple:
 
         cmd = [
             tshark_path, "-r", pcap_path,
+            "-c", str(packet_num),
             "-Y", f"frame.number == {packet_num}", "-V", "-x"
         ]
 
         result = subprocess.run(
             cmd, capture_output=True, text=True,
-            encoding='utf-8', errors='replace', timeout=30
+            encoding='utf-8', errors='replace', timeout=PACKET_DUMP_TIMEOUT
         )
 
         output = result.stdout

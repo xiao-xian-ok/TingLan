@@ -75,6 +75,15 @@ def _path_candidates(path_value: Optional[str], executable_name: str):
     ]
 
 
+_DEFAULT_LOOKUP_CACHE: Optional[str] = None
+
+
+def clear_tshark_cache() -> None:
+    """丢弃缓存的默认查找结果，下次 ``find_tshark()`` 会重新扫描。"""
+    global _DEFAULT_LOOKUP_CACHE
+    _DEFAULT_LOOKUP_CACHE = None
+
+
 def find_tshark(
     explicit_path=None,
     project_root=None,
@@ -86,7 +95,40 @@ def find_tshark(
     ``explicit_path`` and ``WIRESHARK_PATH`` may point to either the executable
     itself or the directory containing it. The optional arguments keep lookup
     deterministic in tests while defaulting to the current process settings.
+
+    无参调用（GUI 和各分析器的走法）的结果会被缓存：一次查找要跑一遍
+    ``shutil.which()`` 的全 PATH 扫描加若干 ``os.stat``，实测 12ms，而它挂在
+    每次点击的路径上，``protocol_analyzer`` 里还有 6 处各自独立调用 —— 全都
+    在重算同一个不会变的答案。
+
+    只缓存**成功**的结果。失败不缓存，否则用户装好 Wireshark 或设了
+    ``WIRESHARK_PATH`` 之后不重启进程就永远还是"未找到"。带参调用一律不走
+    缓存，否则测试注入的 ``env`` / ``platform`` 会被上一次的结果顶掉。
     """
+    global _DEFAULT_LOOKUP_CACHE
+
+    is_default_lookup = (
+        explicit_path is None
+        and project_root is None
+        and env is None
+        and platform is None
+    )
+    if is_default_lookup and _DEFAULT_LOOKUP_CACHE is not None:
+        return _DEFAULT_LOOKUP_CACHE
+
+    found = _locate(explicit_path, project_root, env, platform)
+
+    if is_default_lookup and found is not None:
+        _DEFAULT_LOOKUP_CACHE = found
+    return found
+
+
+def _locate(
+    explicit_path,
+    project_root,
+    env: Optional[Mapping[str, str]],
+    platform: Optional[str],
+) -> Optional[str]:
     current_platform = platform or sys.platform
     environment = os.environ if env is None else env
     executable_name = _executable_name(current_platform)

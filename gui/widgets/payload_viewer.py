@@ -1106,11 +1106,54 @@ class RawDataViewer(QFrame):
         self.text_edit.clear()
 
 
+def _load_packet_layers(pcap_path: str, packet_num: int):
+    """回 pcap 取单帧的协议分层。
+
+    单独抽成模块级函数是为了给后台线程一个明确的入口（也方便测试替换）。
+    它内部会起一个 tshark 子进程，**绝不能在 GUI 主线程上调用**。
+    """
+    from controllers.analysis_controller import get_packet_hex_dump
+
+    return get_packet_hex_dump(pcap_path, packet_num)
+
+
+class _PacketLayersWorker(QThread):
+    """后台取提取文件对应帧的协议分层。
+
+    这活儿原来是在 PacketHexViewer.setContent() 里同步做的，也就是在 GUI 主线程上
+    起 tshark 子进程：44MB 的 pcap 实测冻结 5.7 秒，166MB 冻结 29-31 秒。加上
+    `-c N` 之后常规情况已降到几百毫秒，但帧号很大或磁盘很慢时仍然会是秒级 ——
+    只要它还在主线程上，就总有卡死的可能。放后台是结构性的解法。
+
+    信号带上 ExtractedFile 本身，主线程好据此判断结果是否已经过期（用户可能
+    已经点到别的文件上了）。
+    """
+
+    loaded = Signal(object, list)   # (ExtractedFile, protocol_layers)
+    failed = Signal(object, str)    # (ExtractedFile, 错误信息)
+
+    def __init__(self, ef, parent=None):
+        super().__init__(parent)
+        self._ef = ef
+
+    def run(self):
+        try:
+            _, layers = _load_packet_layers(self._ef.pcap_path, self._ef.source_packet)
+            self.loaded.emit(self._ef, list(layers or []))
+        except Exception as e:
+            logger.debug(f"协议分层加载失败 frame#{self._ef.source_packet}: {e}")
+            self.failed.emit(self._ef, str(e))
+
+
 class PacketHexViewer(QFrame):
     """提取文件的hex查看器"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._current_ef = None
+        # 用集合而不是单个 self._worker：连点提取文件是正常操作，单引用会让还在
+        # 跑的前一个 QThread 失去最后一个 Python 引用被 GC，直接崩。
+        self._workers = set()
         self._setupUI()
 
     def _setupUI(self):
@@ -1176,22 +1219,25 @@ class PacketHexViewer(QFrame):
         layout.addWidget(splitter)
 
     def setContent(self, ef: ExtractedFile):
-        """设置提取文件的内容"""
-        # 禁用更新
+        """设置提取文件的内容
+
+        分两段：本地文件的 hex（只读 4KB，毫秒级）当场做完，保证首屏立刻有东西；
+        协议分层要起 tshark 子进程，扔后台线程，回来了再填。
+        """
+        self._current_ef = ef
+
         self.tree.setUpdatesEnabled(False)
         self.hex_view.setUpdatesEnabled(False)
         try:
             self.tree.clear()
             self.hex_view.clear()
 
-            # 如果还没有加载 hex_dump，进行懒加载
-            if not ef.hex_dump and ef.file_path:
+            if not ef.lazy_loaded and ef.file_path:
                 self._loadFileHexContent(ef)
 
-            # 显示协议分层
-            self._displayProtocolLayers(ef)
+            pending = self._needsLayerLookup(ef)
+            self._displayProtocolLayers(ef, pending=pending)
 
-            # 显示十六进制 dump
             if ef.hex_dump:
                 self.hex_view.setPlainText(ef.hex_dump)
             else:
@@ -1200,19 +1246,92 @@ class PacketHexViewer(QFrame):
             self.tree.setUpdatesEnabled(True)
             self.hex_view.setUpdatesEnabled(True)
 
-    def _loadFileHexContent(self, ef: ExtractedFile):
-        """懒加载文件的十六进制内容"""
-        from controllers.analysis_controller import get_file_hex_content, get_packet_hex_dump
+        if pending:
+            self._startLayerLookup(ef)
+        else:
+            ef.lazy_loaded = True
 
-        # 获取文件内容的十六进制
+    def _needsLayerLookup(self, ef: ExtractedFile) -> bool:
+        if ef.lazy_loaded:
+            return False
+        return ef.source_packet > 0 and bool(ef.pcap_path)
+
+    def _startLayerLookup(self, ef: ExtractedFile):
+        worker = _PacketLayersWorker(ef)
+        worker.loaded.connect(self._onLayersLoaded)
+        worker.failed.connect(self._onLayersFailed)
+        worker.finished.connect(lambda w=worker: self._workers.discard(w))
+        self._workers.add(worker)
+        worker.start()
+
+    def _onLayersLoaded(self, ef: ExtractedFile, layers: list):
+        ef.protocol_layers = layers
+        ef.lazy_loaded = True
+        self._refreshLayersIfCurrent(ef)
+
+    def _onLayersFailed(self, ef: ExtractedFile, message: str):
+        # 失败也标记成已加载：否则每点一次就再花几秒重试一遍。
+        ef.protocol_layers = [f"协议分层获取失败: {message}"]
+        ef.lazy_loaded = True
+        self._refreshLayersIfCurrent(ef)
+
+    def _refreshLayersIfCurrent(self, ef: ExtractedFile):
+        """结果回来时用户可能已经点到别的文件上了，过期结果直接丢掉"""
+        if ef is not self._current_ef:
+            return
+        self.tree.setUpdatesEnabled(False)
+        try:
+            self.tree.clear()
+            self._displayProtocolLayers(ef, pending=False)
+        finally:
+            self.tree.setUpdatesEnabled(True)
+
+    def isLoadingLayers(self) -> bool:
+        return any(w.isRunning() for w in self._workers)
+
+    def waitForLayers(self, deadline=None) -> bool:
+        """等待后台加载结束（测试和退出清理用）"""
+        all_done = True
+        for worker in list(self._workers):
+            finished = worker.wait(deadline) if deadline is not None else worker.wait()
+            all_done = all_done and bool(finished)
+        return all_done
+
+    def renderedLayers(self) -> list:
+        """当前树里实际渲染出来的文本，供测试断言"""
+        out = []
+
+        def walk(item):
+            out.append(item.text(0))
+            for i in range(item.childCount()):
+                walk(item.child(i))
+
+        for i in range(self.tree.topLevelItemCount()):
+            walk(self.tree.topLevelItem(i))
+        return out
+
+    def shutdown(self):
+        """等所有后台线程收尾。
+
+        QThread 在还在跑的时候被析构会直接崩，关闭窗口前必须收干净。
+        tshark 调用本身带超时，所以这里不会无限等下去。
+        """
+        for worker in list(self._workers):
+            try:
+                worker.loaded.disconnect()
+                worker.failed.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+            worker.wait()
+        self._workers.clear()
+
+    def _loadFileHexContent(self, ef: ExtractedFile):
+        """读本地提取文件的前若干字节做 hex dump（不碰 pcap，很快）"""
+        from controllers.analysis_controller import get_file_hex_content
+
         ef.hex_dump = get_file_hex_content(ef.file_path, max_bytes=4096)
 
-        # 如果有关联的包序号，尝试获取协议层信息
-        if ef.source_packet > 0 and ef.pcap_path:
-            _, protocol_layers = get_packet_hex_dump(ef.pcap_path, ef.source_packet)
-            ef.protocol_layers = protocol_layers
-
-    def _displayProtocolLayers(self, ef: ExtractedFile):
+    def _displayProtocolLayers(self, ef: ExtractedFile, pending: bool = False):
         """显示协议分层信息"""
         # 文件信息层
         file_item = QTreeWidgetItem(self.tree, [f"File: {ef.file_name}"])
@@ -1227,6 +1346,10 @@ class PacketHexViewer(QFrame):
             proto_item.setForeground(0, QColor("#388E3C"))
             for layer in ef.protocol_layers:
                 QTreeWidgetItem(proto_item, [f"  > {layer}"])
+        elif pending:
+            proto_item = QTreeWidgetItem(self.tree, ["Protocol Layers"])
+            proto_item.setForeground(0, QColor("#9E9E9E"))
+            QTreeWidgetItem(proto_item, ["  正在从 pcap 解析…"])
 
         # 源信息
         if ef.source_packet > 0:
@@ -1251,6 +1374,8 @@ class PacketHexViewer(QFrame):
             return f"{size / (1024 * 1024):.2f} MB"
 
     def clear(self):
+        # 置空当前文件，后台加载回来时才知道结果已经没人要了
+        self._current_ef = None
         self.tree.clear()
         self.hex_view.clear()
 
@@ -3082,6 +3207,13 @@ class PayloadViewer(QWidget):
             )
         except Exception as e:
             QMessageBox.critical(self, "导出失败", f"导出 Payload 证据时出错:\n{str(e)}")
+
+    def shutdown(self):
+        """退出前收掉所有后台线程。
+
+        QThread 还在跑的时候被析构会直接崩，所以窗口关闭必须走这一步。
+        """
+        self.packet_hex_viewer.shutdown()
 
     def clear(self):
         """清空显示"""
