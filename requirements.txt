@@ -8,5 +8,7 @@ pyahocorasick
 psutil>=5.9.0
 
 # MCP Server Dependencies
+# 1.x 和 2.x 都能跑：2.0 把 FastMCP 改名成 MCPServer 并换了模块路径，
+# mcp_server.py 里按顺序试两条导入路径。
 mcp>=1.0.0
 pycryptodome>=3.20.0

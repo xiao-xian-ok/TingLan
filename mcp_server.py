@@ -20,13 +20,30 @@ import hashlib
 from dataclasses import asdict, is_dataclass
 from typing import Any, Dict, List, Optional
 
-try:
-    from mcp.server.fastmcp import FastMCP  # type: ignore
-except ModuleNotFoundError as e:  # pragma: no cover
-    FastMCP = None  # type: ignore
-    _MCP_IMPORT_ERROR = e
-else:
-    _MCP_IMPORT_ERROR = None
+# MCP Python SDK 2.0 把 FastMCP 改名成 MCPServer 并搬到了
+# mcp.server.mcpserver，1.x 的 mcp.server.fastmcp 不再存在。构造签名、
+# @tool() 装饰器和 run() 在两版之间是兼容的，所以按顺序试即可。
+#
+# 原来只写死了 1.x 那条路径。守卫本身是好的（模块不存在抛
+# ModuleNotFoundError，确实被接住了），问题是接住之后 FastMCP 变成 None，
+# 服务端静默退化成一个只会 SystemExit 的桩，而它喊的是"缺少 mcp 依赖"
+# —— 依赖明明装着，只是换了名字。排查时全部力气都花在查 pip 上了。
+#
+# 捕获范围放宽到 ImportError + AttributeError：模块在、但里面没有那个
+# 名字时抛的是后两者，同样要能落到下一条候选路径上。
+_MCP_IMPORT_ERROR = None
+FastMCP = None  # type: ignore
+for _module_path, _symbol in (
+    ("mcp.server.mcpserver", "MCPServer"),   # SDK >= 2.0
+    ("mcp.server.fastmcp", "FastMCP"),       # SDK 1.x
+):
+    try:
+        FastMCP = getattr(importlib.import_module(_module_path), _symbol)  # type: ignore
+    except (ImportError, AttributeError) as e:  # pragma: no cover
+        _MCP_IMPORT_ERROR = e
+    else:
+        _MCP_IMPORT_ERROR = None
+        break
 
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -34,15 +51,43 @@ for p in [PROJECT_ROOT, os.path.join(PROJECT_ROOT, "core"), os.path.join(PROJECT
     if p not in sys.path:
         sys.path.insert(0, p)
 
+# _import 的失败记录。这里还在模块顶层,logger 要到下面才建得起来
+# (见 logging.getLogger("tinglan.mcp")),所以先攒着,配好日志再统一吐出来。
+_IMPORT_FAILURES: List[str] = []
+
+
 def _import(name, *attrs):
-    """尝试从多个路径导入模块"""
+    """尝试从多个路径导入模块,失败时记录原因而不是静默吞掉。
+
+    原来这里是 ``except: pass`` —— 任何异常(缺子依赖、SyntaxError、
+    循环导入)都被吞掉,对应符号变成 None,然后在**几百行之外的工具调用处**
+    炸出一句 ``'NoneType' object is not callable``,完全看不出是谁没导进来。
+
+    这类静默降级刚在本文件里咬过一次:MCP SDK 从 1.x 升到 2.0 改了模块路径,
+    服务端退化成桩,报错却说"缺少 mcp 依赖" —— 依赖明明装着。
+
+    返回值契约不变(取不到就是 None),只是失败不再是无声的。
+    """
+    errors = []
     for prefix in ['', 'core.']:
         try:
             mod = __import__(prefix + name, fromlist=attrs or [''])
-            if attrs:
-                return tuple(getattr(mod, a, None) for a in attrs)
+        except Exception as e:
+            errors.append(f"{prefix or '<top>'}{name}: {type(e).__name__}: {e}")
+            continue
+
+        if not attrs:
             return mod
-        except: pass
+
+        # 模块导进来了但少了某个名字:同样要说出来,否则和"模块不存在"
+        # 在调用侧长得一模一样。
+        missing = [a for a in attrs if not hasattr(mod, a)]
+        if missing:
+            _IMPORT_FAILURES.append(
+                f"{prefix or '<top>'}{name} 缺少属性: {', '.join(missing)}")
+        return tuple(getattr(mod, a, None) for a in attrs)
+
+    _IMPORT_FAILURES.extend(errors)
     return (None,) * len(attrs) if attrs else None
 # Models
 _detection_models = importlib.import_module("models.detection_result")
@@ -79,7 +124,14 @@ if mcp is None:
         return _w
     class _NoMCP:
         tool = staticmethod(_no_mcp)
-        def run(self): raise SystemExit("缺少 mcp 依赖")
+        def run(self):
+            # 把真正的导入错误带出去。原来只说"缺少 mcp 依赖"，SDK 升级
+            # 导致的改名问题看起来和没装一模一样，白排查半天。
+            raise SystemExit(
+                f"MCP SDK 不可用: {_MCP_IMPORT_ERROR!r}\n"
+                "需要 mcp>=1.0（1.x 提供 mcp.server.fastmcp.FastMCP，"
+                "2.x 提供 mcp.server.mcpserver.MCPServer）"
+            )
     mcp = _NoMCP()
 
 
@@ -119,6 +171,12 @@ if not logger.handlers:
     _stderr_h.setLevel(logging.INFO)
     _stderr_h.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
     logger.addHandler(_stderr_h)
+
+# 日志建好了,把顶层 _import 攒下的失败吐出来。用 WARNING 而不是 DEBUG:
+# 某个 core 模块没导进来意味着对应工具一定会在调用时炸,这必须在启动日志里
+# 一眼看见,而不是等用户去踩。
+for _failure in _IMPORT_FAILURES:
+    logger.warning("模块导入失败(相关工具将不可用): %s", _failure)
 
 
 # 常量
@@ -190,6 +248,225 @@ def _safe_write_path(path: str, base_dirs: List[str]) -> str:
 
 def _new_error_id() -> str:
     return uuid.uuid4().hex[:12]
+
+
+# ============================================================
+# pyshark 采集的超时与截断
+# ============================================================
+
+# 单个 pyshark 分析器最多扫多少包。这是个**性能**上限,不是"看完了"——
+# 所有用到它的地方都必须在返回值里带 packets_scanned / packet_limit_hit,
+# 让调用方知道后面还有没看的流量。取证工具里"扫到上限就停"和"扫完了没发现"
+# 在输出上必须能区分开。
+_MAX_PYSHARK_PACKETS = 5000
+
+# ICMP 隐写分析的包数上限（原来硬编码在函数体里，同样不上报）
+_MAX_ICMP_PACKETS = 2000
+
+# ── 采集超时预算 ──────────────────────────────────────────────
+#
+# 原来是写死的 60 / 120 秒。实测本机 tshark 全文件扫描约 0.2 秒/MB
+# (45MB→5.0s, 166MB→29.1s,过滤器一个都不匹配、必须扫全文的最坏情况),
+# 折算下来 60 秒只够 ~320MB、120 秒只够 ~620MB。听澜是专门处理大流量包的
+# 取证工具,这个天花板太矮 —— 而且它以前是**隐形**的:超时那段代码没生效,
+# 大包会先跑满全程再返回一个空 error,看起来像分析失败而不是超时。
+#
+# 现在按文件大小自适应,并留 2 倍余量吸收慢盘、复杂过滤器、机器差异。
+_CAPTURE_SECONDS_PER_MB = 0.4
+# 下限对齐已有的 _TSHARK_DEFAULT_TIMEOUT —— 小文件不该比 tshark 自己的
+# 预算还紧张。
+_CAPTURE_TIMEOUT_FLOOR = 300
+# 上限兜底:再大的包也不该把一次 MCP 调用钉死一整天。
+_CAPTURE_TIMEOUT_CEILING = 3600
+
+
+def _capture_timeout(pcap_path: str, override: Optional[float] = None) -> float:
+    """按 pcap 大小算采集预算,override 非空时优先(仍受上下限约束)。
+
+    取不到文件大小(路径怪、权限问题)就退回下限,不能让预算计算本身把
+    请求搞挂 —— 宁可给个保守值也不能抛。
+    """
+    if override is not None:
+        try:
+            value = float(override)
+        except (TypeError, ValueError):
+            raise ValueError(f"timeout 必须是数字,收到: {override!r}")
+        if value <= 0:
+            raise ValueError(f"timeout 必须为正数,收到: {value}")
+        return min(value, _CAPTURE_TIMEOUT_CEILING)
+
+    try:
+        size_mb = os.path.getsize(pcap_path) / (1024 * 1024)
+    except OSError:
+        return _CAPTURE_TIMEOUT_FLOOR
+
+    budget = size_mb * _CAPTURE_SECONDS_PER_MB
+    return max(_CAPTURE_TIMEOUT_FLOOR, min(budget, _CAPTURE_TIMEOUT_CEILING))
+
+
+class _CaptureTimeout(Exception):
+    """采集超时。带上被杀掉的 tshark pid,方便对着日志查。"""
+
+    def __init__(self, timeout: float, killed_pids: List[int]):
+        self.timeout = timeout
+        self.killed_pids = killed_pids
+        super().__init__(
+            f"分析超时({timeout:.0f}s),已终止 tshark 进程 {killed_pids or '(未找到)'}。"
+            f"包很大或磁盘慢时可传 timeout 参数放宽(上限 {_CAPTURE_TIMEOUT_CEILING}s)"
+        )
+
+
+class _CaptureHandle:
+    """把 pyshark 的 tshark 子进程 PID 暴露给采集线程之外的调用方。
+
+    为什么需要它:pyshark 的 ``cap.close()`` 是 ``eventloop.run_until_complete``,
+    绑死在**创建它的那个线程**的事件循环上,从超时监控线程调用会出问题。
+    但 ``cap._running_processes`` 里的每个对象都带一个真实的 OS pid ——
+    直接按 pid 发信号不碰事件循环,是唯一安全的跨线程中断方式。
+
+    杀掉 tshark 之后,采集线程那边的管道读会拿到 EOF,自己走 finally 退出,
+    不会残留。
+    """
+
+    def __init__(self):
+        self._cap = None
+        self._lock = threading.Lock()
+
+    def attach(self, cap) -> None:
+        with self._lock:
+            self._cap = cap
+
+    def kill_tshark(self) -> List[int]:
+        """杀掉这次采集起的 tshark(连同它的子进程),返回被杀的 pid。"""
+        with self._lock:
+            cap = self._cap
+        if cap is None:
+            return []
+
+        # _running_processes 是 pyshark 私有属性,版本升级可能改名。
+        # 拿不到就退回空列表,不能让清理逻辑本身把请求搞崩。
+        procs = getattr(cap, "_running_processes", None)
+        if not procs:
+            return []
+
+        killed = []
+        for proc in list(procs):
+            pid = getattr(proc, "pid", None)
+            if not pid:
+                continue
+            try:
+                import psutil
+                p = psutil.Process(pid)
+                for child in p.children(recursive=True):
+                    child.kill()
+                p.kill()
+                killed.append(pid)
+            except ImportError:
+                try:
+                    os.kill(pid, 9)
+                    killed.append(pid)
+                except OSError:
+                    pass
+            except Exception as e:      # psutil.NoSuchProcess 等
+                logger.debug("kill tshark pid=%s 失败: %s", pid, e)
+
+        # 进程已经杀干净了,把 pyshark 的登记表清空。
+        # 它的 __del__ 是 `if self._running_processes: self.close()`,而
+        # close() 又是 `eventloop.run_until_complete(...)` —— 采集线程退出后
+        # 那个事件循环已经关了,GC 再触发就会往 stderr 吐一串
+        # "Exception ignored in: Capture.__del__ / RuntimeError: Event loop is closed"。
+        # 清空之后 __del__ 直接跳过,日志干净。
+        try:
+            procs.clear()
+        except Exception:
+            pass
+        return killed
+
+
+def _run_capture(capture_fn, timeout: float, label: str):
+    """跑一次 pyshark 采集,超时时真的把 tshark 杀掉。
+
+    原来这里是::
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            r = pool.submit(_capture).result(timeout=60)
+
+    ``with`` 退出时会调 ``shutdown(wait=True)``,**阻塞到任务自己跑完为止**,
+    所以那个 timeout 从来没生效过。实测:声称 1s 超时,实际 6.0s。
+    后果比没有超时更糟 —— 60 秒时抛 TimeoutError,却要等采集真跑完才返回,
+    然后把已经算好的结果丢掉;而 ``str(concurrent.futures.TimeoutError())``
+    是空串,调用方连"超时了"都读不出来。
+
+    现在:超时 → 按 pid 杀 tshark → ``shutdown(wait=False)`` 立刻返回,
+    抛 _CaptureTimeout(带明确文案)。
+
+    capture_fn 接收一个 _CaptureHandle,必须在建好 FileCapture 之后
+    立即 ``handle.attach(cap)``,否则超时时找不到进程可杀。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import TimeoutError as _FuturesTimeout
+
+    handle = _CaptureHandle()
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = pool.submit(capture_fn, handle)
+        try:
+            return future.result(timeout=timeout)
+        except _FuturesTimeout:
+            killed = handle.kill_tshark()
+            logger.warning("%s 采集超时 %.0fs,已终止 tshark %s", label, timeout, killed)
+            raise _CaptureTimeout(timeout, killed) from None
+    finally:
+        # 关键:wait=False。用 with 或 wait=True 会在这里把上面省下的时间
+        # 原样等回来,超时就又白做了。
+        pool.shutdown(wait=False)
+
+
+def _scan_report(scanned: int, limit: int = _MAX_PYSHARK_PACKETS) -> Dict[str, Any]:
+    """扫描覆盖度。任何有包数上限的分析器都要把它并进返回值。"""
+    hit = scanned >= limit
+    report: Dict[str, Any] = {
+        "packets_scanned": scanned,
+        "packet_limit": limit,
+        "packet_limit_hit": hit,
+    }
+    if hit:
+        report["note"] = (
+            f"已达 {limit} 包扫描上限,该上限之后的流量未被检查,结果可能不完整"
+        )
+    return report
+
+
+def _capped(items: List[Any], cap: int, name: str, out: Dict[str, Any]) -> List[Any]:
+    """列表截断 + 上报。
+
+    原来是直接 ``credentials[:10]`` 就返回了 —— 抓到 15 组凭据只显示 10 组,
+    调用方无从知道被切过。现在总数和是否截断都写进返回值。
+    """
+    total = len(items)
+    out[f"total_{name}"] = total
+    if total > cap:
+        out[f"{name}_truncated"] = True
+        out.setdefault("truncated", True)
+        return items[:cap]
+    return items
+
+
+# 需要原样透传到 MCP 返回值里的覆盖度/截断字段。
+# 子分析器（_analyze_*_sub）算好了这些，但工具层原来只挑自己关心的几个 key
+# 往外拷，把它们全丢了 —— 于是"只扫了前 5000 包"和"抓到 15 条只回了 10 条"
+# 这些信息死在中间层，调用方照样什么都不知道。
+_REPORT_KEYS = frozenset({
+    "packets_scanned", "packet_limit", "packet_limit_hit", "note", "truncated",
+})
+
+
+def _carry_report(result: Dict[str, Any]) -> Dict[str, Any]:
+    """从子分析器结果里挑出覆盖度/截断字段，供工具层展开转发。"""
+    return {
+        k: v for k, v in result.items()
+        if k in _REPORT_KEYS or k.startswith("total_") or k.endswith("_truncated")
+    }
 
 
 def _error_response(exc: Exception, error_id: str,
@@ -484,56 +761,61 @@ def _detect_attacks_ek(pcap_path, tshark_path, max_packets=0):
     return attacks
 
 
-def _analyze_icmp(pcap_path, tshark_path):
+def _analyze_icmp(pcap_path, tshark_path, timeout=None):
     """ICMP隐写分析"""
     if not ICMPAnalyzer: return {"available": False, "error": "ICMPAnalyzer not loaded"}
 
-    def _capture():
+    def _capture(handle):
         import asyncio
         asyncio.set_event_loop(asyncio.new_event_loop())
         import pyshark
         cap = pyshark.FileCapture(pcap_path, tshark_path=tshark_path, display_filter='icmp')
+        handle.attach(cap)      # 超时时要靠它按 pid 杀 tshark
         pkts = []
         try:
             for pkt in cap:
+                if len(pkts) >= _MAX_ICMP_PACKETS:
+                    break
                 pkts.append(pkt)
-                if len(pkts) > 2000: break
         finally:
             cap.close()
         return pkts
 
     try:
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            pkts = pool.submit(_capture).result(timeout=60)
+        pkts = _run_capture(_capture, _capture_timeout(pcap_path, timeout), "ICMP")
         if len(pkts) < 5: return {"available": False, "icmp_count": len(pkts)}
         result = ICMPAnalyzer().analyze(pkts)
         return {
             "available": True, "icmp_count": result.packet_count,
+            **_scan_report(len(pkts), _MAX_ICMP_PACKETS),
             "findings": [{"type": f.finding_type.value, "title": f.title, "data": f.data,
                           "confidence": f.confidence, "is_flag": f.is_flag} for f in result.findings],
             "possible_flags": result.get_flags(), "summary": result.summary
         }
+    except _CaptureTimeout as e:
+        return {"available": False, "error": str(e), "timed_out": True}
     except Exception as e:
         return {"available": False, **_local_error(e)}
 
 
-def _analyze_ftp_sub(pcap_path, tshark_path):
+def _analyze_ftp_sub(pcap_path, tshark_path, timeout=None):
     """FTP 子分析（线程安全，避免 pyshark 事件循环冲突）"""
-    def _capture():
+    def _capture(handle):
         import asyncio
         asyncio.set_event_loop(asyncio.new_event_loop())
         import pyshark
         cap = pyshark.FileCapture(pcap_path, tshark_path=tshark_path, display_filter='ftp')
+        handle.attach(cap)      # 超时时要靠它按 pid 杀 tshark
         credentials = []
         files = []
         commands = []
         current_user = None
+        pkt_count = 0
         try:
-            pkt_count = 0
             for pkt in cap:
+                if pkt_count >= _MAX_PYSHARK_PACKETS:
+                    break
                 pkt_count += 1
-                if pkt_count > 5000: break
                 if 'FTP' in pkt:
                     try:
                         ftp = pkt.ftp
@@ -554,26 +836,24 @@ def _analyze_ftp_sub(pcap_path, tshark_path):
                         continue
         finally:
             cap.close()
-        return credentials, files, commands
+        return credentials, files, commands, pkt_count
 
     try:
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            credentials, files, commands = pool.submit(_capture).result(timeout=60)
-        return {
-            "available": True,
-            "credentials": credentials[:10],
-            "files": files[:20],
-            "commands": commands[:50],
-            "total_commands": len(commands),
-        }
+        credentials, files, commands, scanned = _run_capture(_capture, _capture_timeout(pcap_path, timeout), "FTP")
+        out: Dict[str, Any] = {"available": True, **_scan_report(scanned)}
+        out["credentials"] = _capped(credentials, 10, "credentials", out)
+        out["files"] = _capped(files, 20, "files", out)
+        out["commands"] = _capped(commands, 50, "commands", out)
+        return out
+    except _CaptureTimeout as e:
+        return {"available": False, "error": str(e), "timed_out": True}
     except Exception as e:
-        return {"available": False, "error": str(e)}
+        return {"available": False, "error": str(e) or type(e).__name__}
 
 
-def _analyze_smtp_sub(pcap_path, tshark_path):
+def _analyze_smtp_sub(pcap_path, tshark_path, timeout=None):
     """SMTP 子分析（线程安全，避免 pyshark 事件循环冲突）"""
-    def _capture():
+    def _capture(handle):
         import asyncio
         asyncio.set_event_loop(asyncio.new_event_loop())
         import pyshark
@@ -581,6 +861,7 @@ def _analyze_smtp_sub(pcap_path, tshark_path):
         import re
 
         cap = pyshark.FileCapture(pcap_path, tshark_path=tshark_path, display_filter='smtp')
+        handle.attach(cap)      # 超时时要靠它按 pid 杀 tshark
 
         credentials = []
         emails = []
@@ -600,11 +881,12 @@ def _analyze_smtp_sub(pcap_path, tshark_path):
             except:
                 return None
 
+        pkt_count = 0
         try:
-            pkt_count = 0
             for packet in cap:
+                if pkt_count >= _MAX_PYSHARK_PACKETS:
+                    break
                 pkt_count += 1
-                if pkt_count > 5000: break
                 msg = ""
                 if 'SMTP' in packet:
                     msg = getattr(packet.smtp, 'command_line', "") or getattr(packet.smtp, 'response_line', "")
@@ -663,31 +945,31 @@ def _analyze_smtp_sub(pcap_path, tshark_path):
                         mail_buffer.append(raw_line)
         finally:
             cap.close()
-        return credentials, emails
+        return credentials, emails, pkt_count
 
     try:
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            credentials, emails = pool.submit(_capture).result(timeout=60)
-        return {
-            "available": True,
-            "credentials": credentials[:10],
-            "emails": emails[:20],
-            "mail_count": len(emails),
-        }
+        credentials, emails, scanned = _run_capture(_capture, _capture_timeout(pcap_path, timeout), "SMTP")
+        out: Dict[str, Any] = {"available": True, **_scan_report(scanned)}
+        out["credentials"] = _capped(credentials, 10, "credentials", out)
+        out["emails"] = _capped(emails, 20, "emails", out)
+        out["mail_count"] = len(emails)
+        return out
+    except _CaptureTimeout as e:
+        return {"available": False, "error": str(e), "timed_out": True}
     except Exception as e:
-        return {"available": False, "error": str(e)}
+        return {"available": False, "error": str(e) or type(e).__name__}
 
 
-def _analyze_bluetooth_sub(pcap_path, tshark_path):
+def _analyze_bluetooth_sub(pcap_path, tshark_path, timeout=None):
     """蓝牙子分析（线程安全，避免 pyshark 事件循环冲突）"""
-    def _capture():
+    def _capture(handle):
         import asyncio
         asyncio.set_event_loop(asyncio.new_event_loop())
         import pyshark
         import re
 
         cap = pyshark.FileCapture(pcap_path, tshark_path=tshark_path, display_filter='bluetooth')
+        handle.attach(cap)      # 超时时要靠它按 pid 杀 tshark
 
         obex_files = []
         l2cap_count = 0
@@ -699,14 +981,15 @@ def _analyze_bluetooth_sub(pcap_path, tshark_path):
                 return ""
             return re.sub(r'[^0-9a-fA-F]', '', str(raw_hex))
 
+        pkt_count = 0
         try:
-            pkt_count = 0
             for packet in cap:
+                if pkt_count >= _MAX_PYSHARK_PACKETS:
+                    break
                 pkt_count += 1
-                if pkt_count > 5000: break
                 try:
                     session_id = f"{packet.bluetooth.src}_{packet.bluetooth.dst}" if hasattr(packet, 'bluetooth') else "unknown"
-                except:
+                except Exception:
                     session_id = "unknown"
 
                 if 'OBEX' in packet:
@@ -723,20 +1006,19 @@ def _analyze_bluetooth_sub(pcap_path, tshark_path):
                     gatt_count += 1
         finally:
             cap.close()
-        return obex_files, l2cap_count, gatt_count
+        return obex_files, l2cap_count, gatt_count, pkt_count
 
     try:
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            obex_files, l2cap_count, gatt_count = pool.submit(_capture).result(timeout=60)
-        return {
-            "available": True,
-            "obex_files": obex_files[:20],
-            "l2cap_count": l2cap_count,
-            "gatt_count": gatt_count,
-        }
+        obex_files, l2cap_count, gatt_count, scanned = _run_capture(_capture, _capture_timeout(pcap_path, timeout), "蓝牙")
+        out: Dict[str, Any] = {"available": True, **_scan_report(scanned)}
+        out["obex_files"] = _capped(obex_files, 20, "obex_files", out)
+        out["l2cap_count"] = l2cap_count
+        out["gatt_count"] = gatt_count
+        return out
+    except _CaptureTimeout as e:
+        return {"available": False, "error": str(e), "timed_out": True}
     except Exception as e:
-        return {"available": False, "error": str(e)}
+        return {"available": False, "error": str(e) or type(e).__name__}
 
 
 def _detect_trigger_domain(pkts):
@@ -984,30 +1266,31 @@ def _decode_buffer(buffer, decode_mode):
         return None
 
 
-def _analyze_dns_covert(pcap_path, tshark_path, decode_mode="auto", trigger_domain="auto"):
+def _analyze_dns_covert(pcap_path, tshark_path, decode_mode="auto", trigger_domain="auto",
+                        timeout=None):
     """DNS隐蔽通道分析（线程安全，避免 pyshark 事件循环冲突）
     trigger_domain='auto' 时自动从流量中检测触发域名。"""
     if not DNSCovertChannelAnalyzer:
         return {"ok": False, "error": "DNSCovertChannelAnalyzer not loaded"}
 
-    def _capture():
+    def _capture(handle):
         import asyncio
         asyncio.set_event_loop(asyncio.new_event_loop())
         import pyshark
         cap = pyshark.FileCapture(pcap_path, tshark_path=tshark_path, display_filter='dns')
+        handle.attach(cap)      # 超时时要靠它按 pid 杀 tshark
         pkts = []
         try:
             for pkt in cap:
+                if len(pkts) >= _MAX_PYSHARK_PACKETS:
+                    break
                 pkts.append(pkt)
-                if len(pkts) > 5000: break
         finally:
             cap.close()
         return pkts
 
     try:
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            pkts = pool.submit(_capture).result(timeout=120)
+        pkts = _run_capture(_capture, _capture_timeout(pcap_path, timeout), "DNS")
 
         if not pkts:
             return {"ok": True, "available": False, "dns_count": 0, "message": "未发现DNS包"}
@@ -1067,6 +1350,7 @@ def _analyze_dns_covert(pcap_path, tshark_path, decode_mode="auto", trigger_doma
             "ok": True,
             "available": True,
             "dns_count": result.packet_count,
+            **_scan_report(len(pkts)),
             "decode_mode": actual_mode,
             "trigger_domain": actual_trigger,
             "findings": [f.to_dict() for f in result.findings],
@@ -1129,33 +1413,38 @@ def _analyze_dns_covert(pcap_path, tshark_path, decode_mode="auto", trigger_doma
         if auto_detected_trigger:
             resp["auto_detected_trigger"] = auto_detected_trigger
         return resp
+    except _CaptureTimeout as e:
+        return {"ok": False, "error": str(e), "timed_out": True}
     except Exception as e:
         return _local_error(e)
 
 
-def _analyze_cobalt_strike(pcap_path, tshark_path, key_file_path=None):
+def _analyze_cobalt_strike(pcap_path, tshark_path, key_file_path=None, timeout=None):
     """Cobalt Strike C2分析（线程安全，避免 pyshark 事件循环冲突）"""
     if not CobaltStrikeAnalyzer:
         return {"ok": False, "error": "CobaltStrikeAnalyzer not loaded"}
 
-    def _capture():
+    def _capture(handle):
         import asyncio
         asyncio.set_event_loop(asyncio.new_event_loop())
         import pyshark
         cap = pyshark.FileCapture(pcap_path, tshark_path=tshark_path, display_filter='http')
+        handle.attach(cap)      # 超时时要靠它按 pid 杀 tshark
         pkts = []
         try:
             for pkt in cap:
+                if len(pkts) >= _MAX_PYSHARK_PACKETS:
+                    break
                 pkts.append(pkt)
-                if len(pkts) > 5000: break
         finally:
             cap.close()
         return pkts
 
     try:
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            pkts = pool.submit(_capture).result(timeout=120)
+        pkts = _run_capture(_capture, _capture_timeout(pcap_path, timeout), "Cobalt Strike")
+        # 扫描覆盖度。CS 分析有 6 个返回分支，每个都要带上，否则"只扫了前
+        # 5000 个 HTTP 包"这件事会在某条分支上悄悄丢掉。
+        _cs_scan = _scan_report(len(pkts))
 
         if not pkts:
             return {"ok": True, "available": False, "http_count": 0, "message": "未发现HTTP包"}
@@ -1172,6 +1461,7 @@ def _analyze_cobalt_strike(pcap_path, tshark_path, key_file_path=None):
                 "ok": True,
                 "available": True,
                 "http_count": stage1_result.packet_count,
+                **_cs_scan,
                 "cookies_found": 0,
                 "findings": findings,
                 "summary": "未发现CS Metadata Cookie",
@@ -1195,6 +1485,7 @@ def _analyze_cobalt_strike(pcap_path, tshark_path, key_file_path=None):
                 return {
                     "ok": True, "available": True,
                     "http_count": stage1_result.packet_count,
+                    **_cs_scan,
                     "cookies_found": len(cookies), "cookies": cookies[:10],
                     "findings": findings,
                     "summary": f"提取 {len(cookies)} 个Cookie, 密钥提取失败",
@@ -1218,6 +1509,7 @@ def _analyze_cobalt_strike(pcap_path, tshark_path, key_file_path=None):
                 return {
                     "ok": True, "available": True,
                     "http_count": stage1_result.packet_count,
+                    **_cs_scan,
                     "cookies_found": len(cookies),
                     "findings": findings,
                     "summary": f"提取 {len(cookies)} 个Cookie, 缺少 cryptography 包",
@@ -1226,6 +1518,7 @@ def _analyze_cobalt_strike(pcap_path, tshark_path, key_file_path=None):
                 return {
                     "ok": True, "available": True,
                     "http_count": stage1_result.packet_count,
+                    **_cs_scan,
                     "cookies_found": len(cookies),
                     "findings": findings,
                     "summary": f"提取 {len(cookies)} 个Cookie, PEM加载失败: {e}",
@@ -1268,6 +1561,7 @@ def _analyze_cobalt_strike(pcap_path, tshark_path, key_file_path=None):
             return {
                 "ok": True, "available": True,
                 "http_count": stage1_result.packet_count,
+                **_cs_scan,
                 "cookies_found": len(cookies),
                 "sessions_decrypted": len(sessions),
                 "sessions": sessions,
@@ -1280,11 +1574,14 @@ def _analyze_cobalt_strike(pcap_path, tshark_path, key_file_path=None):
             "ok": True,
             "available": True,
             "http_count": stage1_result.packet_count,
+            **_cs_scan,
             "cookies_found": len(cookies),
             "cookies": cookies[:10],
             "findings": findings,
             "summary": f"提取 {len(cookies)} 个Cookie, 未提供密钥文件",
         }
+    except _CaptureTimeout as e:
+        return {"ok": False, "error": str(e), "timed_out": True}
     except Exception as e:
         return _local_error(e)
 
@@ -1806,14 +2103,17 @@ def analyze_php_ast(code: str) -> Dict[str, Any]:
 
 @mcp.tool()
 @pcap_tool(read_paths=["pcap_path"])
-def analyze_ftp(pcap_path: str, tshark_path: Optional[str] = None) -> Dict[str, Any]:
-    """分析FTP流量,提取凭据和文件传输信息。返回登录凭据(用户名/密码)、传输文件列表(文件名/上传或下载)和FTP命令记录"""
+def analyze_ftp(pcap_path: str, tshark_path: Optional[str] = None,
+                timeout: Optional[float] = None) -> Dict[str, Any]:
+    """分析FTP流量,提取凭据和文件传输信息。返回登录凭据(用户名/密码)、传输文件列表(文件名/上传或下载)和FTP命令记录
+    timeout: 采集超时秒数。不传则按 pcap 大小自适应(约 0.4 秒/MB, 下限 300s, 上限 3600s)。
+    """
     try:
         if not os.path.exists(pcap_path):
             return {"ok": False, "error": f"文件不存在: {pcap_path}"}
 
         tshark = _find_tshark(tshark_path)
-        result = _analyze_ftp_sub(pcap_path, tshark)
+        result = _analyze_ftp_sub(pcap_path, tshark, timeout=timeout)
         if not result.get("available"):
             return {"ok": False, "error": result.get("error", "FTP 分析失败")}
         return {
@@ -1821,7 +2121,7 @@ def analyze_ftp(pcap_path: str, tshark_path: Optional[str] = None) -> Dict[str, 
             "credentials": result["credentials"],
             "files": result["files"],
             "commands": result.get("commands", []),
-            "total_commands": result.get("total_commands", 0),
+            **_carry_report(result),
         }
     except Exception as e:
         return _local_error(e)
@@ -1829,14 +2129,17 @@ def analyze_ftp(pcap_path: str, tshark_path: Optional[str] = None) -> Dict[str, 
 
 @mcp.tool()
 @pcap_tool(read_paths=["pcap_path"])
-def analyze_smtp(pcap_path: str, tshark_path: Optional[str] = None) -> Dict[str, Any]:
-    """分析SMTP邮件流量,提取认证和邮件内容。返回认证凭据(用户名/密码)、邮件列表(发件人/收件人/主题)"""
+def analyze_smtp(pcap_path: str, tshark_path: Optional[str] = None,
+                 timeout: Optional[float] = None) -> Dict[str, Any]:
+    """分析SMTP邮件流量,提取认证和邮件内容。返回认证凭据(用户名/密码)、邮件列表(发件人/收件人/主题)
+    timeout: 采集超时秒数。不传则按 pcap 大小自适应(约 0.4 秒/MB, 下限 300s, 上限 3600s)。
+    """
     try:
         if not os.path.exists(pcap_path):
             return {"ok": False, "error": f"文件不存在: {pcap_path}"}
 
         tshark = _find_tshark(tshark_path)
-        result = _analyze_smtp_sub(pcap_path, tshark)
+        result = _analyze_smtp_sub(pcap_path, tshark, timeout=timeout)
         if not result.get("available"):
             return {"ok": False, "error": result.get("error", "SMTP 分析失败")}
         return {
@@ -1844,6 +2147,7 @@ def analyze_smtp(pcap_path: str, tshark_path: Optional[str] = None) -> Dict[str,
             "credentials": result["credentials"],
             "emails": result["emails"],
             "mail_count": result["mail_count"],
+            **_carry_report(result),
         }
     except Exception as e:
         return _local_error(e)
@@ -1875,14 +2179,17 @@ def analyze_usb(pcap_path: str, tshark_path: Optional[str] = None) -> Dict[str, 
 
 @mcp.tool()
 @pcap_tool(read_paths=["pcap_path"])
-def analyze_bluetooth(pcap_path: str, tshark_path: Optional[str] = None) -> Dict[str, Any]:
-    """分析蓝牙流量,提取OBEX/L2CAP/GATT数据。能识别OBEX文件传输(文件名+会话),统计L2CAP和GATT交互次数"""
+def analyze_bluetooth(pcap_path: str, tshark_path: Optional[str] = None,
+                      timeout: Optional[float] = None) -> Dict[str, Any]:
+    """分析蓝牙流量,提取OBEX/L2CAP/GATT数据。能识别OBEX文件传输(文件名+会话),统计L2CAP和GATT交互次数
+    timeout: 采集超时秒数。不传则按 pcap 大小自适应(约 0.4 秒/MB, 下限 300s, 上限 3600s)。
+    """
     try:
         if not os.path.exists(pcap_path):
             return {"ok": False, "error": f"文件不存在: {pcap_path}"}
 
         tshark = _find_tshark(tshark_path)
-        result = _analyze_bluetooth_sub(pcap_path, tshark)
+        result = _analyze_bluetooth_sub(pcap_path, tshark, timeout=timeout)
         if not result.get("available"):
             return {"ok": False, "error": result.get("error", "蓝牙分析失败")}
         return {
@@ -1890,6 +2197,7 @@ def analyze_bluetooth(pcap_path: str, tshark_path: Optional[str] = None) -> Dict
             "obex_files": result["obex_files"],
             "l2cap_count": result["l2cap_count"],
             "gatt_count": result["gatt_count"],
+            **_carry_report(result),
         }
     except Exception as e:
         return _local_error(e)
@@ -1897,19 +2205,24 @@ def analyze_bluetooth(pcap_path: str, tshark_path: Optional[str] = None) -> Dict
 
 @mcp.tool()
 @pcap_tool(read_paths=["pcap_path"])
-def analyze_mms(pcap_path: str, tshark_path: Optional[str] = None) -> Dict[str, Any]:
-    """分析MMS协议流量,追踪InvokeID提取文件传输数据。适用于工控/SCADA流量,提取文件内容预览和文件名"""
+def analyze_mms(pcap_path: str, tshark_path: Optional[str] = None,
+                timeout: Optional[float] = None) -> Dict[str, Any]:
+    """分析MMS协议流量,追踪InvokeID提取文件传输数据。适用于工控/SCADA流量,提取文件内容预览和文件名
+
+    timeout: 采集超时秒数。不传则按 pcap 大小自适应(约 0.4 秒/MB, 下限 300s, 上限 3600s)。
+    """
     try:
         if not os.path.exists(pcap_path):
             return {"ok": False, "error": f"文件不存在: {pcap_path}"}
 
-        def _capture():
+        def _capture(handle):
             import asyncio
             asyncio.set_event_loop(asyncio.new_event_loop())
             import pyshark
 
             tshark = _find_tshark(tshark_path)
             cap = pyshark.FileCapture(pcap_path, tshark_path=tshark, display_filter='mms')
+            handle.attach(cap)      # 超时时要靠它按 pid 杀 tshark
 
             open_inv_to_name = {}
             frsm_to_name = {}
@@ -1968,15 +2281,15 @@ def analyze_mms(pcap_path: str, tshark_path: Optional[str] = None) -> Dict[str, 
                 cap.close()
             return extracted_files
 
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            extracted_files = pool.submit(_capture).result(timeout=120)
+        extracted_files = _run_capture(_capture, _capture_timeout(pcap_path, timeout), "MMS")
 
         return {
             "ok": True,
             "extracted_files": extracted_files,
             "file_count": len(extracted_files),
         }
+    except _CaptureTimeout as e:
+        return {"ok": False, "error": str(e), "timed_out": True}
     except Exception as e:
         return _local_error(e)
 
@@ -2056,7 +2369,8 @@ def analyze_rtp(pcap_path: str, tshark_path: Optional[str] = None, export: bool 
 @mcp.tool()
 @pcap_tool(read_paths=["pcap_path"], requires_modules=[(DNSCovertChannelAnalyzer, "protocol_analyzer")])
 def analyze_dns_covert(pcap_path: str, tshark_path: Optional[str] = None,
-                       decode_mode: str = "auto", trigger_domain: str = "auto") -> Dict[str, Any]:
+                       decode_mode: str = "auto", trigger_domain: str = "auto",
+                       timeout: Optional[float] = None) -> Dict[str, Any]:
     """分析DNS隐蔽通道流量,提取子域名编码数据、TXT指令和域名统计。
     支持hex(Hex→Base64→GB2312)和base64(Base64→GB2312)两种解码模式。
     decode_mode='auto'时自动检测编码模式。
@@ -2066,6 +2380,7 @@ def analyze_dns_covert(pcap_path: str, tshark_path: Optional[str] = None,
     tshark_path: tshark路径(可选)
     decode_mode: 解码模式,'hex'或'base64'或'auto'(默认auto,自动检测)
     trigger_domain: 触发结算的域名(默认auto,自动检测)
+    timeout: 采集超时秒数。不传则按 pcap 大小自适应(约 0.4 秒/MB, 下限 300s, 上限 3600s)。
     """
     if DNSCovertChannelAnalyzer is None:
         return {"ok": False, "error": "DNSCovertChannelAnalyzer 模块不可用"}
@@ -2076,7 +2391,7 @@ def analyze_dns_covert(pcap_path: str, tshark_path: Optional[str] = None,
 
         tshark = _find_tshark(tshark_path)
         result = _analyze_dns_covert(pcap_path, tshark, decode_mode=decode_mode,
-                                     trigger_domain=trigger_domain)
+                                     trigger_domain=trigger_domain, timeout=timeout)
         return result
 
     except Exception as e:
@@ -2087,7 +2402,8 @@ def analyze_dns_covert(pcap_path: str, tshark_path: Optional[str] = None,
 @pcap_tool(read_paths=["pcap_path", ("key_file_path", "any_ext")],
            requires_modules=[(CobaltStrikeAnalyzer, "protocol_analyzer")])
 def analyze_cobalt_strike(pcap_path: str, tshark_path: Optional[str] = None,
-                          key_file_path: Optional[str] = None) -> Dict[str, Any]:
+                          key_file_path: Optional[str] = None,
+                          timeout: Optional[float] = None) -> Dict[str, Any]:
     """分析Cobalt Strike C2流量,提取HTTP Cookie中的Metadata。
     无key_file_path时仅提取Cookie和基本findings;
     有key_file_path时执行完整解密(RSA解密→Metadata解析→Session存储),返回Beacon ID/AES密钥/主机信息。
@@ -2095,6 +2411,7 @@ def analyze_cobalt_strike(pcap_path: str, tshark_path: Optional[str] = None,
     pcap_path: pcap文件路径
     tshark_path: tshark路径(可选)
     key_file_path: .cobaltstrike.beacon_keys文件路径(可选)
+    timeout: 采集超时秒数。不传则按 pcap 大小自适应(约 0.4 秒/MB, 下限 300s, 上限 3600s)。
     """
     if CobaltStrikeAnalyzer is None:
         return {"ok": False, "error": "CobaltStrikeAnalyzer 模块不可用"}
@@ -2104,7 +2421,8 @@ def analyze_cobalt_strike(pcap_path: str, tshark_path: Optional[str] = None,
             return {"ok": False, "error": f"文件不存在: {pcap_path}"}
 
         tshark = _find_tshark(tshark_path)
-        result = _analyze_cobalt_strike(pcap_path, tshark, key_file_path=key_file_path)
+        result = _analyze_cobalt_strike(pcap_path, tshark, key_file_path=key_file_path,
+                                        timeout=timeout)
         return result
 
     except Exception as e:
