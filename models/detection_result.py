@@ -38,10 +38,15 @@ class ThreatLevel(Enum):
 
     @classmethod
     def from_confidence(cls, confidence: str) -> "ThreatLevel":  # 从置信度转换为威胁等级
+        # "suspicious" 是 calculate_confidence 里最弱的一档（权重刚过 30 分，
+        # 连检测阈值 60 都没到）。它原本不在表里，靠 mapping 的默认值落到
+        # MEDIUM —— 于是最不可信的一档在界面上显示成"中危"，正常 JS 被
+        # 蹭到几十分就红了半屏。它属于低危。
         mapping = {
             "high": cls.HIGH,
             "medium": cls.MEDIUM,
             "low": cls.LOW,
+            "suspicious": cls.LOW,
             "none": cls.INFO
         }
         return mapping.get(confidence, cls.MEDIUM)

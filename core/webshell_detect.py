@@ -13,10 +13,12 @@ try:
     from core.http_formatter import burp_format_request
     from core.statistical_analyzer import StatisticalAnalyzer, StatisticalConfig
     from core.http_reassembly import decode_http_body_text
+    from core.static_asset import is_static_asset
 except ImportError:
     from http_formatter import burp_format_request
     from statistical_analyzer import StatisticalAnalyzer, StatisticalConfig
     from http_reassembly import decode_http_body_text
+    from static_asset import is_static_asset
 
 logger = logging.getLogger(__name__)
 
@@ -194,26 +196,47 @@ class DetectionConfig:
     )
 
     # 响应包
+    #
+    # 'requires': 只有当列表里某个特征也命中时才计分。用来救那些形状本身
+    # 太常见、单独出现毫无证据力的分隔符类特征。
+    # 'ambiguous': 正常网页内容里也会出现，扫前端静态资源时不计分。
+    # 'case_sensitive': 关掉默认的 IGNORECASE。协议里写死的字面标记
+    #   （[S]/[E]、X@Y）必须大小写敏感，否则压缩 JS 的单字母下标就命中了。
     RESPONSE_INDICATORS = [
         # 蚁剑响应
-        {'pattern': r'\[S\].*?\[E\]', 'weight': 85, 'name': 'antsword_marker', 'flags': re.DOTALL},  # [S][E]标记
-        {'pattern': r'->\./', 'weight': 60, 'name': 'path_marker'},  # 路径标记
+        # `\[S\].*?\[E\]` 原本走默认的 IGNORECASE，于是压缩 jQuery 里的
+        # `p.event.global[s] ... t[e]` 被当成蚁剑起止标记，白拿 85 分 ——
+        # 实测 webone.pcap 里三个 jquery.min.js 都因此被判成蚁剑中危。
+        # 两道收口：大小写敏感 + `[S]` 前面不能紧跟标识符/右括号
+        # （那种位置的一定是数组下标，不是标记）。
+        {'pattern': r'(?<![\w\]\)])\[S\].*?\[E\]', 'weight': 85, 'name': 'antsword_marker',
+         'flags': re.DOTALL, 'case_sensitive': True},  # [S][E]标记
+        {'pattern': r'->\./', 'weight': 60, 'name': 'path_marker', 'ambiguous': True},  # 路径标记
 
         # 菜刀响应
-        {'pattern': r'X@Y', 'weight': 70, 'name': 'caidao_xay_marker'},  # X@Y标记
+        {'pattern': r'X@Y', 'weight': 70, 'name': 'caidao_xay_marker', 'case_sensitive': True},  # X@Y标记
         {'pattern': r'->\|', 'weight': 65, 'name': 'caidao_path_prefix'},  # ->|路径前缀
-        {'pattern': r'\|\|[^|]+\|\|', 'weight': 50, 'name': 'caidao_delimiter'},  # ||分隔符
+        # 菜刀目录列表的字段分隔符。`\|\|[^|]+\|\|` 会命中 JS 的逻辑或
+        # （`a || b || c`、压缩后的 `a||b||c`），实测 jquery.tab.js 和
+        # kindeditor.js 都因此白拿 50 分进了检测结果。两道收口：
+        #   1. 分隔的字段里不允许有空白，排除 `x || y` 这种带空格的写法；
+        #   2. requires 菜刀自己的会话标记，压缩 JS 的 `a||b||c` 没有上下文
+        #      就不计分。
+        {'pattern': r'\|\|[^|\s]{1,128}\|\|', 'weight': 50, 'name': 'caidao_delimiter',
+         'requires': ['caidao_xay_marker', 'caidao_path_prefix'], 'ambiguous': True},
 
         # 命令执行回显
         {'pattern': r'uid=\d+\([^)]+\)\s+gid=\d+', 'weight': 80, 'name': 'id_command_output'},  # Linux id输出
         {'pattern': r'Windows IP Configuration', 'weight': 75, 'name': 'ipconfig_output'},
         {'pattern': r'Directory of [C-Z]:\\', 'weight': 75, 'name': 'dir_command_output'},
-        {'pattern': r'total\s+\d+.*?drwx', 'weight': 70, 'name': 'ls_command_output', 'flags': re.DOTALL},
+        # `.*?` 配 DOTALL 可以横跨整个响应体，一篇网页里离得老远的 "total 3"
+        # 和 "drwx" 也会被连起来。真 ls -l 的两者相隔不到一行，限长即可。
+        {'pattern': r'total\s+\d+[^\n]{0,80}\n\s*drwx', 'weight': 70, 'name': 'ls_command_output'},
         {'pattern': r'(root|admin|www-data):[x*]:\d+:\d+:', 'weight': 75, 'name': 'etc_passwd_output'},  # /etc/passwd
         {'pattern': r'\[boot loader\]', 'weight': 65, 'name': 'boot_ini_output'},
 
         # 错误信息(权重低，容易误报)
-        {'pattern': r'(Parse error|Fatal error|Warning):\s+.+\s+in\s+.+\s+on line\s+\d+', 'weight': 35, 'name': 'php_error'},
+        {'pattern': r'(Parse error|Fatal error|Warning):\s+.+\s+in\s+.+\s+on line\s+\d+', 'weight': 35, 'name': 'php_error', 'ambiguous': True},
     ]
 
     # HTTP请求特征
@@ -939,6 +962,26 @@ def _get_response_body(response_packet) -> Optional[str]:
     return body if body else None
 
 
+def _response_content_type(response_packet) -> str:
+    """取响应的 Content-Type，取不到返回空串。"""
+    if _http_layer(response_packet) is None:
+        return ""
+    return getattr(response_packet.http, 'content_type', '') or ''
+
+
+def _is_static_asset_pair(request_uri: Optional[str], response_packet) -> bool:
+    """这一对请求-响应是不是浏览器在拉前端静态资源。
+
+    命中的话，响应体里那些"正常网页内容也会出现"的模糊特征就不该计分：
+    jquery 里的 `a || b || c` 不是菜刀的字段分隔符。URI 和 Content-Type
+    两头都看，因为实测有 .js 被服务端以 text/html 返回。
+    """
+    return is_static_asset(
+        uri=request_uri or '',
+        content_type=_response_content_type(response_packet),
+    )
+
+
 def _is_readable_text(text: str) -> bool:
     """检查文本是否可读，用于响应显示判断"""
     if not text or len(text) < 5:
@@ -1115,13 +1158,24 @@ class FeatureMatcher:
     """特征匹配引擎"""
 
     @staticmethod
-    def match_indicators(content: str, indicators: List[Dict]) -> Tuple[List[Dict], int]:
-        """匹配特征列表，返回(匹配结果, 总权重)"""
+    def match_indicators(content: str, indicators: List[Dict],
+                         skip_ambiguous: bool = False) -> Tuple[List[Dict], int]:
+        """匹配特征列表，返回(匹配结果, 总权重)
+
+        两个收敛开关，都是为了别把正常网页内容算成攻击：
+
+        - ``skip_ambiguous``：跳过标了 ``ambiguous`` 的特征。扫前端静态资源
+          （JS/CSS/图片）时传 True —— 那些形状在正常代码里天天出现。
+        - 特征自带的 ``requires``：列表里至少要有一个同批命中的特征，本条
+          才计分。分隔符类特征单独出现毫无证据力，得有会话标记托底。
+
+        ``requires`` 要在**全部匹配完之后**再裁，否则依赖项排在后面就永远
+        判不到。
+        """
         if not content:
             return [], 0
 
         matches = []
-        total_weight = 0
         matched_names = set()
 
         for indicator in indicators:
@@ -1133,22 +1187,38 @@ class FeatureMatcher:
             if name in matched_names:
                 continue
 
+            if skip_ambiguous and indicator.get('ambiguous'):
+                continue
+
+            if not indicator.get('case_sensitive'):
+                flags |= re.IGNORECASE
+
             try:
-                match = re.search(pattern, content, flags | re.IGNORECASE)
+                match = re.search(pattern, content, flags)
                 if match:
                     matches.append({
                         'name': name,
                         'pattern': pattern,
                         'weight': indicator['weight'],
                         'matched_text': match.group(0)[:50],
-                        'description': indicator.get('description', '')
+                        'description': indicator.get('description', ''),
+                        'requires': indicator.get('requires'),
                     })
-                    total_weight += indicator['weight']
                     matched_names.add(name)
             except re.error as e:
                 logger.warning(f"正则表达式错误 [{pattern}]: {e}")
 
-        return matches, total_weight
+        accepted = []
+        total_weight = 0
+        for match in matches:
+            requires = match.pop('requires', None)
+            if requires and not matched_names.intersection(requires):
+                logger.debug(f"特征 {match['name']} 缺少上下文 {requires}，不计分")
+                continue
+            accepted.append(match)
+            total_weight += match['weight']
+
+        return accepted, total_weight
 
     @staticmethod
     def check_suspicious_params(params: Dict[str, str]) -> List[Dict]:
@@ -1444,7 +1514,8 @@ class WebShellDetector:
             # 响应包检测
             if response_body:
                 resp_matches, resp_weight = self.matcher.match_indicators(
-                    response_body, DetectionConfig.RESPONSE_INDICATORS)
+                    response_body, DetectionConfig.RESPONSE_INDICATORS,
+                    skip_ambiguous=_is_static_asset_pair(request_uri, response_packet))
                 result['response_indicators'].extend(resp_matches)
                 result['total_weight'] += resp_weight
 
@@ -1554,7 +1625,8 @@ class WebShellDetector:
             # 响应检测
             if response_body:
                 resp_matches, resp_weight = self.matcher.match_indicators(
-                    response_body, DetectionConfig.RESPONSE_INDICATORS)
+                    response_body, DetectionConfig.RESPONSE_INDICATORS,
+                    skip_ambiguous=_is_static_asset_pair(request_uri, response_packet))
                 result['response_indicators'].extend(resp_matches)
                 result['total_weight'] += resp_weight
                 result['response_sample'] = format_response_for_display(response_body[:500])
@@ -1986,7 +2058,8 @@ class WebShellDetector:
 
                 # 通用响应特征
                 resp_matches, resp_weight = self.matcher.match_indicators(
-                    response_body, DetectionConfig.RESPONSE_INDICATORS)
+                    response_body, DetectionConfig.RESPONSE_INDICATORS,
+                    skip_ambiguous=_is_static_asset_pair(request_uri, response_packet))
                 result['response_indicators'] = resp_matches
                 result['total_weight'] += resp_weight
                 result['response_sample'] = format_response_for_display(response_body[:500])
@@ -2203,6 +2276,7 @@ class WebShellDetector:
 
             request_body = _get_request_body(http_layer)
             response_body = _get_response_body(response_packet)
+            is_static_pair = _is_static_asset_pair(request_uri, response_packet)
 
             result = {
                 'type': 'GODZILLA_DETECTED',
@@ -2361,7 +2435,8 @@ class WebShellDetector:
 
                 # 通用响应特征
                 resp_matches, resp_weight = self.matcher.match_indicators(
-                    response_body, DetectionConfig.RESPONSE_INDICATORS)
+                    response_body, DetectionConfig.RESPONSE_INDICATORS,
+                    skip_ambiguous=is_static_pair)
                 result['response_indicators'].extend(resp_matches)
                 result['total_weight'] += resp_weight
 
@@ -2376,17 +2451,55 @@ class WebShellDetector:
             # 计算置信度
             result['confidence'] = self.matcher.calculate_confidence(result['total_weight'], include_suspicious)
 
-            if result['confidence'] != 'none':
-                logger.debug(f"[哥斯拉] 置信度:{result['confidence']} 权重:{result['total_weight']} URI:{request_uri}")
-                return result
+            if result['confidence'] == 'none':
+                return None
 
-            return None
+            # 哥斯拉是 POST 加密载荷的工具：客户端一定往上发东西。一个
+            # 「GET 静态资源 + 没有任何哥斯拉自身特征」的包对，权重全来自
+            # 通用 HTTP 头和响应体里的模糊形状，判成哥斯拉纯属噪声。
+            # 强特征（md5+base64+md5 响应格式、已知会话）不受这条限制 ——
+            # 那种响应出现在 .js 上反而更该报。
+            if not self._has_godzilla_request_evidence(result, request_body, is_static_pair):
+                logger.debug(f"[哥斯拉] 无请求侧证据，跳过静态资源 {request_uri}")
+                return None
+
+            logger.debug(f"[哥斯拉] 置信度:{result['confidence']} 权重:{result['total_weight']} URI:{request_uri}")
+            return result
 
         except Exception as e:
             logger.error(f"哥斯拉检测异常: {e}", exc_info=True)
             return None
 
     # 哥斯拉辅助函数
+
+    # 只有这几条能独立支撑"这是哥斯拉"，其余（通用 HTTP 头、响应体里的
+    # 通用形状）都只是加权项。
+    GODZILLA_STANDALONE_INDICATORS = frozenset({
+        'godzilla_response_format',
+        'godzilla_known_session',
+        'godzilla_init_request',
+        'godzilla_raw_encrypted',
+    })
+
+    @classmethod
+    def _has_godzilla_request_evidence(cls, result: Dict, request_body: Optional[str],
+                                       is_static_pair: bool) -> bool:
+        """静态资源请求是否有足够证据仍然判成哥斯拉。
+
+        非静态资源一律放行 —— 这条守卫只用来挡浏览器拉 JS/CSS/图片的噪声，
+        不该改变正常业务路径上的判定。
+        """
+        if not is_static_pair:
+            return True
+
+        if request_body:
+            return True
+
+        if result.get('payloads'):
+            return True
+
+        names = {ind.get('name') for ind in result.get('indicators', [])}
+        return bool(names & cls.GODZILLA_STANDALONE_INDICATORS)
 
     @staticmethod
     def _check_godzilla_headers(http_layer) -> int:
