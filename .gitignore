@@ -232,3 +232,9 @@ CODE_REVIEW_2026-08-10.md
 logs/
 pyproject.toml
 uv.lock
+
+# MCP 客户端配置 —— 每台机器不同，不该进版本控制。
+# 仓库里原来提交了一份带作者本机绝对路径的 .mcp.json（还是项目改名前的
+# 旧路径），任何人 clone 下来都指向一个不存在的目录，MCP 服务对所有克隆者
+# 都是坏的。配置方法见 MCP_GUIDE.md，模板见 .mcp.json.example。
+.mcp.json

@@ -1,0 +1,20 @@
+{
+  "_comment": [
+    "听澜 MCP 服务配置模板。复制成 .mcp.json 并按自己的环境改路径。",
+    ".mcp.json 已被 gitignore —— 它是本机配置，不要提交。",
+    "",
+    "command: 指向你的 Python 解释器。用了虚拟环境就填venv 里的那个,",
+    "         Windows 是 .venv/Scripts/python.exe, Linux/macOS 是 .venv/bin/python。",
+    "         直接填 'python' 也行, 前提是它在 PATH 上且装了 requirements.txt。",
+    "args:    指向本项目的 mcp_server.py 绝对路径。",
+    "",
+    "注意: 不要用 ${CLAUDE_PROJECT_DIR} —— 这个变量只注入到服务端进程环境,",
+    "      项目级 .mcp.json 里不会展开, 会带着未展开的 ${...} 原样去启动。"
+  ],
+  "mcpServers": {
+    "TingLan": {
+      "command": "/path/to/TingLan/.venv/bin/python",
+      "args": ["/path/to/TingLan/mcp_server.py"]
+    }
+  }
+}
