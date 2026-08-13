@@ -11,6 +11,12 @@ from models.detection_result import (
     AnalysisSummary, DetectionResult, DetectionType, ThreatLevel, ProtocolFinding,
     AutoDecodingResult, FileRecoveryResult, AttackDetectionInfo, RTPStreamInfo
 )
+from models.severity_policy import (
+    filter_noise,
+    is_noise_level,
+    sort_attacks_by_severity,
+    sort_by_severity,
+)
 
 
 class TreeNode:
@@ -65,14 +71,42 @@ class AnalysisTreeModel(QAbstractItemModel):
         super().__init__(parent)
         self.root = TreeNode("Root")
         self._icons = {}
+        # 低危/信息级收敛开关。**由界面的复选框驱动，模型自己不做判断** ——
+        # 之前这里按 should_suppress_noise 自行决定，结果和右侧详情表的
+        # 复选框各管各的：取消勾选右边恢复了、左边还是不显示低危，用户没
+        # 有任何办法让树把低危包显示出来。开关只能有一个。
+        self._suppress_noise = False
+        self._summary: Optional[AnalysisSummary] = None
+
+    def setSuppressNoise(self, suppress: bool):
+        """开关低危/信息级收敛，变化时用缓存的 summary 立即重建。
+
+        重建而不是只改标记，是因为树是一次性建好的静态节点，没有
+        QSortFilterProxyModel 那样的过滤层可以复用。
+        """
+        if self._suppress_noise == suppress:
+            return
+        self._suppress_noise = suppress
+        if self._summary is not None:
+            self.buildFromSummary(self._summary)
+
+    def isNoiseSuppressed(self) -> bool:
+        return self._suppress_noise
 
     def buildFromSummary(self, summary: AnalysisSummary):
         """从分析结果构建树"""
         import time as _time
         t0 = _time.time()
 
+        # 缓存起来，setSuppressNoise 要靠它重建
+        self._summary = summary
+
         self.beginResetModel()
         self.root = TreeNode("Root")
+
+        # 开关开着时树里不铺低危/信息级 —— 几万个节点既建得慢又没人看得
+        # 完，真正的攻击反而找不着。计数仍按全量显示，隐藏了多少看得出来。
+        suppress_noise = self._suppress_noise
 
         # 攻击行为检测节点
         attack_node = TreeNode(
@@ -86,21 +120,25 @@ class AnalysisTreeModel(QAbstractItemModel):
         # 按检测类型分组
         grouped = summary.detection_by_type
 
-        threat_level_order = {
-            ThreatLevel.INFO: 0,
-            ThreatLevel.LOW: 1,
-            ThreatLevel.MEDIUM: 2,
-            ThreatLevel.HIGH: 3,
-            ThreatLevel.CRITICAL: 4
-        }
-
         # 按类型分组
         for dtype, items in grouped.items():
-            # 按威胁等级排序
-            sorted_items = sorted(items, key=lambda x: threat_level_order.get(x.threat_level, 2))
+            # 严重/高危/中危排前面。原来这里是升序（信息在最上、严重垫底），
+            # 一个类型下几百条时最该先看的东西被压在最下面，正好和取证需要
+            # 的顺序相反。
+            sorted_items = sort_by_severity(items)
+            if suppress_noise:
+                sorted_items = filter_noise(sorted_items)
+                if not sorted_items:
+                    continue
+
+            # 收敛掉低危/信息时标出实际展开数，否则标题写 (5000) 底下只有
+            # 200 条，看起来像构建出错或者漏检。
+            hidden = len(items) - len(sorted_items)
+            label = (f"{dtype.display_name} ({len(sorted_items)}/{len(items)})"
+                     if hidden else f"{dtype.display_name} ({len(items)})")
 
             type_node = TreeNode(
-                name=f"{dtype.display_name} ({len(items)})",
+                name=label,
                 count=len(items),
                 icon_name=f"attack_{dtype.value}",
                 node_type="detection_type"
@@ -353,14 +391,6 @@ class AnalysisTreeModel(QAbstractItemModel):
                     break
 
             if attack_behavior_node:
-                risk_level_order = {
-                    "info": 0,
-                    "low": 1,
-                    "medium": 2,
-                    "high": 3,
-                    "critical": 4
-                }
-
                 # 按攻击类型分组
                 grouped_by_attack = {}
                 for attack in summary.attack_detections:
@@ -370,11 +400,21 @@ class AnalysisTreeModel(QAbstractItemModel):
                     grouped_by_attack[attack_type].append(attack)
 
                 for attack_type, attacks in grouped_by_attack.items():
-                    # 按风险等级从低到高排序
-                    sorted_attacks = sorted(attacks, key=lambda x: risk_level_order.get(x.risk_level, 2))
+                    # 严重/高危/中危排前面（原来同样是升序，见上）
+                    sorted_attacks = sort_attacks_by_severity(attacks)
+                    if suppress_noise:
+                        sorted_attacks = [
+                            a for a in sorted_attacks if not is_noise_level(a.risk_level)
+                        ]
+                        if not sorted_attacks:
+                            continue
+
+                    hidden = len(attacks) - len(sorted_attacks)
+                    label = (f"{attack_type} ({len(sorted_attacks)}/{len(attacks)})"
+                             if hidden else f"{attack_type} ({len(attacks)})")
 
                     type_node = TreeNode(
-                        name=f"{attack_type} ({len(attacks)})",
+                        name=label,
                         count=len(attacks),
                         icon_name=f"attack_{attack_type.lower().replace(' ', '_')}",
                         node_type="attack_type"

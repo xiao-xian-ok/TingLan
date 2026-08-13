@@ -38,6 +38,7 @@ from models.detection_result import (
     AutoDecodingResult, FileRecoveryResult, AttackDetectionInfo, RTPStreamInfo
 )
 from models.tree_model import TreeNode
+from models.severity_policy import is_priority_level, should_suppress_noise
 
 from services.interfaces import IAnalysisService
 
@@ -1334,6 +1335,10 @@ class AnalysisPanelWidget(QWidget):
         self.tree_panel.itemSelected.connect(self.itemSelected.emit)
         layout.addWidget(self.tree_panel)
 
+    def setSuppressNoise(self, suppress: bool):
+        """转发"隐藏低危/信息"开关给结果树。"""
+        self.tree_panel.setSuppressNoise(suppress)
+
     def addOrUpdateFile(self, file_path: str, summary: AnalysisSummary):
         file_name = os.path.basename(file_path)
 
@@ -1667,6 +1672,10 @@ class MainWindow(QMainWindow):
         # 表格选择
         self.detail_table.itemSelected.connect(self._onTableItemSelected)
 
+        # "隐藏低危/信息"复选框同时管左侧结果树，否则取消勾选只有右边恢复
+        self.detail_table.noiseSuppressionChanged.connect(
+            self.analysis_panel.setSuppressNoise)
+
         # 密钥管理和解码工具 - 结果显示到右侧
         self.keys_panel.resultReady.connect(self.tool_result_panel.setResult)
         self.decode_panel.resultReady.connect(self.tool_result_panel.setResult)
@@ -1948,16 +1957,23 @@ class MainWindow(QMainWindow):
             self.status_bar.setProgress(percent, message)
 
     def _onDetectionFound(self, detection: DetectionResult):
-        """检测结果到达，检查显示上限"""
-        # 检查显示上限
-        if self._display_count >= UILimits.MAX_DISPLAY_ROWS:
-            # 超过上限，只记录不显示
-            if self._display_count == UILimits.MAX_DISPLAY_ROWS:
-                self.status_bar.setStatus(f"显示上限 {UILimits.MAX_DISPLAY_ROWS} 条，后续结果仅记录")
-            self._display_count += 1
+        """检测结果到达，检查显示上限
+
+        上限用满之后不再一刀切地丢弃：严重/高危/中危继续进表，低危和信息
+        级才停。否则一场扫描器噪声就能在真正的攻击到达之前把 5000 行额度
+        吃光，而"被挤出去"和"没检测到"在界面上长得一模一样。
+        """
+        self._display_count += 1
+
+        over_limit = self._display_count > UILimits.MAX_DISPLAY_ROWS
+        if over_limit and not is_priority_level(detection.threat_level):
+            if self._display_count == UILimits.MAX_DISPLAY_ROWS + 1:
+                self.status_bar.setStatus(
+                    f"显示上限 {UILimits.MAX_DISPLAY_ROWS} 条，"
+                    "后续仅显示严重/高危/中危"
+                )
             return
 
-        self._display_count += 1
         self.analysis_panel.addDetection(detection)
         self.detail_table.addDetection(detection)
 
@@ -2029,9 +2045,16 @@ class MainWindow(QMainWindow):
 
         self.analysis_panel.addOrUpdateFile(file_path, summary)
 
+        # 先让详情表决定要不要收敛（超阈值自动勾上复选框），复选框的信号
+        # 会把同一个决定传给左侧结果树，两边保持一致。
         self.detail_table.showFromSummary(summary)
 
-        self.status_bar.setStatus("分析完成")
+        if should_suppress_noise(total_attacks):
+            self.status_bar.setStatus(
+                f"攻击 {total_attacks} 条，已隐藏低危/信息级（导出不受影响）"
+            )
+        else:
+            self.status_bar.setStatus("分析完成")
         self.status_bar.setPacketCount(summary.total_packets)
         self.status_bar.setThreatCount(total_attacks)
 

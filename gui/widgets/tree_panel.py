@@ -174,16 +174,28 @@ class TreePanel(QWidget):
     def buildTree(self, summary: AnalysisSummary):
         """从分析结果构建树"""
         self.source_model.buildFromSummary(summary)
+        self._expandTopLevel()
+        self._updateStatus(summary)
 
-        # 只展开第一级分类节点，避免大量子节点导致 UI 卡死
+    def setSuppressNoise(self, suppress: bool):
+        """开关低危/信息级收敛（由详情表的复选框驱动）。
+
+        模型会用缓存的 summary 重建，这里补一次展开 —— beginResetModel
+        之后展开状态是丢的，不重新展开树看起来就像被清空了。
+        """
+        if self.source_model.isNoiseSuppressed() == suppress:
+            return
+        self.source_model.setSuppressNoise(suppress)
+        self._expandTopLevel()
+
+    def _expandTopLevel(self):
+        """只展开第一级分类节点，避免大量子节点导致 UI 卡死"""
         self.tree_view.setUpdatesEnabled(False)
         for i in range(self.proxy_model.rowCount(QModelIndex())):
             idx = self.proxy_model.index(i, 0, QModelIndex())
             self.tree_view.expand(idx)
         self.tree_view.resizeColumnToContents(0)
         self.tree_view.setUpdatesEnabled(True)
-
-        self._updateStatus(summary)
 
     def addDetection(self, detection: DetectionResult):
         """动态添加检测结果"""

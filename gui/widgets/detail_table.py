@@ -3,18 +3,27 @@
 from typing import List, Optional
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableView, QLineEdit,
-    QLabel, QPushButton, QComboBox, QHeaderView, QAbstractItemView
+    QLabel, QPushButton, QComboBox, QHeaderView, QAbstractItemView,
+    QCheckBox
 )
 from PySide6.QtCore import Signal, Qt, QSortFilterProxyModel
 
 from models.table_model import DetectionTableModel, DetectionFilterProxyModel
 from models.detection_result import DetectionResult, AnalysisSummary
+from models.severity_policy import (
+    ATTACK_OVERLOAD_THRESHOLD,
+    should_suppress_noise,
+    sort_by_severity,
+)
 
 
 class DetailTable(QWidget):
     """详情表格"""
 
     itemSelected = Signal(object)  # 选中行变化信号，传递DetectionResult
+    # "隐藏低危/信息"开关变化。左侧结果树要跟着一起变 —— 这个复选框是
+    # 整个界面唯一的收敛开关，不能只管右边这半屏。
+    noiseSuppressionChanged = Signal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -98,6 +107,17 @@ class DetailTable(QWidget):
         self.outcome_filter.currentIndexChanged.connect(self._onOutcomeFilterChanged)
         toolbar.addWidget(self.outcome_filter)
 
+        # 低危/信息级收敛开关。命中超过阈值时自动勾上（见 showFromSummary），
+        # 但仍然让用户能手动取消 —— 取证工具不该单方面决定什么看不到。
+        self.noise_filter = QCheckBox("隐藏低危/信息")
+        self.noise_filter.setToolTip(
+            f"检测到的攻击超过 {ATTACK_OVERLOAD_THRESHOLD} 条时自动开启。\n"
+            "只影响界面显示，导出仍包含全部结果。"
+        )
+        self.noise_filter.setStyleSheet("QCheckBox { color: #666; font-size: 12px; }")
+        self.noise_filter.toggled.connect(self._onNoiseFilterToggled)
+        toolbar.addWidget(self.noise_filter)
+
         layout.addLayout(toolbar)
 
         # 表格视图
@@ -173,8 +193,11 @@ class DetailTable(QWidget):
 
         参数:
             detections: DetectionResult对象列表
+
+        统一按威胁等级降序装填：严重/高危/中危在最前，低危和信息垫底。
+        表格自己带排序表头，用户点列头照样能改，这里只决定初始顺序。
         """
-        self.source_model.setDetections(detections)
+        self.source_model.setDetections(sort_by_severity(detections))
         self._updateCount()
 
     def showDetection(self, detection: DetectionResult):
@@ -195,8 +218,32 @@ class DetailTable(QWidget):
             selection_model.blockSignals(False)
 
     def showFromSummary(self, summary: AnalysisSummary):
-        """从分析摘要显示检测结果"""
+        """从分析摘要显示检测结果
+
+        攻击条数超阈值时自动收敛低危/信息级。算总数要把 attack_detections
+        一起算上 —— 界面上"检测到 N 个攻击行为"就是这两个之和，只按
+        detections 判会和用户看到的数字对不上。
+        """
+        total_attacks = len(summary.detections) + len(summary.attack_detections)
+        self.setSuppressNoise(should_suppress_noise(total_attacks))
         self.setDetections(summary.detections)
+
+    def setSuppressNoise(self, suppress: bool):
+        """同步开关状态到复选框、代理模型和结果树。"""
+        # 用 setChecked 触发 toggled，代理和树由 _onNoiseFilterToggled 统一
+        # 更新，避免两处各写一份状态。blockSignals 会让它们收不到通知。
+        if self.noise_filter.isChecked() != suppress:
+            self.noise_filter.setChecked(suppress)
+        else:
+            self._applyNoiseSuppression(suppress)
+
+    def _onNoiseFilterToggled(self, checked: bool):
+        self._applyNoiseSuppression(checked)
+
+    def _applyNoiseSuppression(self, suppress: bool):
+        self.proxy_model.setSuppressNoise(suppress)
+        self._updateCount()
+        self.noiseSuppressionChanged.emit(suppress)
 
     def addDetection(self, detection: DetectionResult):
         """添加单条检测结果"""
@@ -271,6 +318,11 @@ class DetailTable(QWidget):
         filtered = self.proxy_model.rowCount()
         if total == filtered:
             self.count_label.setText(f"共 {total} 条记录")
+        elif self.proxy_model.isNoiseSuppressed():
+            # 说清楚少掉的那些去哪了。只写"显示 N/M"会让人以为是漏检。
+            self.count_label.setText(
+                f"显示 {filtered}/{total} 条记录（已隐藏 {total - filtered} 条低危/信息）"
+            )
         else:
             self.count_label.setText(f"显示 {filtered}/{total} 条记录")
 

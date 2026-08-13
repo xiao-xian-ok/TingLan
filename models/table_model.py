@@ -5,6 +5,7 @@ from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QSortFilterProx
 from PySide6.QtGui import QColor
 
 from models.detection_result import DetectionResult
+from models.severity_policy import is_noise_level
 
 
 # 研判列的配色：确认得手要一眼看见，未生效要能被视觉忽略
@@ -132,6 +133,7 @@ class DetectionFilterProxyModel(QSortFilterProxyModel):
         self._filter_types = []      # 检测类型过滤
         self._filter_levels = []     # 置信度过滤 (high/medium/low)
         self._filter_outcomes = []   # 研判结论过滤 (confirmed/suspected/...)
+        self._suppress_noise = False  # 超量时收敛低危/信息级
 
     def setFilterText(self, text: str):
         self._filter_text = text.lower()
@@ -144,6 +146,21 @@ class DetectionFilterProxyModel(QSortFilterProxyModel):
     def setFilterLevels(self, levels: List[str]):
         self._filter_levels = levels
         self.invalidateFilter()
+
+    def setSuppressNoise(self, suppress: bool):
+        """开关"隐藏低危/信息级"。
+
+        命中量大到一定程度（见 severity_policy.ATTACK_OVERLOAD_THRESHOLD）
+        时由界面自动打开：那个量级的结果基本是扫描器噪声，全铺开只会把真
+        正的攻击淹掉。数据仍在 summary 里，导出不受影响。
+        """
+        if self._suppress_noise == suppress:
+            return
+        self._suppress_noise = suppress
+        self.invalidateFilter()
+
+    def isNoiseSuppressed(self) -> bool:
+        return self._suppress_noise
 
     def setFilterOutcomes(self, outcomes: List[str]):
         """按 A/B/C 研判结论过滤
@@ -161,6 +178,11 @@ class DetectionFilterProxyModel(QSortFilterProxyModel):
 
         detection = model.getDetection(source_row)
         if not detection:
+            return False
+
+        # 低危/信息级收敛。放在最前面：命中过万时这条能最快把候选砍掉，
+        # 后面几个字符串比较就不用做了。
+        if self._suppress_noise and is_noise_level(detection.threat_level):
             return False
 
         # 文本过滤
