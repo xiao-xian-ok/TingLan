@@ -201,19 +201,39 @@ class DetailTable(QWidget):
         self._updateCount()
 
     def showDetection(self, detection: DetectionResult):
-        """显示单条检测结果（高亮选中）"""
-        # 临时阻塞选择信号，避免 selectRow 触发 _onSelectionChanged
+        """显示单条检测结果（高亮并滚动到可见区）
+
+        原来只 selectRow 不滚动。表里上万条时，从左侧结果树点一条，选中的行
+        往往落在视口之外 —— 界面上看起来"右边没跟着动"，而实际上高亮就在
+        几千行以外。必须 scrollTo 才算真的定位过去。
+
+        另一半症状是被过滤掉的情况：勾了"隐藏低危/信息"或设了类型/研判过滤时，
+        mapFromSource 返回无效索引，原来直接 return，**上一次的选中行还亮着**。
+        用户点了新的一条，右边却还停在旧的那条上，看起来就是"对不上"。
+        这种情况要把选中清掉，宁可空着也不要显示错的。
+        """
         selection_model = self.table_view.selectionModel()
+        # 临时阻塞选择信号，避免 selectRow 触发 _onSelectionChanged
         selection_model.blockSignals(True)
         try:
+            proxy_index = None
             for row in range(self.source_model.rowCount()):
                 if self.source_model.getDetection(row) is detection:
-                    proxy_index = self.proxy_model.mapFromSource(
+                    candidate = self.proxy_model.mapFromSource(
                         self.source_model.index(row, 0)
                     )
-                    if proxy_index.isValid():
-                        self.table_view.selectRow(proxy_index.row())
+                    proxy_index = candidate if candidate.isValid() else None
                     break
+
+            if proxy_index is None:
+                # 当前过滤条件下这条看不见 —— 清掉旧高亮，别留着误导
+                selection_model.clearSelection()
+                selection_model.clearCurrentIndex()
+                return
+
+            self.table_view.selectRow(proxy_index.row())
+            self.table_view.scrollTo(
+                proxy_index, QAbstractItemView.PositionAtCenter)
         finally:
             selection_model.blockSignals(False)
 
