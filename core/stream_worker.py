@@ -845,6 +845,7 @@ class StreamAnalysisWorker(QThread):
             "caidao": DetectionResult.from_caidao_result,
             "behinder": DetectionResult.from_behinder_result,
             "godzilla": DetectionResult.from_godzilla_result,
+            "webshell_generic": DetectionResult.from_generic_webshell_result,
         }
 
         try:

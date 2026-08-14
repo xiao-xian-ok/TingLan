@@ -69,6 +69,8 @@ class DetectionType(Enum):
     CAIDAO = "caidao"
     BEHINDER = "behinder"
     GODZILLA = "godzilla"
+    # 确实像 webshell，但拿不出任何一家的独特特征，不硬指家族
+    WEBSHELL_GENERIC = "webshell_generic"
     SQLI = "sqli"  # OWASP Top 10 攻击类型
     XSS = "xss"
     RCE = "rce"
@@ -93,6 +95,7 @@ class DetectionType(Enum):
             "caidao": "菜刀 (Caidao)",
             "behinder": "冰蝎 (Behinder)",
             "godzilla": "哥斯拉 (Godzilla)",
+            "webshell_generic": "疑似 WebShell (家族未定)",
             "sqli": "SQL注入",
             "xss": "跨站脚本 (XSS)",
             "rce": "远程代码执行 (RCE)",
@@ -122,6 +125,10 @@ class DetectionType(Enum):
     @classmethod
     def from_type_string(cls, type_str: str) -> "DetectionType":
         type_str_lower = type_str.lower()
+        # 必须排在四家前面：WEBSHELL_GENERIC_DETECTED 里不含任何家族名，
+        # 但放到后面会被后续的宽松子串匹配抢走
+        if "webshell_generic" in type_str_lower:
+            return cls.WEBSHELL_GENERIC
         if "antsword" in type_str_lower:
             return cls.ANTSWORD
         elif "caidao" in type_str_lower:
@@ -381,6 +388,11 @@ class DetectionResult:
         return cls.from_webshell_result(raw, DetectionType.GODZILLA)
 
     @classmethod
+    def from_generic_webshell_result(cls, raw: Dict) -> "DetectionResult":
+        """像 webshell 但没有家族独特特征的那一类"""
+        return cls.from_webshell_result(raw, DetectionType.WEBSHELL_GENERIC)
+
+    @classmethod
     def from_attack_result(
         cls,
         attack_result,
@@ -410,6 +422,7 @@ class DetectionResult:
             "caidao": DetectionType.CAIDAO,
             "behinder": DetectionType.BEHINDER,
             "godzilla": DetectionType.GODZILLA,
+            "webshell_generic": DetectionType.WEBSHELL_GENERIC,
             # 显示名称
             "SQL Injection": DetectionType.SQLI,
             "Cross-Site Scripting": DetectionType.XSS,

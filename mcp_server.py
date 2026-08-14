@@ -653,7 +653,8 @@ def _detect_webshell_ek(pcap_path, tshark_path, max_packets=0):
 
     results = []
     type_map = {"antsword": DetectionType.ANTSWORD, "caidao": DetectionType.CAIDAO,
-                "behinder": DetectionType.BEHINDER, "godzilla": DetectionType.GODZILLA}
+                "behinder": DetectionType.BEHINDER, "godzilla": DetectionType.GODZILLA,
+                "webshell_generic": DetectionType.WEBSHELL_GENERIC}
     try:
         handler = TsharkProcessHandler(tshark_path)
         config = StreamConfig(pcap_path=pcap_path, display_filter='http',

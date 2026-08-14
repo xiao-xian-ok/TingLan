@@ -42,6 +42,23 @@ class DetectionConfig:
 
     # 蚁剑特征
     ANTSWORD_INDICATORS = [
+        # ---- 蚁剑专属：默认 PHP 编码器模板的 open_basedir 绕过例程 ----
+        #
+        # 下面这一堆通用 PHP 手法(@ini_set / eval / base64_decode / $_POST[)
+        # 蚁剑、菜刀、哥斯拉的规则表里都有，谁的独特特征都不是。真正能把蚁剑
+        # 单拎出来的是它默认模板开头那段 open_basedir 探测+绕过：菜刀的 z0
+        # 只有 `@ini_set(...);@eval(...)`，没有这一段。
+        #
+        # 依据是蚁剑默认 PHP encoder 的模板文本，本仓库里没有蚁剑抓包可对，
+        # 属于按公开模板写的特征，未经真实流量验证 —— 真拿到样本要复核。
+        {'pattern': r'\$opdir\s*=\s*@?\s*ini_get\s*\(\s*["\']open_basedir["\']',
+         'weight': 95, 'name': 'antsword_opdir_probe'},
+        {'pattern': r'\$ocwd\s*=\s*@?\s*dirname\s*\(\s*\$_SERVER\s*\[\s*["\']SCRIPT_FILENAME["\']',
+         'weight': 90, 'name': 'antsword_ocwd'},
+        {'pattern': r'preg_split\s*\(\s*["\']/\s*;\s*\|\s*:\s*/["\']\s*,\s*\$opdir',
+         'weight': 85, 'name': 'antsword_basedir_split'},
+
+        # ---- 以下全是通用 PHP webshell 手法，只能证明"是个 webshell" ----
         {'pattern': r'@ini_set\s*\(\s*["\']display_errors["\']', 'weight': 90, 'name': 'php_ini_set'},  # 禁用错误显示
         {'pattern': r'@set_time_limit\s*\(\s*0\s*\)', 'weight': 70, 'name': 'set_time_limit'},  # 无限执行时间
 
@@ -259,6 +276,11 @@ class DetectionConfig:
     MEDIUM_CONFIDENCE_THRESHOLD = 75
     SUSPICIOUS_THRESHOLD = 30
 
+    # 只命中通用形状特征、没有任何家族专属证据时的总分上限。
+    # 必须 < DETECTION_THRESHOLD —— 这样这类流量最高只能落到 suspicious，
+    # 永远不会自己变成 low/medium/high。详见 _cap_shape_only_weight。
+    SHAPE_ONLY_WEIGHT_CAP = DETECTION_THRESHOLD - 5
+
     # 统计学阈值
     STATISTICAL_THRESHOLDS = {
         'entropy': {
@@ -386,6 +408,175 @@ class DetectionConfig:
         'a', 'b', 'c', 'x', 'y', 'z',
         '1', '2', '3',
     ]
+
+
+def _indicator_names(indicators: List[Dict]) -> set:
+    """从特征表里取出 name 集合"""
+    return {ind['name'] for ind in indicators if ind.get('name')}
+
+
+def _all_indicator_names(result: Dict) -> set:
+    """请求侧 + 响应侧的特征名。
+
+    RESPONSE_INDICATORS 的匹配结果进的是 `result['response_indicators']`
+    这个**另一个**列表，不在 `result['indicators']` 里。归因和门控都必须
+    一并看 —— 蚁剑的 `[S]...[E]` 起止标记、菜刀的 `X@Y` 全在响应侧，
+    只翻请求侧会把这些最硬的证据整个漏掉。
+    """
+    return (_indicator_names(result.get('indicators') or [])
+            | _indicator_names(result.get('response_indicators') or []))
+
+
+# ---- 家族独特特征 ----------------------------------------------------------
+#
+# 锚点(ANCHORS)回答的是"这是不是个 webshell"，独特特征(UNIQUE)回答的是
+# "这是**哪个**家族"。两者不是一回事：`@ini_set("display_errors","0")`
+# 是货真价实的 webshell 证据，但蚁剑、菜刀、哥斯拉三家的规则表里都有它,
+# 拿它定家族等于抛硬币。
+#
+# 判定规则：命中了某家的独特特征才敢叫那个名字；一个独特特征都没有、
+# 但确实像 webshell 的，一律叫"疑似 WebShell(家族未定)"。
+#
+# 跨家族撞名的一律不算独特 —— `methodBody=` 这一条冰蝎叫 method_body_var、
+# 哥斯拉叫 godzilla_method_body，同一个正则两个名字，它谁的独特特征都不是。
+
+BEHINDER_UNIQUE = frozenset({
+    'behinder4_first_request',       # 冰蝎4默认密钥首包的固定 Base64
+    'behinder_decrypt_success',      # 真用冰蝎密钥解开了
+    'behinder_v3_handshake',         # 抓到这个 URI 上的 v3 密钥协商
+    'behinder4_eval_post',           # eval($post) —— 冰蝎4固定 shell 代码
+    'behinder4_decrypt_post',        # $post=Decrypt(
+    'behinder4_php_input_decrypt',   # Decrypt(file_get_contents("php://input"))
+})
+
+GODZILLA_UNIQUE = frozenset({
+    'godzilla_response_format',      # md5前16+base64+md5后16，协议级
+    'godzilla_known_session',
+    'godzilla_decrypt_success',
+    'godzilla_run_post',             # run($_POST[...]) —— 哥斯拉 PHP
+    'godzilla_classloader',          # class X extends ClassLoader —— 哥斯拉 JSP
+    'godzilla_e_post',               # E($_POST[ —— 哥斯拉的 E() 函数
+})
+
+CAIDAO_UNIQUE = frozenset({
+    'caidao_ini_b64',                # 固定 Base64 QGluaV9zZXQ
+    'caidao_ini_signature',
+    'caidao_z_base64',               # z 参数 + base64_decode
+    'caidao_z_long_b64',
+    'caidao_action_pattern',         # action=xxx&z1= 的参数约定
+    'caidao_xay_marker',             # 响应侧 X@Y 起止标记(大小写敏感)
+    'caidao_path_prefix',            # 响应侧 ->| 路径前缀
+})
+
+ANTSWORD_UNIQUE = frozenset({
+    'antsword_default_ua',           # UA 自称 antSword/vX
+    'antsword_opdir_probe',          # 默认模板的 open_basedir 探测
+    'antsword_ocwd',
+    'antsword_basedir_split',
+    'antsword_marker',               # 响应侧 [S]...[E] 起止标记
+    # 注意这里**没有** ant_prefix。参数名以 ant 开头是形状类启发式，
+    # 正常应用(Ant Design、各种 ant_ 前缀的业务字段)一抓一大把。而 ANCHORS
+    # 是 UNIQUE 的超集，把它放进来等于让 `ant_id=1` 这种普通表单绕过
+    # _cap_shape_only_weight 的封顶 —— 上面那几条协议级特征已经够给蚁剑
+    # 定身份了，不需要再拿它凑数。
+})
+
+UNIQUE_BY_FAMILY = {
+    'antsword': ANTSWORD_UNIQUE,
+    'caidao': CAIDAO_UNIQUE,
+    'behinder': BEHINDER_UNIQUE,
+    'godzilla': GODZILLA_UNIQUE,
+}
+
+
+# ---- 家族专属锚点 ----------------------------------------------------------
+#
+# 只有这些特征能证明"是**这个**家族"。其余流量层特征描述的都是
+# "一个带加密体的 POST" 或 "一个 JDK HTTP 客户端" —— 形状而已，
+# 冰蝎、哥斯拉、正常的文件上传、加密 API、protobuf 全都长这样。
+BEHINDER_ANCHORS = frozenset(
+    BEHINDER_UNIQUE
+    | _indicator_names(DetectionConfig.BEHINDER_INDICATORS)
+)
+
+GODZILLA_ANCHORS = frozenset(
+    GODZILLA_UNIQUE
+    | _indicator_names(DetectionConfig.GODZILLA_INDICATORS)
+)
+
+# 蚁剑/菜刀这两个的锚点是**代码级**证据(危险 PHP 函数、菜刀固定 Base64)。
+# ANTSWORD_INDICATORS 里 @ini_set/eval/base64_decode 那批是通用 webshell 特征、
+# 不是蚁剑独有 —— 但它们至少证明"这是个 webshell"，而不是"这个表单的参数
+# 叫 a1/b2"。锚点要挡的是后者，归因交给上面的 UNIQUE。
+ANTSWORD_ANCHORS = frozenset(
+    ANTSWORD_UNIQUE
+    | _indicator_names(DetectionConfig.ANTSWORD_INDICATORS)
+)
+
+CAIDAO_ANCHORS = frozenset(
+    CAIDAO_UNIQUE
+    | _indicator_names(DetectionConfig.CAIDAO_INDICATORS)
+    | ANTSWORD_ANCHORS           # 菜刀会用半权重复用蚁剑那套 PHP 特征
+)
+
+ANCHORS_BY_FAMILY = {
+    'antsword': ANTSWORD_ANCHORS,
+    'caidao': CAIDAO_ANCHORS,
+    'behinder': BEHINDER_ANCHORS,
+    'godzilla': GODZILLA_ANCHORS,
+}
+
+
+def has_unique_family_evidence(result: Dict, family: str) -> bool:
+    """这条结果里有没有 `family` 的独特特征"""
+    unique = UNIQUE_BY_FAMILY.get(family)
+    if not unique:
+        return False
+    return bool(_all_indicator_names(result) & unique)
+
+
+def _cap_shape_only_weight(result: Dict, anchors: frozenset, family: str) -> None:
+    """通用形状特征不许单独把一条流量定成某个家族。
+
+    冰蝎/哥斯拉的流量层特征 —— 纯Base64、高熵、16字节对齐、无可读参数、
+    短URI+大body、Java UA、JDK Accept、Cookie尾分号 —— **没有一条是这两个
+    家族独有的**。可它们原来和家族专属特征同权计分，随手就能凑过
+    HIGH_CONFIDENCE_THRESHOLD(100)：
+
+      - 256 字节随机数据做 base64  → 195 分, high, 判成冰蝎
+      - 普通 Java 后端发的明文表单  → 170 分, high, 判成哥斯拉
+
+    这两个例子里家族专属证据都是 0 分。文件上传、JWT、protobuf、加密 API
+    全部会被卷进来，这就是"什么包都有冰蝎哥斯拉"的根因。
+
+    所以这里把"只有形状"的总分压到判定阈值以下：形状只能给真锚点加码，
+    不能单独立案。真实的自定义密钥冰蝎(body 里确实不存在明文特征)仍然会以
+    suspicious 露出来 —— 不至于瞎掉，只是不再冒充 high。
+
+    同一个思路在 RESPONSE_INDICATORS 的 'requires' 上已经用过(见那段注释)，
+    当初漏掉了流量层。
+    """
+    names = _all_indicator_names(result)
+    if names & anchors:
+        return
+
+    cap = DetectionConfig.SHAPE_ONLY_WEIGHT_CAP
+    original = result.get('total_weight', 0)
+    if original <= cap:
+        return
+
+    result['total_weight'] = cap
+    result['shape_only'] = True
+    result.setdefault('indicators', []).append({
+        'name': 'shape_only_no_family_evidence',
+        'weight': 0,
+        'description': (
+            f'只命中通用加密流量形状特征，没有{family}专属证据；'
+            f'加权 {original} 已压到 {cap}(判定阈值 '
+            f'{DetectionConfig.DETECTION_THRESHOLD} 以下)'
+        ),
+        'matched_text': ', '.join(sorted(names)) or 'n/a',
+    })
 
 
 def try_decrypt_behinder(encrypted_data: str, custom_keys: List[bytes] = None) -> Optional[Dict]:
@@ -1320,6 +1511,8 @@ class WebShellDetector:
             'caidao': [],
             'behinder': [],
             'godzilla': [],
+            # 确实像 webshell、但没有任何一家的独特特征，不硬指家族
+            'webshell_generic': [],
             'suspicious': [],      # 统计学分析检测到的可疑流量
             'timeline': [],        # 完整攻击时间线
             'summary': {
@@ -1342,9 +1535,6 @@ class WebShellDetector:
         if 'godzilla' in tools:
             self._scan_godzilla_sessions(paired_packets)
 
-        # 已检测到的请求(去重用)
-        detected_requests = {}
-
         packet_index = 0
 
         # 对每个包对进行检测
@@ -1359,7 +1549,6 @@ class WebShellDetector:
             http_layer = packet.http
             method = getattr(http_layer, 'request_method', '') or ''
             uri = getattr(http_layer, 'request_full_uri', '') or ''
-            request_key = (method, uri)
 
             # 收集检测结果
             all_detections = []
@@ -1401,23 +1590,61 @@ class WebShellDetector:
                 all_detections.sort(key=lambda x: x[1].get('total_weight', 0), reverse=True)
                 best_tool, best_result = all_detections[0]
 
-                # 检查是否已经检测过同一请求
-                if request_key in detected_requests:
-                    prev_tool, prev_weight = detected_requests[request_key]
-                    # 如果新的权重更高，替换旧的
-                    if best_result.get('total_weight', 0) > prev_weight:
-                        # 从旧工具结果中移除
-                        results[prev_tool] = [
-                            r for r in results[prev_tool]
-                            if not (r.get('method') == method and r.get('uri') == uri)
-                        ]
-                        # 添加到新工具结果
-                        results[best_tool].append(best_result)
-                        detected_requests[request_key] = (best_tool, best_result.get('total_weight', 0))
-                else:
-                    # 新请求，直接添加
-                    results[best_tool].append(best_result)
-                    detected_requests[request_key] = (best_tool, best_result.get('total_weight', 0))
+                # 家族归因：拿得出独特特征的优先，谁都拿不出就不给家族名。
+                #
+                # 原来单纯 argmax(total_weight)，可各家的分是各自独立调的
+                # (同一个 @ini_set 蚁剑记 90、菜刀走半权重记 45)，压根不是同一把
+                # 尺子。实测一个通用 PHP webshell 四家全判 high —— 蚁剑 315 /
+                # 菜刀 165 / 冰蝎 105 / 哥斯拉 40 —— 取最高就被硬指成"蚁剑"，
+                # 另外三家的意见还被悄悄丢掉。
+                #
+                # 所以先在"有独特特征"的候选里挑分最高的(all_detections 已按权重
+                # 降序，取第一个即可)。注意这一步可能选中分数**更低**的家族：
+                # 一条同时被蚁剑 315(全是通用 PHP 手法) 和菜刀 165(命中 z 参数
+                # 约定) 命中的流量，答案是菜刀 —— 分低但说得出理由。
+                attributable = [
+                    (tool, r) for tool, r in all_detections
+                    if tool != 'suspicious' and has_unique_family_evidence(r, tool)
+                ]
+                if attributable:
+                    best_tool, best_result = attributable[0]
+                elif best_tool != 'suspicious':
+                    # 谁都拿不出独特特征 —— 是不是 webshell 另说(权重和置信度
+                    # 保持原样)，但名字不能瞎安
+                    best_result['family_undetermined'] = True
+                    best_result['original_family'] = best_tool
+                    best_result['type'] = 'WEBSHELL_GENERIC_DETECTED'
+                    best_tool = 'webshell_generic'
+
+                # 落选家族一并留档，人工复核时能看到当时都有谁命中、各多少分
+                if len(all_detections) > 1 or best_tool == 'webshell_generic':
+                    best_result['candidate_families'] = [
+                        {'family': tool, 'weight': r.get('total_weight', 0),
+                         'confidence': r.get('confidence', 'none'),
+                         'unique': tool != 'suspicious'
+                                   and has_unique_family_evidence(r, tool)}
+                        for tool, r in all_detections
+                    ]
+
+                # 每个包留一条。
+                #
+                # 这里原来按 (method, uri) 在**整个 pcap 范围**内去重，只保留权重
+                # 最高的那一条。注释说的是"同一请求只保留权重最高的结果"，本意
+                # 应该是"同一个包别让四个检测器各报一遍"——可那件事上面
+                # `all_detections.sort()[0]` 已经做完了，这一层实际去掉的是
+                # **同一个 URI 在不同时间的重复访问**。
+                #
+                # 后果：一个 webshell 被操作 5 次(id / whoami / ls -la /
+                # cat /etc/passwd / uname -a)，results 里只剩 1 条，留下的还是
+                # "权重最高"那条——而权重高低跟命令危害无关，纯看碰巧命中几条
+                # 规则。实测留下的是 whoami，丢掉的是 cat /etc/passwd。
+                # timeline 虽然有全部 5 条，但它只带
+                # packet_index/tool/confidence/weight/method/uri/type，
+                # **不带 payloads**，命令内容不在里面；而且
+                # stream_worker.py 只遍历那几个 tool 列表，从不读 timeline。
+                # 于是攻击者在同一个 shell 上操作得越多，界面上能看到的越少 ——
+                # 而命令序列恰恰是 webshell 取证最想要的东西。
+                results[best_tool].append(best_result)
 
                 # 添加到时间线
                 results['timeline'].append({
@@ -1434,7 +1661,8 @@ class WebShellDetector:
         results['timeline'].sort(key=lambda x: x['packet_index'])
 
         # 统计
-        for tool_name in ['antsword', 'caidao', 'behinder', 'godzilla', 'suspicious']:
+        for tool_name in ['antsword', 'caidao', 'behinder', 'godzilla',
+                          'webshell_generic', 'suspicious']:
             for result in results[tool_name]:
                 results['summary']['total_detections'] += 1
                 confidence = result.get('confidence', 'suspicious')
@@ -1472,6 +1700,19 @@ class WebShellDetector:
                 'raw_request_body': '',
                 'response_indicators': []
             }
+
+            # 蚁剑默认 UA。改 UA 是一行配置的事，所以它只能算加分项、
+            # 不能反过来当"没有就不是蚁剑"的依据。但真出现了就是硬证据 ——
+            # 没有哪个正常客户端会自称 antSword。
+            ua = getattr(http_layer, 'user_agent', '') or ''
+            if re.match(r'^\s*antSword\s*/\s*v?\d', ua, re.IGNORECASE):
+                result['indicators'].append({
+                    'name': 'antsword_default_ua',
+                    'weight': 95,
+                    'description': f'蚁剑默认 User-Agent: {ua[:60]}',
+                    'matched_text': ua[:80]
+                })
+                result['total_weight'] += 95
 
             # 请求包检测
             if request_body and request_method in DetectionConfig.SUPPORTED_METHODS:
@@ -1521,6 +1762,11 @@ class WebShellDetector:
 
                 if resp_matches:
                     result['response_sample'] = format_response_for_display(response_body[:500])
+
+            # 没有蚁剑专属证据就不许靠参数名形状单独立案。
+            # SUSPICIOUS_PARAM_PATTERNS 里 `^[a-z]{1,2}\d{1,2}$` 这条尤其危险：
+            # 一个 `a1=x&b2=y&c3=z&d4=w` 的普通表单就是 4×20=80 分，直接 medium。
+            _cap_shape_only_weight(result, ANTSWORD_ANCHORS, '蚁剑')
 
             # 计算置信度
             result['confidence'] = self.matcher.calculate_confidence(result['total_weight'], include_suspicious)
@@ -1593,6 +1839,15 @@ class WebShellDetector:
                             'decoded': decoded[:500],
                             'is_ini_signature': '@ini_set' in decoded
                         }
+                        # 这段固定 Base64 解出来是菜刀 shell 的核心代码，是家族锚点。
+                        # 原来只加权重不留名字，_cap_shape_only_weight 认不出它。
+                        if '@ini_set' in decoded:
+                            result['indicators'].append({
+                                'name': 'caidao_ini_signature',
+                                'weight': 30,
+                                'description': f'{param_name} 参数解出菜刀 shell 核心代码(@ini_set)',
+                                'matched_text': decoded[:50]
+                            })
                         result['total_weight'] += 30
 
                 # 解码所有参数(包括z1, z2等)
@@ -1630,6 +1885,9 @@ class WebShellDetector:
                 result['response_indicators'].extend(resp_matches)
                 result['total_weight'] += resp_weight
                 result['response_sample'] = format_response_for_display(response_body[:500])
+
+            # 没有菜刀专属证据就不许靠形状单独立案
+            _cap_shape_only_weight(result, CAIDAO_ANCHORS, '菜刀')
 
             result['confidence'] = self.matcher.calculate_confidence(result['total_weight'], include_suspicious)
 
@@ -2069,6 +2327,9 @@ class WebShellDetector:
                 ast_adjustment = self._apply_ast_validation(result, result['payloads'], 'Behinder')
                 result['total_weight'] += ast_adjustment
 
+            # 没有冰蝎专属证据就不许靠形状单独立案
+            _cap_shape_only_weight(result, BEHINDER_ANCHORS, '冰蝎')
+
             # 计算置信度
             result['confidence'] = self.matcher.calculate_confidence(result['total_weight'], include_suspicious)
 
@@ -2373,6 +2634,22 @@ class WebShellDetector:
                                 'decoded': decrypt_result['decrypted'][:500],
                                 'key_used': decrypt_result['key']
                             }
+                            # 只有**真用哥斯拉密钥**解开才算家族证据。
+                            # try_decrypt_godzilla 最后有一条纯 Base64 兜底分支，
+                            # 返回 key='none'/method='Base64' —— 那只是"这段
+                            # base64 解出来是可读文本"，任何明文 base64 参数都满足。
+                            # 拿它当独特特征，一条菜刀的 z0 就会被判成哥斯拉。
+                            _named_key = decrypt_result['key'] not in ('none', None, '')
+                            result['indicators'].append({
+                                'name': ('godzilla_decrypt_success' if _named_key
+                                         else 'godzilla_base64_payload'),
+                                'weight': 30,
+                                'description': (
+                                    f'参数{param_name}用哥斯拉密钥解密成功'
+                                    f'(key={decrypt_result["key"]})' if _named_key
+                                    else f'参数{param_name}为可解码Base64(未用哥斯拉密钥)'),
+                                'matched_text': decrypt_result['decrypted'][:50]
+                            })
                             result['total_weight'] += 30  # 解密成功加权
 
                 # 无参数时整体作为加密数据
@@ -2386,6 +2663,17 @@ class WebShellDetector:
                             'decoded': decrypt_result['decrypted'][:500],
                             'key_used': decrypt_result['key']
                         }
+                        _named_key = decrypt_result['key'] not in ('none', None, '')
+                        result['indicators'].append({
+                            'name': ('godzilla_decrypt_success' if _named_key
+                                     else 'godzilla_base64_payload'),
+                            'weight': 30,
+                            'description': (
+                                f'请求体用哥斯拉密钥解密成功'
+                                f'(key={decrypt_result["key"]})' if _named_key
+                                else '请求体为可解码Base64(未用哥斯拉密钥)'),
+                            'matched_text': decrypt_result['decrypted'][:50]
+                        })
                         result['total_weight'] += 30
 
             # 响应体检测(强特征)
@@ -2447,6 +2735,9 @@ class WebShellDetector:
             if result['payloads']:
                 ast_adjustment = self._apply_ast_validation(result, result['payloads'], 'Godzilla')
                 result['total_weight'] += ast_adjustment
+
+            # 没有哥斯拉专属证据就不许靠形状单独立案
+            _cap_shape_only_weight(result, GODZILLA_ANCHORS, '哥斯拉')
 
             # 计算置信度
             result['confidence'] = self.matcher.calculate_confidence(result['total_weight'], include_suspicious)
