@@ -2377,8 +2377,9 @@ class ScoreBreakdownPanel(QFrame):
                 border-radius: 6px;
             }
         """)
-        self.setMinimumHeight(100)
-        self.setMaximumHeight(150)
+        # 少了"判定"那一行，高度跟着收一档，免得留一块空白
+        self.setMinimumHeight(80)
+        self.setMaximumHeight(125)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 8, 10, 8)
@@ -2390,12 +2391,13 @@ class ScoreBreakdownPanel(QFrame):
         title.setStyleSheet("font-size: 11px; font-weight: bold; color: #F57C00;")
         header.addWidget(title)
         header.addStretch()
-
-        # 灵敏度显示
-        self.sensitivity_label = QLabel("灵敏度: 50")
-        self.sensitivity_label.setStyleSheet("font-size: 10px; color: #FF8F00;")
-        header.addWidget(self.sensitivity_label)
         layout.addLayout(header)
+
+        # 这里原来还有一个"灵敏度: N"。它取的是 breakdown['sensitivity']，
+        # 而那个值就是 fast_filter 预筛分(_calculate_combined_verdict 的
+        # risk_score) —— 和刚摘掉的"判定"行同源，只是换了个名字。一条高危攻击
+        # 旁边挂"灵敏度: 5"，读起来仍然像系统在给它打低分。名字里的"灵敏度"
+        # 另有所指(_sensitivity_profile 那个 0-100 旋钮)，同名不同物，更绕。
 
         # 分隔线
         line = QFrame()
@@ -2437,20 +2439,20 @@ class ScoreBreakdownPanel(QFrame):
 
         layout.addLayout(grid)
 
-        # 综合判定
-        self.verdict_label = QLabel("综合判定: --")
-        self.verdict_label.setStyleSheet("font-size: 11px; font-weight: bold; color: #333;")
-        layout.addWidget(self.verdict_label)
+        # 这里原来还有一行"判定: skip/notice/review/audit"。
+        #
+        # 那个值来自 core.fast_filter，回答的是"这段载荷值不值得再花 CPU 跑一遍
+        # AST"，**不是**"这是不是攻击"。把它摆在一条已经确认的攻击载荷下面、还写成
+        # "判定: skip (正常流量)"，读起来就成了系统在给这条攻击盖"正常"的章 ——
+        # 和左边的威胁等级、和"研判"列(core.success_adjudicator，那个才是"攻击有没有
+        # 打下")互相打架。三套判定挤在一个界面里，只有这一套是纯内部调度信号，
+        # 不该露给人看。
 
     def setScoreBreakdown(self, breakdown: dict):
         """设置得分拆解数据"""
         if not breakdown:
             self.clear()
             return
-
-        # 灵敏度
-        sensitivity = breakdown.get('sensitivity', 50)
-        self.sensitivity_label.setText(f"灵敏度: {sensitivity}")
 
         # 熵值
         entropy = breakdown.get('entropy', {})
@@ -2472,27 +2474,6 @@ class ScoreBreakdownPanel(QFrame):
         self.length_label.setText(length.get('display', '长度: --'))
         self._setIndicator(self.length_indicator, length.get('hit', False))
 
-        # 综合判定
-        combined = breakdown.get('combined', {})
-        verdict = combined.get('verdict', 'unknown')
-        reason = combined.get('reason', '')
-        force_audit = combined.get('force_audit', False)
-
-        verdict_text = f"判定: {verdict}"
-        if force_audit:
-            verdict_text += " [强制审计]"
-        if reason:
-            verdict_text += f" ({reason[:50]})"
-        self.verdict_label.setText(verdict_text)
-
-        # 根据判定结果设置颜色
-        if verdict == 'skip':
-            self.verdict_label.setStyleSheet("font-size: 11px; font-weight: bold; color: #4CAF50;")
-        elif verdict == 'audit' or force_audit:
-            self.verdict_label.setStyleSheet("font-size: 11px; font-weight: bold; color: #F44336;")
-        else:
-            self.verdict_label.setStyleSheet("font-size: 11px; font-weight: bold; color: #FF9800;")
-
     def _setIndicator(self, indicator: QLabel, hit: bool):
         """设置指示器颜色"""
         if hit:
@@ -2502,12 +2483,10 @@ class ScoreBreakdownPanel(QFrame):
 
     def clear(self):
         """清空显示"""
-        self.sensitivity_label.setText("灵敏度: --")
         self.entropy_label.setText("熵值: --")
         self.structure_label.setText("格式: --")
         self.char_label.setText("字符: --")
         self.length_label.setText("长度: --")
-        self.verdict_label.setText("综合判定: --")
         self.entropy_indicator.setStyleSheet("color: #9E9E9E;")
         self.structure_indicator.setStyleSheet("color: #9E9E9E;")
         self.char_indicator.setStyleSheet("color: #9E9E9E;")
@@ -3047,6 +3026,21 @@ class PayloadViewer(QWidget):
             return
         self._updateScoreBreakdown(detection)
 
+    @staticmethod
+    def _extractContentType(detection: DetectionResult) -> str:
+        """从 stream_worker 拼好的请求头里取 Content-Type，取不到返回空串"""
+        raw = detection.raw_result if isinstance(detection.raw_result, dict) else None
+        if not raw:
+            return ''
+        headers = raw.get('raw_request_headers') or ''
+        if not isinstance(headers, str):
+            return ''
+        for line in headers.splitlines():
+            name, sep, value = line.partition(':')
+            if sep and name.strip().lower() == 'content-type':
+                return value.strip()
+        return ''
+
     def _updateScoreBreakdown(self, detection: DetectionResult):
         """更新得分拆解面板（带缓存）"""
         try:
@@ -3066,8 +3060,8 @@ class PayloadViewer(QWidget):
 
             # 提取载荷数据
             payload_data = b''
-            content_type = ''
             http_method = detection.method or ''
+            uri = detection.uri or ''
 
             if detection.raw_result and isinstance(detection.raw_result, dict):
                 raw_body = detection.raw_result.get('raw_request_body', '')
@@ -3078,6 +3072,11 @@ class PayloadViewer(QWidget):
                         # 限制分析长度，避免大载荷卡死
                         payload_data = str(raw_body)[:5000].encode('utf-8', errors='ignore')
 
+            # content_type 原来是个赋空之后再没被写过的死变量，一路传到
+            # fast_filter 里，Content-Type 相关的降权逻辑等于从来没生效过。
+            # 真值在 stream_worker 拼好的请求头里(stream_worker.py:1175)。
+            content_type = self._extractContentType(detection)
+
             if not payload_data and detection.payload:
                 if isinstance(detection.payload, dict):
                     import json
@@ -3085,8 +3084,11 @@ class PayloadViewer(QWidget):
                 else:
                     payload_data = str(detection.payload)[:5000].encode('utf-8', errors='ignore')
 
-            if payload_data and len(payload_data) > 0:
-                breakdown = get_score_breakdown(payload_data, content_type, http_method)
+            # body 可能是空的(GET 的目录穿越整个攻击都在 URI 里)，
+            # 这种情况下只要有 URI 就仍然值得分析
+            if payload_data or uri:
+                breakdown = get_score_breakdown(
+                    payload_data, content_type, http_method, uri)
                 # 存入缓存
                 if len(self._score_cache) >= self._score_cache_max:
                     # LRU: 清掉一半

@@ -907,6 +907,7 @@ _ast_engine_singleton = None
 _entropy_analyzer_singleton = None
 _encoding_detector_singleton = None
 _statistical_analyzer_singleton = None
+_auto_decoder_singleton = None
 
 
 def get_fast_filter() -> FastFilter:
@@ -942,24 +943,69 @@ def should_analyze(payload: str, content_type: str = "") -> bool:
     return need_ast
 
 
-def get_score_breakdown(payload_data: bytes, content_type: str = "", http_method: str = "") -> Optional[dict]:
-    """PayloadViewer用的得分拆解，整合AST/熵值/统计学/快速过滤几个模块的结果"""
-    if not payload_data or len(payload_data) < 10:
+def _decode_for_breakdown(payload_data: bytes) -> str:
+    """把原始报文过一遍**检测器同款**解码链。
+
+    检测器跑的是 AutoDecoder 解码后的文本(attack_detector.py:1940 那段)，
+    面板原来直接拿 raw_request_body 就扫 —— 两边压根不是同一个字符串。
+    实测 `${@print(md5(acunetix_wvs_security_test))}` 在原始报文里长成
+    `%24{%40print(md5(...))}`，`$` 被编码成 %24，关键字一个都命中不了，
+    于是面板会给一条已经确认的 RCE 打 0 分。
+
+    AutoDecoder 拿不到结果时退回一次 URL 解码 —— 退化路径也必须解 URL，
+    那正是原来漏掉的那一层。
+    """
+    if not payload_data:
+        return ""
+
+    try:
+        from core.auto_decoder import AutoDecoder
+        global _auto_decoder_singleton
+        if _auto_decoder_singleton is None:
+            _auto_decoder_singleton = AutoDecoder()
+        decoded = _auto_decoder_singleton.decode(payload_data, max_depth=6).final_text
+        if decoded:
+            return decoded
+    except Exception as e:
+        logger.debug(f"得分拆解解码失败，退回 URL 解码: {e}")
+
+    raw = payload_data.decode('utf-8', errors='ignore')
+    try:
+        from urllib.parse import unquote_plus
+        return unquote_plus(raw)
+    except Exception:
+        return raw
+
+
+def get_score_breakdown(payload_data: bytes, content_type: str = "",
+                        http_method: str = "", uri: str = "") -> Optional[dict]:
+    """PayloadViewer用的得分拆解，整合AST/熵值/统计学/快速过滤几个模块的结果
+
+    `payload_data` 是**原始**请求体，还带着 URL 编码，不能直接拿去扫 ——
+    详见 `_decode_for_breakdown`。`uri` 也要一起看：POST 的攻击可能整个落在
+    查询串里(`?rec=password_reset_post`)，那部分不在 body 里。
+
+    两类维度喂的东西不一样，是故意的：
+      - 语义类(格式/字符频率/AST/快速过滤)看**解码后**的文本，必须和检测器对齐；
+      - 熵值和长度看**原始字节** —— 它们描述的是线上真实载荷，解码会改掉含义
+        (熵值那行的 `[url]` 编码标记也正是从原文里看出来的)。
+    """
+    payload_str = payload_data.decode('utf-8', errors='ignore') if payload_data else ""
+
+    scan_text = _decode_for_breakdown(payload_data)
+    if uri:
+        scan_text = f"{uri}\n{scan_text}" if scan_text else uri
+
+    if len(scan_text) < 10:
         return None
 
     try:
-        # 转换为字符串进行分析
-        try:
-            payload_str = payload_data.decode('utf-8', errors='ignore')
-        except:
-            payload_str = str(payload_data)
-
         entropy_result = _analyze_entropy(payload_data, payload_str)
-        structure_result = _analyze_structure(payload_str)
-        char_freq_result = _analyze_char_frequency(payload_str)
+        structure_result = _analyze_structure(scan_text)
+        char_freq_result = _analyze_char_frequency(scan_text)
         length_result = _analyze_payload_length(payload_data)
-        ast_result = _analyze_ast(payload_str)
-        filter_result = _fast_filter.filter(payload_str, content_type)
+        ast_result = _analyze_ast(scan_text)
+        filter_result = _fast_filter.filter(scan_text, content_type)
 
         combined_result = _calculate_combined_verdict(
             entropy_result, structure_result, char_freq_result,
