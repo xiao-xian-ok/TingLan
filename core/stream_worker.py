@@ -1112,27 +1112,63 @@ class StreamAnalysisWorker(QThread):
 
     def _detect_packet(self, detector, packet: PacketData) -> Optional[DetectionResult]:
         try:
-            body = packet.http_request_body
-            if not body and packet.http_uri and '?' in packet.http_uri:
+            body = packet.http_request_body or b""
+            query = ""
+            if packet.http_uri and '?' in packet.http_uri:
                 query = packet.http_uri.split('?', 1)[1]
-                body = query.encode('utf-8', errors='replace')
-            if not body:
-                body = (packet.http_uri or '').encode('utf-8', errors='replace')
 
-            if not body:
+            # 检测数据 = 请求体 **和** 查询串，两个都要扫。
+            #
+            # 原来这里是个三选一的降级链(body > query > 整条 URI)，只在**没有**
+            # 请求体时才去看查询串。于是"POST 表单 + 查询串里带攻击载荷"整类请求
+            # 全部漏检 —— 打登录/搜索这种本来就带 body 的接口时尤其常见。
+            # 实测同一条 POST /admin/login.php?rec=file:///etc/passwd：
+            #     只扫 body   -> detection_type='unknown'        权重 0
+            #     body+query  -> detection_type='path_traversal' 权重 190
+            #                    (+100 path_traversal:sensitive_file, +90 ssrf:file_scheme)
+            # 一条 190 分的 LFI+SSRF 因为载荷在查询串里就当没看见。
+            #
+            # 用 `&` 拼：两边多数时候都是 x-www-form-urlencoded 的参数表，拼出来
+            # 仍是一张合法参数表，检测器内部按 `&` 切参数的逻辑不会被拼接点带偏。
+            #
+            # 拼接点确实可能出现跨边界匹配(body 末尾 + query 开头凑成一条规则)，
+            # 但那是**既有**性质、不是这次引入的：`comment=union&order=select`
+            # 两个参数本来就在同一个 body 里时，旧代码一样判 sqli。实测换成换行
+            # 或 \x00 做分隔符结果完全相同 —— 规则跨得过任何分隔符，选什么都挡
+            # 不住。所以这里只要求"合并之后 == 这些参数本来就在一起"。
+            scan_parts = [part for part in (body, query.encode('utf-8', errors='replace'))
+                          if part]
+            if scan_parts:
+                scan_data = b"&".join(scan_parts)
+            else:
+                # 两者都空才退回整条 URI（无查询串的 GET 就走这条）
+                scan_data = (packet.http_uri or '').encode('utf-8', errors='replace')
+
+            if not scan_data:
                 return None
 
             detection = detector.detect(
-                data=body,
+                data=scan_data,
                 method=packet.http_method,
                 uri=packet.http_uri,
                 content_type=packet.http_content_type
             )
 
+            # 会话追踪和证据展示拿的仍是**原来那个口径**的载荷(body → query → URI)，
+            # 不跟着上面的合并一起变，两个原因：
+            #   1. 会话追踪要用 body_len 判"高熵大体积 POST"、要从 multipart 里
+            #      抠上传文件名。把查询串拼进去会让长度虚高，查询串里万一带
+            #      `filename=` 还会抠出一个根本不存在的上传文件。
+            #   2. 证据面板显示的是"请求体"。GET 没有请求体，原来是拿查询串顶上的，
+            #      直接换成真 body 会让 GET 的证据栏变空。
+            # 这次只修检测漏报，不动这两边。
+            packet_payload = body or (
+                query.encode('utf-8', errors='replace') if query else scan_data)
+
             # 会话上下文。**每个请求都要喂给追踪器**，不能只喂命中的：
             # "上传 webshell → 随后访问它"这类攻击路径里，上传请求本身
             # 往往看着无害，只有把它记下来，后面那次访问才能被关联出来。
-            signal = self._track_session(packet, body, detection)
+            signal = self._track_session(packet, packet_payload, detection)
             if signal is not None and signal.triggered:
                 detection['total_weight'] = detection.get('total_weight', 0) + signal.bonus
                 detection['session_signals'] = signal.to_dict()
@@ -1176,16 +1212,16 @@ class StreamAnalysisWorker(QThread):
                         raw_headers += f"Content-Type: {packet.http_content_type}\r\n"
                     raw_headers += "\r\n"
 
-                    raw_body_str = safe_display_text(body, max_length=50000)
+                    raw_body_str = safe_display_text(packet_payload, max_length=50000)
 
                     # "_full" 这两个字段是给 payload_viewer 看完整请求用的。
                     # 原来完全不截断 —— 一次几 MB 的上传就原样留在内存里，
                     # 而且 raw_http_request_full = headers + body 又复制了一份。
                     # 1MB 足够覆盖真实场景里要人工看的请求。
-                    raw_body_full = body[:_FULL_BODY_LIMIT].decode('utf-8', errors='replace')
-                    if len(body) > _FULL_BODY_LIMIT:
+                    raw_body_full = packet_payload[:_FULL_BODY_LIMIT].decode('utf-8', errors='replace')
+                    if len(packet_payload) > _FULL_BODY_LIMIT:
                         raw_body_full += (
-                            f"\n\n...[已截断，原始 body 共 {len(body)} 字节]")
+                            f"\n\n...[已截断，原始 body 共 {len(packet_payload)} 字节]")
 
                     detection['raw_request_headers'] = raw_headers
                     detection['raw_request_body'] = raw_body_str[:50000]
