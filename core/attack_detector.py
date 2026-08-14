@@ -1414,6 +1414,17 @@ class FileUploadDetector(ASTEnhancedDetector):
         'null_byte_bypass': (r'\.(php|jsp|asp|aspx|exe)%00\.(jpg|png|gif)', 95),
     }
 
+    # 这几个"危险扩展名"同时是真实的顶级域名：.com 通用、.pl 波兰、
+    # .sh 圣赫勒拿、.py 巴拉圭。光看后缀分不出 backup.sh(脚本) 和
+    # cdn.assets.sh(域名)，必须再看一眼整个 token 的形状。
+    TLD_COLLIDING_EXTENSIONS = frozenset({'.com', '.pl', '.sh', '.py'})
+
+    # 主机名形状：常见主机标签开头，或者三段以上再接顶级域名
+    _HOSTNAME_RE = re.compile(
+        r'^(?:www\d?|ftp|mail|smtp|cdn|api|img|static|assets|web|m)\.[a-z0-9.-]+$'
+        r'|^(?:[a-z0-9-]+\.){2,}[a-z]{2,}$'
+    )
+
     def __init__(self):
         super().__init__()
         self._compile_patterns(self.PATTERNS)
@@ -1494,9 +1505,30 @@ class FileUploadDetector(ASTEnhancedDetector):
 
         for ext, weight in self.DANGEROUS_EXTENSIONS.items():
             if filename_lower.endswith(ext):
+                if (ext in self.TLD_COLLIDING_EXTENSIONS
+                        and self._looks_like_hostname(filename_lower)):
+                    continue
                 return weight
 
         return 0
+
+    @classmethod
+    def _looks_like_hostname(cls, filename_lower: str) -> bool:
+        """`www.vulnweb.com` 是主机名，不是待上传的可执行文件。
+
+        _extract_filenames 的 URI 正则会把请求体里任意位置的 `/xxx.yyy` 当文件名
+        捞出来，于是 `user_name=/www.vulnweb.com` 里的域名撞上 .com(DOS 可执行)
+        拿 90 分，一条正常表单被判成"恶意文件上传·高危"。.pl/.sh/.py 同理分别是
+        波兰/圣赫勒拿/巴拉圭的顶级域名。
+
+        只对 TLD_COLLIDING_EXTENSIONS 里那几个后缀做这层判断 —— .php/.jsp/.exe
+        不是顶级域名，不需要、也不该被这条规则削弱。
+
+        已知边界：`vulnweb.com` 这种不带主机标签的两段式域名仍然分不出来，
+        它和 `backup.sh` 在字面上完全同形。宁可留这个误报，也不能把两段式的
+        真脚本文件一起放过。
+        """
+        return bool(cls._HOSTNAME_RE.match(filename_lower))
 
     def _is_double_extension(self, filename: str) -> bool:
         filename_lower = filename.lower()
