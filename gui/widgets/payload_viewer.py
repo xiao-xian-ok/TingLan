@@ -633,6 +633,45 @@ class WiresharkStyleViewer(QFrame):
         self.hex_view.clear()
 
 
+class _EvidenceWorker(QThread):
+    """后台回原始 pcap 取被卸载的证据。
+
+    和 _PacketLayersWorker 是同一个毛病、同一个解法：BurpStyleViewer.setContent()
+    原来在 GUI 主线程上直接调 get_http_request_evidence()，而那个函数会起 tshark
+    子进程把 pcap 从头读到目标帧。实测 174MB 的 webone.pcap：
+
+        frame    500 ->  897 ms
+        frame  20000 ->  411 ms
+        frame 120000 -> 1883 ms
+        frame 300000 -> 4069 ms
+
+    也就是说点一条靠后的流量，界面要冻 4 秒。而且只在 Burp 视图下发生 ——
+    Wireshark 视图不走这个函数，所以现象是"切到 Burp 就卡，切回去就不卡"。
+    帧号越大越慢，pcap 越大越慢，放主线程就永远有卡死的可能。
+
+    信号带上 DetectionResult 本身，主线程据此判断结果是否已经过期
+    （用户可能已经点到别的条目上了）。
+    """
+
+    loaded = Signal(object, dict)   # (DetectionResult, evidence)
+    failed = Signal(object, str)    # (DetectionResult, 错误信息)
+
+    def __init__(self, detection, pcap_path: str, frame: int, parent=None):
+        super().__init__(parent)
+        self._detection = detection
+        self._pcap_path = pcap_path
+        self._frame = frame
+
+    def run(self):
+        try:
+            from controllers.analysis_controller import get_http_request_evidence
+            evidence = get_http_request_evidence(self._pcap_path, self._frame)
+            self.loaded.emit(self._detection, dict(evidence or {}))
+        except Exception as e:
+            logger.debug(f"证据回取失败 frame#{self._frame}: {e}")
+            self.failed.emit(self._detection, str(e))
+
+
 class BurpStyleViewer(QFrame):
     """Burp风格的HTTP请求查看器"""
 
@@ -640,6 +679,9 @@ class BurpStyleViewer(QFrame):
         super().__init__(parent)
         self._current_detection: Optional[DetectionResult] = None
         self._full_text = ""
+        # 用集合而不是单个引用：连点是正常操作，单引用会让还在跑的前一个
+        # QThread 失去最后一个 Python 引用被 GC，直接崩。(同 PacketHexViewer)
+        self._workers = set()
         self._setupUI()
 
     def _setupUI(self):
@@ -723,13 +765,18 @@ class BurpStyleViewer(QFrame):
         self._full_text = ""
         lines = []
 
-        # 证据被卸载过的条目，点开时回原始 pcap 取回来
+        # 证据被卸载过的条目，点开时回原始 pcap 取回来（后台线程，不阻塞界面）
         self._ensureEvidenceLoaded(detection)
 
         # 优先使用真实的 HTTP 请求数据
         raw_http = None
         if detection.raw_result and isinstance(detection.raw_result, dict):
             raw_http = detection.raw_result.get('raw_http_request', '')
+            if detection.raw_result.get('_evidence_fetching'):
+                # 取回来会自动刷新（_refreshIfCurrent）。不给提示的话这一屏
+                # 看起来就像"没有证据"，而实际上正在读盘。
+                raw_http = (f"{raw_http}\n"
+                            "[正在回原始 pcap 取完整请求，稍候自动刷新…]")
 
         if raw_http:
             # 直接显示真实的 HTTP 请求
@@ -886,29 +933,43 @@ class BurpStyleViewer(QFrame):
         clipboard.setText(self.text_edit.toPlainText())
 
     def _ensureEvidenceLoaded(self, detection: DetectionResult):
-        """把被卸载的证据从原始 pcap 里取回来
+        """把被卸载的证据从原始 pcap 里取回来 —— **异步**。
 
         检测数超过 ResourceLimits.FULL_EVIDENCE_DETECTIONS 之后，stream_worker
-        不再把原始报文留在内存里，只写一条带帧号的占位。以前**没有任何代码去取**，
-        于是大流量 pcap 里 2000 条之后的证据在界面上就等于没了。这里补上。
+        不再把原始报文留在内存里，只写一条带帧号的占位。以前没有任何代码去取，
+        于是大流量 pcap 里 2000 条之后的证据在界面上就等于没了；后来补上了，
+        但补成了**主线程同步调用** —— 那个函数要起 tshark 把 pcap 从头读到目标
+        帧，174MB 的包实测能冻 4 秒（详见 _EvidenceWorker 的实测数据）。
 
-        取不到时保留占位并把原因写进去 —— 不能让"取失败"看起来像"本来就没有"。
+        现在改成后台取：先原样渲染占位，取回来再刷新。取不到时保留占位并把原因
+        写进去 —— 不能让"取失败"看起来像"本来就没有"。
         """
         raw = detection.raw_result if isinstance(detection.raw_result, dict) else None
         if not raw or not raw.get('evidence_lazy'):
             return
-        if raw.get('_evidence_fetched'):
+        if raw.get('_evidence_fetched') or raw.get('_evidence_fetching'):
             return
 
         pcap_path = raw.get('pcap_path') or ''
         frame = raw.get('frame_number') or getattr(detection, 'packet_number', 0)
-
         try:
-            from controllers.analysis_controller import get_http_request_evidence
-            evidence = get_http_request_evidence(pcap_path, int(frame or 0))
-        except Exception as e:
-            evidence = {"error": str(e)}
+            frame = int(frame or 0)
+        except (TypeError, ValueError):
+            frame = 0
 
+        raw['_evidence_fetching'] = True
+        worker = _EvidenceWorker(detection, pcap_path, frame)
+        worker.loaded.connect(self._onEvidenceLoaded)
+        worker.failed.connect(self._onEvidenceFailed)
+        worker.finished.connect(lambda w=worker: self._workers.discard(w))
+        self._workers.add(worker)
+        worker.start()
+
+    def _applyEvidence(self, detection: DetectionResult, evidence: dict):
+        raw = detection.raw_result if isinstance(detection.raw_result, dict) else None
+        if raw is None:
+            return
+        raw['_evidence_fetching'] = False
         raw['_evidence_fetched'] = True
 
         if evidence.get('error') or not evidence.get('full'):
@@ -924,6 +985,39 @@ class BurpStyleViewer(QFrame):
         raw['raw_http_request'] = evidence['full'][:100000]
         raw['raw_http_request_full'] = evidence['full']
         raw['evidence_lazy'] = False
+
+    def _onEvidenceLoaded(self, detection: DetectionResult, evidence: dict):
+        self._applyEvidence(detection, evidence)
+        self._refreshIfCurrent(detection)
+
+    def _onEvidenceFailed(self, detection: DetectionResult, message: str):
+        # 失败也标记成已取过：否则每点一次就再花几秒重试一遍。
+        self._applyEvidence(detection, {'error': message})
+        self._refreshIfCurrent(detection)
+
+    def _refreshIfCurrent(self, detection: DetectionResult):
+        """结果回来时用户可能已经点到别的条目上了，过期结果直接丢掉"""
+        if detection is not self._current_detection:
+            return
+        self.setContent(detection)
+
+    def isLoadingEvidence(self) -> bool:
+        return any(w.isRunning() for w in self._workers)
+
+    def waitForEvidence(self, timeout_ms: int = 15000) -> bool:
+        """等待后台取证结束（测试和退出清理用）"""
+        all_done = True
+        for worker in list(self._workers):
+            if not worker.wait(timeout_ms):
+                all_done = False
+        return all_done
+
+    def shutdownWorkers(self, timeout_ms: int = 3000):
+        """QThread 还在跑的时候被析构会直接崩，窗口关闭必须收干净"""
+        for worker in list(self._workers):
+            if worker.isRunning():
+                worker.wait(timeout_ms)
+        self._workers.clear()
 
     def _buildFullExportText(self, detection: DetectionResult, preview_text: str) -> str:
         """Return the non-preview Burp text when full request fields were preserved."""
@@ -3214,6 +3308,8 @@ class PayloadViewer(QWidget):
         QThread 还在跑的时候被析构会直接崩，所以窗口关闭必须走这一步。
         """
         self.packet_hex_viewer.shutdown()
+        # Burp 视图的证据回取也是 QThread，漏掉同样会崩
+        self.burp_viewer.shutdownWorkers()
 
     def clear(self):
         """清空显示"""
