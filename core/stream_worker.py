@@ -94,6 +94,12 @@ except ImportError:  # pragma: no cover
     RequestLedger = None
     build_adjudicator = None
 
+# 攻击链聚合。拿不到就退化成"逐条独立呈现"，主流程照常跑完。
+try:
+    from core.attack_chain import annotate as annotate_attack_chains
+except ImportError:  # pragma: no cover
+    annotate_attack_chains = None
+
 logger = logging.getLogger(__name__)
 
 # payload_viewer 里"完整请求"的上限。见 _detect_packet 里的说明。
@@ -459,7 +465,7 @@ class StreamAnalysisWorker(QThread):
 
     # HTTP 流式分析占进度条 15%~43% 这一段
     _HTTP_STAGE_START = 15
-    _HTTP_STAGE_SPAN = 28
+    _HTTP_STAGE_SPAN = 25
 
     def _http_stage_percent(self, http_count: int) -> int:
         """HTTP 阶段的进度百分比
@@ -599,12 +605,12 @@ class StreamAnalysisWorker(QThread):
         if self._is_cancelled:
             return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets, rtp_streams)
 
-        self._emit_progress(43, "攻击成功研判...")
+        self._emit_progress(48, "攻击成功研判...")
         self._mark_stage("攻击成功研判")
         ast_streams = self._run_success_adjudication(results)
 
         if self.options.detect_webshell and not self._is_cancelled:
-            self._emit_progress(46, "WebShell AST 语义分析...")
+            self._emit_progress(51, "WebShell AST 语义分析...")
             self._mark_stage("WebShell AST 语义分析")
             ast_results = self._run_webshell_ast_detection(ast_streams)
             if ast_results:
@@ -616,9 +622,9 @@ class StreamAnalysisWorker(QThread):
         if self._is_cancelled:
             return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets, rtp_streams)
 
-        self._emit_progress(54, "ICMP 隐写检测...")
+        self._emit_progress(56, "ICMP 隐写检测...")
         self._mark_stage("ICMP 隐写检测")
-        icmp_findings = self._run_icmp_analysis()
+        icmp_findings = self._run_icmp_analysis(protocol_counts)
         protocol_findings.extend(icmp_findings)
 
         if self._is_cancelled:
@@ -626,13 +632,13 @@ class StreamAnalysisWorker(QThread):
 
         self._emit_progress(58, "DNS 隧道分析...")
         self._mark_stage("DNS 隧道分析")
-        dns_findings = self._run_dns_analysis()
+        dns_findings = self._run_dns_analysis(protocol_counts)
         protocol_findings.extend(dns_findings)
 
         if self._is_cancelled:
             return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets, rtp_streams)
 
-        self._emit_progress(62, "CS 通信检测...")
+        self._emit_progress(60, "CS 通信检测...")
         self._mark_stage("CS 通信检测")
         cs_findings = self._run_cs_detection()
         protocol_findings.extend(cs_findings)
@@ -640,14 +646,14 @@ class StreamAnalysisWorker(QThread):
         if self._is_cancelled:
             return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets, rtp_streams)
 
-        self._emit_progress(66, "RTP 音视频流检测...")
+        self._emit_progress(62, "RTP 音视频流检测...")
         self._mark_stage("RTP 音视频流检测")
         rtp_streams = self._run_rtp_analysis()
 
         if self._is_cancelled:
             return self._build_summary(results, [], protocol_findings, decoding_results, recovered_files, extracted_files, total_packets, rtp_streams)
 
-        self._emit_progress(70, "深度协议分析 (SSH/TLS/SMB/RDP/Redis 等)...")
+        self._emit_progress(64, "深度协议分析 (SSH/TLS/SMB/RDP/Redis 等)...")
         self._mark_stage("深度协议分析")
         deep_findings, deep_extracted = self._run_deep_protocol_analysis(protocol_counts)
         protocol_findings.extend(deep_findings)
@@ -683,10 +689,14 @@ class StreamAnalysisWorker(QThread):
 
         self._emit_progress(95, "生成分析报告...")
         self._mark_stage("生成分析报告")
+        # 攻击链聚合必须放在**所有**检测都收齐之后：AST 阶段产出的那批
+        # 是在研判跑完之后才 extend 进来的，放早了它们进不了链。
+        self._annotate_attack_chains(results)
         protocol_stats = self._build_protocol_stats(protocol_counts, total_packets, protocol_hierarchy)
 
         # 收尾：结束最后一个阶段的计时
         self._mark_stage(None)
+        self._log_stage_breakdown()
 
         return self._build_summary(
             results, protocol_stats, protocol_findings,
@@ -755,7 +765,7 @@ class StreamAnalysisWorker(QThread):
             confirmed, suspected, failed, len(hosts),
         )
         self._emit_progress(
-            44, f"成功研判：确认 {confirmed} 条，疑似 {suspected} 条，"
+            50, f"成功研判：确认 {confirmed} 条，疑似 {suspected} 条，"
                 f"排除失败 {failed} 条")
         return hosts
 
@@ -834,7 +844,7 @@ class StreamAnalysisWorker(QThread):
             return []
         if ast_hosts is not None and not ast_hosts:
             logger.info("成功研判未发现任何得手迹象，跳过 WebShell AST 深挖")
-            self._emit_progress(46, "WebShell AST：无得手迹象，跳过")
+            self._emit_progress(51, "WebShell AST：无得手迹象，跳过")
             return []
 
         packets = []
@@ -886,7 +896,7 @@ class StreamAnalysisWorker(QThread):
                     now = time.time()
                     if now - last_tick >= 0.5:
                         self._emit_progress(
-                            46, f"WebShell AST 采集中（{scope}）... "
+                            52, f"WebShell AST 采集中（{scope}）... "
                                 f"({len(packets)} 个 HTTP 包, "
                                 f"{est_bytes / 1024 / 1024:.0f}MB)")
                         last_tick = now
@@ -912,7 +922,7 @@ class StreamAnalysisWorker(QThread):
                     "语义分析 —— 主检测链路(_run_http_stream_analysis)仍覆盖全量。",
                     len(packets), why, est_bytes / 1024 / 1024)
                 self._emit_progress(
-                    46, f"WebShell AST：已收 {len(packets)} 个 HTTP 包（{why}），剩余未分析")
+                    52, f"WebShell AST：已收 {len(packets)} 个 HTTP 包（{why}），剩余未分析")
 
             if not packets:
                 return []
@@ -920,7 +930,7 @@ class StreamAnalysisWorker(QThread):
             detector = WebShellDetector()
             detector.enable_ast(True)
             self._emit_progress(
-                47, f"WebShell AST 检测中... ({len(packets)} 个 HTTP 包，{scope})")
+                53, f"WebShell AST 检测中... ({len(packets)} 个 HTTP 包，{scope})")
             detection_results = detector.detect(packets)
             for tool_name, converter in converters.items():
                 for raw_result in detection_results.get(tool_name, []):
@@ -1079,13 +1089,13 @@ class StreamAnalysisWorker(QThread):
 
             self._seen_keys.clear()
 
-            self._emit_progress(43, f"HTTP分析完成: {http_count} 请求, {len(results)} 威胁")
+            self._emit_progress(40, f"HTTP分析完成: {http_count} 请求, {len(results)} 威胁")
 
         except TsharkError as e:
             if _allow_ek_fallback:
                 logger.warning(f"FIELDS HTTP stream unavailable, retrying EK: {e}")
                 return self._run_http_stream_analysis(total_packets, False, results)
-            self._emit_progress(43, f"HTTP分析警告: {str(e)[:40]}")
+            self._emit_progress(40, f"HTTP分析警告: {str(e)[:40]}")
             raise
         except Exception as e:
             if _allow_ek_fallback:
@@ -1346,7 +1356,7 @@ class StreamAnalysisWorker(QThread):
                 now = time.time()
                 if now - last_tick >= 0.5:
                     # 46~52 这一段。拿不到响应总数，用渐近曲线保证只增不越界
-                    pct = 46 + int((1.0 - 1.0 / (1.0 + resp_count / 20000.0)) * 6)
+                    pct = 40 + int((1.0 - 1.0 / (1.0 + resp_count / 20000.0)) * 8)
                     self._emit_progress(
                         pct,
                         f"HTTP 响应扫描中... ({resp_count} 个响应, "
@@ -1417,14 +1427,14 @@ class StreamAnalysisWorker(QThread):
                 )
         except Exception as error:
             logger.warning("HTTP response stream scan failed: %s", error)
-            self._emit_progress(52, "HTTP 响应流式扫描失败")
+            self._emit_progress(48, "HTTP 响应流式扫描失败")
         finally:
             close = getattr(packet_iter, "close", None)
             if close:
                 close()
 
         if not self._is_cancelled:
-            self._emit_progress(52, f"HTTP 响应扫描完成: {len(extracted_files)} 个对象")
+            self._emit_progress(48, f"HTTP 响应扫描完成: {len(extracted_files)} 个对象")
         return extracted_files
 
     @staticmethod
@@ -1521,6 +1531,39 @@ class StreamAnalysisWorker(QThread):
             if not lazy:
                 detection.response_data = response_data
 
+    # 这一趟允许写进 display filter 的流号上限。
+    #
+    # 超过就退回全量 `http.response`：几百个 `tcp.stream==N` 的大交替
+    # 自己就要 tshark 逐包求值，省下来的解析还不够赔进去的过滤开销，
+    # 命令行也可能被撑爆。口径与 _build_ast_display_filter 的 64 一致。
+    _RESPONSE_FILTER_MAX_STREAMS = 64
+
+    @classmethod
+    def _build_response_stream_filter(
+        cls, stream_ids: Set[int], all_detections_covered: bool
+    ) -> str:
+        """把要认领响应的那几条 TCP 流翻译成 display filter。
+
+        **语义必须与全量 `http.response` 完全等价**，不是"少看一点换速度"。
+        等价的论证：下面的匹配循环只会把响应认到两个索引里去 ——
+        `request_to_indices`（按 http.request_in）和 `stream_to_indices`
+        （按 tcp.stream）。后者显然只落在 stream_ids 里；前者的每条检测
+        只要**自己带了合法 tcp_stream**，它的请求和响应就同处一条流，
+        于是也落在 stream_ids 里。两者都被覆盖，收窄才不丢东西。
+
+        所以 `all_detections_covered` 是硬前提：只要有**一条**检测的
+        tcp_stream 缺失（-1），它就只能靠 request_in 认领，而它所在的流
+        不在 stream_ids 里 —— 收窄会让这条检测的响应侧永远为空。
+        这种时候必须退回全量，宁可慢，不可漏。
+        """
+        if not all_detections_covered:
+            return "http.response"
+        usable = sorted(sid for sid in stream_ids if isinstance(sid, int) and sid >= 0)
+        if not usable or len(usable) > cls._RESPONSE_FILTER_MAX_STREAMS:
+            return "http.response"
+        streams = " || ".join(f"tcp.stream=={sid}" for sid in usable)
+        return f"http.response && ({streams})"
+
     def _fetch_http_responses(
         self,
         results: List[DetectionResult],
@@ -1528,12 +1571,40 @@ class StreamAnalysisWorker(QThread):
         _response_matches: Optional[List[Tuple[PacketData, List[int]]]] = None,
         _seen_response_links: Optional[Set[Tuple[str, int]]] = None,
     ) -> List[DetectionResult]:
-        """检测完成后，按 tcp_stream 批量抓取对应的 HTTP 响应包"""
+        """检测完成后，按 tcp_stream 批量抓取对应的 HTTP 响应包。
+
+        ── 这一趟和 _scan_http_responses 不是重复，别顺手合并 ──
+
+        两者过滤器相同（http.response），覆盖的**检测集合却不同**，
+        合并任何一趟都会造成证据损失：
+
+          _scan_http_responses(results)     40% 阶段，覆盖 HTTP 主检测链路的
+                                            结果。它必须跑在成功研判**之前** ——
+                                            研判维度 A 读 response_sample、
+                                            维度 B 拿 response_status 做前置
+                                            否决（见 success_adjudicator
+                                            _dimension_b 开头那段）。它同时
+                                            还要做文件提取，所以不能收窄、
+                                            也不能提前退出。
+
+          _fetch_http_responses(ast_results) AST 阶段之后，覆盖的是
+                                            _run_webshell_ast_detection 新产出
+                                            的那批检测 —— 它们在 40% 那趟跑完
+                                            时**还不存在**。
+
+        顺序被锁死成 响应扫描 → 研判 → AST，所以第二趟无法并进第一趟。
+
+        注意 ast_results 走到这里时研判**已经跑完**（研判在 43%，AST 在 46%），
+        它们不会被 adjudicate_all 处理。也就是说这一趟的产物只进
+        payload_viewer 的响应侧展示，不进研判。收窄这一趟因此**不可能**
+        影响研判召回 —— 这是下面 display filter 收窄的安全性依据。
+        """
         if not results or not self._handler:
             return results
 
         stream_to_indices: Dict[int, List[int]] = {}
         request_to_indices: Dict[int, List[int]] = {}
+        covered_indices: Set[int] = set()
         for idx, det in enumerate(results):
             tcp_stream = -1
             request_frame = 0
@@ -1544,6 +1615,7 @@ class StreamAnalysisWorker(QThread):
                 request_frame = getattr(det, "packet_number", 0)
             if tcp_stream >= 0:
                 stream_to_indices.setdefault(tcp_stream, []).append(idx)
+                covered_indices.add(idx)
             try:
                 request_frame = int(request_frame or 0)
             except (TypeError, ValueError):
@@ -1568,9 +1640,14 @@ class StreamAnalysisWorker(QThread):
             for idx in target_indices
         }
         output_format = OutputFormat.FIELDS if _allow_ek_fallback else OutputFormat.EK
+        # 原来这里固定是 "http.response"：整个文件的响应全部吐给 Python，
+        # 再在下面的循环里逐条丢掉不相关的。大抓包里响应是几十万级，
+        # 而这一趟真正要认领的通常只有个位数条流。把筛选交给 tshark。
+        display_filter = self._build_response_stream_filter(
+            stream_ids, len(covered_indices) == len(results))
         config = StreamConfig(
             pcap_path=self.pcap_path,
-            display_filter="http.response",
+            display_filter=display_filter,
             output_format=output_format,
             fields=list(HTTP_RESPONSE_FIELDS) if output_format is OutputFormat.FIELDS else [],
             disable_name_resolution=True,
@@ -1685,25 +1762,46 @@ class StreamAnalysisWorker(QThread):
 
         return "\r\n".join(header_lines)
 
-    def _run_icmp_analysis(self) -> List[ProtocolFinding]:
-        from core.protocol_analyzer import ICMPAnalyzer
+    def _run_icmp_analysis(self,
+                           protocol_counts: Optional[Dict[str, int]] = None
+                           ) -> List[ProtocolFinding]:
+        from core.protocol_analyzer import (
+            ICMPAnalyzer, ProtocolAnalyzerManager, ProtocolType)
         findings: List[ProtocolFinding] = []
         try:
+            # 与深度分析阶段同一套门控：io,phs 层帧数为 0 → -Y icmp 必匹配
+            # 0 包 → 跑与不跑结果集相同，跳过的是纯浪费。统计拿不到时
+            # select_runnable_protocols 返回"全部照跑"，不会漏。
+            _, skipped = ProtocolAnalyzerManager.select_runnable_protocols(
+                {ProtocolType.ICMP}, protocol_counts)
+            if ProtocolType.ICMP in skipped:
+                self._emit_progress(58, "ICMP分析: 无 ICMP 流量, 已跳过")
+                return findings
+
             analyzer = ICMPAnalyzer()
             result = analyzer.analyze_pcap(self.pcap_path, display_filter="icmp")
             for af in result.findings:
                 pf = ProtocolFinding.from_analyzer_finding(af)
                 findings.append(pf)
                 self.protocolFindingFound.emit(pf)
-            self._emit_progress(56, f"ICMP分析完成: {len(findings)} 个发现")
+            self._emit_progress(58, f"ICMP分析完成: {len(findings)} 个发现")
         except Exception as e:
             logger.warning(f"ICMP 分析异常: {e}")
         return findings
 
-    def _run_dns_analysis(self) -> List[ProtocolFinding]:
-        from core.protocol_analyzer import DNSCovertChannelAnalyzer
+    def _run_dns_analysis(self,
+                          protocol_counts: Optional[Dict[str, int]] = None
+                          ) -> List[ProtocolFinding]:
+        from core.protocol_analyzer import (
+            DNSCovertChannelAnalyzer, ProtocolAnalyzerManager, ProtocolType)
         findings: List[ProtocolFinding] = []
         try:
+            _, skipped = ProtocolAnalyzerManager.select_runnable_protocols(
+                {ProtocolType.DNS}, protocol_counts)
+            if ProtocolType.DNS in skipped:
+                self._emit_progress(60, "DNS分析: 无 DNS 流量, 已跳过")
+                return findings
+
             analyzer = DNSCovertChannelAnalyzer()
             result = analyzer.analyze_pcap(self.pcap_path, display_filter="dns")
             for af in result.findings:
@@ -1725,7 +1823,7 @@ class StreamAnalysisWorker(QThread):
                 pf = ProtocolFinding.from_analyzer_finding(af)
                 findings.append(pf)
                 self.protocolFindingFound.emit(pf)
-            self._emit_progress(64, f"CS检测完成: {len(findings)} 个发现")
+            self._emit_progress(62, f"CS检测完成: {len(findings)} 个发现")
         except Exception as e:
             logger.warning(f"CS 分析异常: {e}")
         return findings
@@ -1746,7 +1844,7 @@ class StreamAnalysisWorker(QThread):
 
             streams = list_rtp_streams(self.pcap_path, self.tshark_path)
             if not streams:
-                self._emit_progress(68, "未发现 RTP 音视频流")
+                self._emit_progress(64, "未发现 RTP 音视频流")
                 return []
 
             has_dynamic = any(s.payload_type >= 96 for s in streams)
@@ -1759,7 +1857,7 @@ class StreamAnalysisWorker(QThread):
                         s.media_type = mtype
                         s.sample_rate = rate
 
-            self._emit_progress(68, f"发现 {len(streams)} 条 RTP 音视频流")
+            self._emit_progress(64, f"发现 {len(streams)} 条 RTP 音视频流")
             return streams
 
         except Exception as e:
@@ -1783,7 +1881,8 @@ class StreamAnalysisWorker(QThread):
         extracted_file_paths: List[str] = []
 
         try:
-            from core.protocol_analyzer import ProtocolAnalyzerManager, ProtocolType
+            from core.protocol_analyzer import (
+                ProtocolAnalyzerManager, ProtocolType, collect_service_ports)
 
             SKIP = {ProtocolType.ICMP, ProtocolType.DNS, ProtocolType.COBALT_STRIKE}
 
@@ -1791,14 +1890,17 @@ class StreamAnalysisWorker(QThread):
             deep_protocols = [
                 protocol for protocol in ProtocolType if protocol not in SKIP
             ]
+            # 一趟 conv,tcp（实测 21 秒）换掉 RDP/Redis/SSH 三趟裸端口扫描
+            # （实测各 111 秒）。问不出来时返回 None，那三个照跑。
+            service_ports = collect_service_ports(self.pcap_path, self.tshark_path or "")
             runnable, gated = ProtocolAnalyzerManager.select_runnable_protocols(
-                deep_protocols, protocol_counts)
+                deep_protocols, protocol_counts, service_ports)
             if gated:
                 names = ", ".join(sorted(p.value for p in gated))
                 logger.info(
                     "协议分级统计里没有这些协议层，跳过对应分析器（跑了也必然"
                     "匹配 0 个包）：%s", names)
-                self._emit_progress(70, f"深度协议分析：按协议统计跳过 {len(gated)} 个分析器")
+                self._emit_progress(64, f"深度协议分析：按协议统计跳过 {len(gated)} 个分析器")
 
             results = manager.analyze_all_pcap(
                 self.pcap_path,
@@ -1807,6 +1909,7 @@ class StreamAnalysisWorker(QThread):
                 progress_callback=self._emit_deep_protocol_progress,
                 parallel=True,
                 max_workers=4,
+                protocol_counts=protocol_counts,
             )
 
             total_findings = 0
@@ -1842,7 +1945,7 @@ class StreamAnalysisWorker(QThread):
         if total <= 0:
             return
         completed = index + 1
-        percent = 65 + ((completed * 9 + total - 1) // total)
+        percent = 64 + ((completed * 10 + total - 1) // total)
         name = getattr(protocol, "value", str(protocol))
         self._emit_progress(
             min(percent, 74),
@@ -2008,6 +2111,84 @@ class StreamAnalysisWorker(QThread):
             pct = (count / total * 100) if total > 0 else 0
             stats.append(ProtocolStats(proto, count, pct))
         return stats
+
+    def _annotate_attack_chains(self, results: List[DetectionResult]) -> None:
+        """把检测按 (来源, 目标, 路径) 聚成攻击链，并把链结论写回每一条。
+
+        为什么需要：研判是**逐条**下结论的，而攻击是**成链**发生的。
+        实测一个 webshell 在抓包里被访问 19 次，逐条研判只认出 1 条
+        confirmed —— 另外 18 次单独看都只是"POST 了个 php 文件，响应 200"。
+        聚成链之后，那 18 条继承"本链已证实得手"，不再被降档压掉。
+
+        反过来，6747 条打同一个登录页的扫描 payload 聚成的链上一条得手
+        都没有，整条链照常降档 —— 聚合不会把噪声救回来。
+
+        聚合失败不能影响分析结果：拿不到模块或中途出错都只记日志。
+        """
+        if annotate_attack_chains is None or not results:
+            return
+        try:
+            chains = annotate_attack_chains(results)
+        except Exception as e:
+            logger.warning("攻击链聚合失败，退化为逐条呈现: %s", e)
+            return
+        landed = [chain for chain in chains if chain.landed]
+        logger.info("攻击链聚合：%d 条检测 → %d 条链，其中 %d 条已证实得手",
+                    len(results), len(chains), len(landed))
+
+        # 按攻击者会话打一份摘要出来。
+        #
+        # 这一行就是分析员真正需要的东西：实测那个包里
+        #   192.168.94.59 → 192.168.32.189  尝试 6747 次，得手 19 次
+        # 而界面上是 6747 行平铺，那 19 条淹在里面。详情表的树形聚合还没
+        # 做，先把结论落到可见的地方，别让算出来的东西烂在内存里。
+        try:
+            from core.attack_chain import build_sessions
+
+            lines = []
+            for session in build_sessions(chains)[:10]:
+                data = session.to_dict()
+                lines.append(
+                    f"  {data['src_ip'] or '(未知)':<17} → "
+                    f"{data['dst_ip'] or '(未知)':<17} "
+                    f"{data['summary']:<24} 结论 {data['outcome'] or '—'}")
+            for chain in landed[:20]:
+                lines.append(
+                    f"    ★ 得手链 {chain.src_ip} → {chain.dst_ip}{chain.path}"
+                    f"  ({chain.size} 条检测, {chain.outcome})")
+            if lines:
+                print("\n[*] 按攻击者聚合：\n" + "\n".join(lines) + "\n")
+        except Exception as e:
+            logger.debug("攻击链摘要输出失败: %s", e)
+
+    def _log_stage_breakdown(self) -> None:
+        """把这一轮各阶段/各趟 tshark 的耗时输出出来。
+
+        为什么需要它：流水线里有好几个阶段**全程不发进度信号**（成功研判
+        内部的出站 SYN 采集、ICMP/DNS 的整趟扫描、深度协议分析里每个
+        分析器内部的 5~9 趟、SMB 的两次 --export-objects）。界面上就是
+        "卡住十几秒"，而卡在哪一趟原来只能靠猜 —— 埋点其实一直在记
+        （record_tshark_pass），只是 get_dashboard_data() 没给出口。
+
+        用 print 而不是只用 logger.info：main.py 里没有任何 logging 配置，
+        根 logger 只有 lastResort 处理器（WARNING 起才输出到 stderr），
+        所以全项目的 logger.info 在 GUI 下都是看不见的。这一行是给人看
+        的诊断输出，必须真的能到达 —— 与 analysis_service 里那些
+        `[*]` 前缀的输出同一套约定。
+
+        埋点自身绝不允许影响分析结果：任何一步异常都静默吞掉。
+        """
+        if get_observability_hub is None:
+            return
+        try:
+            breakdown = get_observability_hub().format_stage_breakdown(limit=15)
+            # print 也必须在 try 里：sys.stdout 为 None 时 CPython 会静默返回，
+            # 但重定向到**已关闭的管道**时会抛 ValueError。埋点炸掉整轮分析
+            # 是本末倒置的。
+            print(f"\n[*] 本轮各阶段 / tshark 趟耗时（降序）：\n{breakdown}\n")
+            logger.info("本轮各阶段 / tshark 趟耗时（降序）：\n%s", breakdown)
+        except Exception as e:
+            logger.debug(f"阶段耗时明细输出失败: {e}")
 
     def _build_summary(
         self,

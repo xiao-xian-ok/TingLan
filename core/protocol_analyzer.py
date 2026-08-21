@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 import pathlib
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, Iterable, List, Optional, Any, Tuple
@@ -53,8 +54,50 @@ def _split_tshark_fields(line: str) -> List[str]:
     return fields
 
 
+def _tshark_stage_name(args: List[str]) -> str:
+    """从 tshark 参数里提取这趟的稳定名字（stage 桶的 key，同名趟累加）。
+
+    优先级：-Y 过滤器（一趟的语义 ID）> --export-objects > -z > -e 字段；
+    都没有才落到 other。名字截断到 80 字符，防非常规过滤器撑爆 stage 表。
+    """
+    for i, arg in enumerate(args):
+        if arg == "-Y" and i + 1 < len(args):
+            return f"tshark.{str(args[i + 1])[:80]}"
+        if arg == "--export-objects" and i + 1 < len(args):
+            return f"tshark.export_{str(args[i + 1]).split(',')[0]}"
+        if arg == "-z" and i + 1 < len(args):
+            return f"tshark.{str(args[i + 1]).replace(',', '_')}"
+        if arg == "-e" and i + 1 < len(args):
+            return f"tshark.e_{str(args[i + 1])[:80]}"
+    return "tshark.other"
+
+
+def _record_tshark_stage(name: str, elapsed_s: float, lines: int = 0,
+                         output_chars: int = 0) -> None:
+    """一趟 tshark 跑完后的埋点，转发给观测中心的 record_tshark_pass。
+
+    埋点自身绝不允许影响检测结果：取数或写数任何一步异常都静默吞掉。
+    """
+    try:
+        from core.observability import get_observability_hub
+    except ImportError:
+        try:
+            from observability import get_observability_hub
+        except ImportError:
+            return
+    try:
+        get_observability_hub().record_tshark_pass(
+            name, elapsed_s, lines, output_chars)
+    except Exception:
+        logger.debug("tshark 趟埋点失败: %s", name, exc_info=True)
+
+
 def _run_tshark_text(tshark_path: str, args: List[str], timeout: int = 180) -> str:
-    """统一执行 tshark，超时由 subprocess.run 负责回收，避免异常路径泄露子进程。"""
+    """统一执行 tshark，超时由 subprocess.run 负责回收，避免异常路径泄露子进程。
+
+    埋点放 finally：超时/异常也算一趟（0 行 + 大耗时在报告里一眼可见），
+    但异常路径的返回值不受影响。
+    """
     cmd = [tshark_path] + _prepare_tshark_args(args)
     kwargs = {
         "capture_output": True,
@@ -65,15 +108,180 @@ def _run_tshark_text(tshark_path: str, args: List[str], timeout: int = 180) -> s
     }
     if sys.platform == "win32":
         kwargs["creationflags"] = 0x08000000
+    start = time.perf_counter()
+    stdout = ""
     try:
-        return subprocess.run(cmd, **kwargs).stdout or ""
+        result = subprocess.run(cmd, **kwargs)
+        stdout = result.stdout or ""
     except FileNotFoundError:
         print(f"[!] 无法找到tshark: {tshark_path}")
     except subprocess.TimeoutExpired:
         logger.warning("tshark 执行超时: %s", " ".join(cmd[:8]))
     except Exception as exc:
         logger.warning("tshark 执行失败: %s", exc)
-    return ""
+    finally:
+        _record_tshark_stage(
+            _tshark_stage_name(args),
+            time.perf_counter() - start,
+            lines=stdout.count("\n"),
+            output_chars=len(stdout),
+        )
+    return stdout
+
+
+def _layer_present(protocol_counts, *layer_names):
+    """io,phs 分层统计中指定的层是否存在。
+
+    "per-pass 层门控"的判据：某层帧数为 0 → 以该层为过滤条件的 tshark
+    趟必然匹配 0 个包 → 跑与不跑结果集相同，省掉的是全文件解析。
+    统计缺失（protocol_counts 为空）时一律返回 True（照跑）——
+    "统计没出来"和"确实没有这个层"是两回事，不能混。
+    """
+    if not protocol_counts:
+        return True
+    upper = {str(name).upper() for name in layer_names}
+    return any(
+        str(key).upper() in upper and value > 0
+        for key, value in protocol_counts.items()
+    )
+
+
+# conv,tcp 输出行：`10.0.0.9:51000  <-> 192.168.1.20:80   7 5356 bytes ...`
+_CONV_LINE_RE = re.compile(
+    r"^\s*\S+?:(\d{1,5})\s+<->\s+\S+?:(\d{1,5})\s")
+
+
+def collect_service_ports(pcap_path: str, tshark_path: str,
+                          timeout: int = 300) -> Optional[set]:
+    """一趟 `-z conv,tcp` 拿到这个抓包里**被当作服务端口**的集合。
+
+    返回 None 表示"没问出来"，调用方必须当作"不知道"照常跑全部分析器。
+    空集合和 None 是两回事，别合并。
+
+    ── 为什么需要它 ──
+
+    RDP / Redis / SSH 三个分析器故意不做层门控（见 _LAYER_GATED_ANALYZERS
+    的注释）：它们有 `tcp.port == 3389` / `== 6379` /
+    `tcp.dstport == 22 && syn` 这类**裸端口**路径，专门用来发现没有完成
+    握手的爆破和端口扫描 —— 那种流量恰恰不会在 io,phs 里留下协议层。
+
+    理由成立，但代价是实测每趟 111 秒、输出 47/14/0 行。这一趟 conv,tcp
+    只要 21 秒，而且能同时回答裸端口路径的问题：SYN 扫描照样会在
+    conv,tcp 里留下一条会话记录，所以门控不会把扫描检测一起关掉。
+
+    ── 判据：右侧端口才是服务端口 ──
+
+    tshark 的 conv,tcp 按**首包**排列，发起方在左。实测标定包里有
+        192.168.94.59:3389  <->  192.168.32.189:80
+    左边那个 3389 是客户端随机挑到的临时端口，跟 RDP 毫无关系。只看
+    "端口出现过没有"会把它当成 RDP 存在 —— 门控直接失效。
+
+    所以取右侧端口。再额外把左侧 <1024 的也算上：抓包从会话中间开始时
+    首包可能是响应方发的，那种情况下左右会颠倒，而 <1024 的知名端口
+    做客户端源端口的概率极低。宁可多跑一趟，不可漏。
+    """
+    if not pcap_path or not tshark_path:
+        return None
+    output = _run_tshark_text(
+        tshark_path, ["-r", pcap_path, "-n", "-q", "-z", "conv,tcp"],
+        timeout=timeout)
+    if not output:
+        return None
+
+    ports = set()
+    matched = 0
+    for line in output.splitlines():
+        match = _CONV_LINE_RE.match(line)
+        if not match:
+            continue
+        matched += 1
+        left, right = int(match.group(1)), int(match.group(2))
+        ports.add(right)
+        if left < 1024:
+            ports.add(left)
+
+    if not matched:
+        # 一条会话行都没解析出来 —— 可能是 tshark 输出格式变了。
+        # 这种时候必须返回 None（不知道），不能返回空集合（没有服务）。
+        logger.warning("conv,tcp 输出未能解析出任何会话，端口门控退回全跑")
+        return None
+    return ports
+
+
+# ============================================================
+# 轻量 FIELDS 取数通道（替代 PyShark FileCapture）
+# ============================================================
+
+def _iter_field_lines(tshark_path: str, pcap_path: str, display_filter: str,
+                      fields: List[str]):
+    """流式逐行产出 `tshark -T fields` 输出，不物化 stdout。
+
+    与 PyShark FileCapture 的差别只在取数通道：逐行顺序与文件顺序一致，
+    `-E occurrence=f` 让多值字段只取首个值（与 pyshark get_field_value
+    的行为相同）。行按 tab 切分，字段缺失时为空串。
+    """
+    cmd = [str(tshark_path), "-r", pcap_path, "-Y", display_filter,
+           "-T", "fields", "-E", "separator=\t", "-E", "occurrence=f"]
+    for f in fields:
+        cmd += ["-e", f]
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        text=True, encoding="utf-8", errors="replace",
+        creationflags=0x08000000 if sys.platform == "win32" else 0)
+    start = time.perf_counter()
+    count = 0
+    try:
+        for line in proc.stdout:
+            count += 1
+            yield line.rstrip("\r\n").split("\t")
+    finally:
+        proc.stdout.close()
+        proc.wait()
+        # 生成器被提前关闭（break/异常）也照样留痕，行数就是实际消费量
+        _record_tshark_stage(
+            _tshark_stage_name(["-Y", display_filter]),
+            time.perf_counter() - start,
+            lines=count,
+        )
+
+
+class _LiteLayer:
+    """tshark -T fields 一行的字段视图，模拟 pyshark 层对象。
+
+    字段缺失时抛 AttributeError —— hasattr() 才能像 pyshark 那样区分
+    "字段不存在"和"字段为空"，analyze() 里的 hasattr 守卫语义不变。
+    """
+    __slots__ = ("_values",)
+
+    def __init__(self, values: Dict[str, Optional[str]]):
+        self._values = values
+
+    def get_field_value(self, name: str) -> Optional[str]:
+        return self._values.get(name)
+
+    def __getattr__(self, name: str):
+        if name in self._values:
+            return self._values[name]
+        raise AttributeError(name)
+
+
+class _LitePacket:
+    """一行的轻量包视图：pkt.icmp / pkt.ip / pkt.dns / pkt.layers。
+
+    layers[2] 固定是 dns 层（DNSCovertChannelAnalyzer 用
+    `pkt.layers[2].get_field_value("stream")` 取 dns.stream）；dns 为
+    None 的包不会走到那次访问（display_filter="dns" 保证有 dns 层）。
+    """
+    __slots__ = ("icmp", "ip", "dns", "layers")
+
+    def __init__(self, layers: Dict[str, Dict[str, Optional[str]]]):
+        icmp = layers.get("icmp")
+        ip = layers.get("ip")
+        dns = layers.get("dns")
+        self.icmp = _LiteLayer(icmp) if icmp is not None else None
+        self.ip = _LiteLayer(ip) if ip is not None else None
+        self.dns = _LiteLayer(dns) if dns is not None else None
+        self.layers = [self.ip, None, self.dns]
 
 
 # ============================================================
@@ -423,6 +631,46 @@ class ICMPAnalyzer(ProtocolAnalyzer):
             summary="; ".join(summary_parts)
         )
 
+    # ICMP 隐写分析的字段需求很小（type/payload hex/ttl/seq），
+    # 用流式 -T fields 代替 PyShark FileCapture：同样的逐包数据，
+    # 但省掉每包一个 asyncio 任务 + 完整包对象树的构建开销。
+    # 注意：ICMP 载荷不在 icmp.* 字段树里（tshark -e icmp.data.data 无效），
+    # 实际落在通用 data.data 上，且输出不带冒号 —— 正好等价于原代码
+    # pkt.icmp.data_data.replace(':', '') 之后的值。
+    _FIELD_NAMES = ["icmp.type", "data.data", "ip.ttl", "icmp.seq"]
+
+    def analyze_pcap(self, pcap_path: str, **kwargs) -> ProtocolAnalysisResult:
+        from services.analysis_service import AnalysisService
+        tshark_path = AnalysisService().find_tshark()
+        if not tshark_path:
+            return ProtocolAnalysisResult(
+                protocol=ProtocolType.ICMP,
+                packet_count=0,
+                findings=[],
+                summary="tshark不可用"
+            )
+        display_filter = kwargs.get("display_filter") or "icmp"
+        packets = []
+        for parts in _iter_field_lines(tshark_path, pcap_path,
+                                       display_filter, self._FIELD_NAMES):
+            icmp_type, data_data, ttl, seq = \
+                (parts + [""] * len(self._FIELD_NAMES))[:len(self._FIELD_NAMES)]
+            icmp = {}
+            ip = {}
+            # 空串 = tshark 该字段缺失，等同 pyshark 的"层里没有这个字段"
+            if icmp_type:
+                icmp["type"] = icmp_type
+                if data_data:
+                    # analyze() 里 data_len 分支在 pyshark 下也不存在，
+                    # 实际走的正是 data_data 分支，这里保持一致
+                    icmp["data_data"] = data_data
+                if seq:
+                    icmp["seq"] = seq
+            if ttl:
+                ip["ttl"] = ttl
+            packets.append(_LitePacket({"icmp": icmp, "ip": ip}))
+        return self.analyze(packets, **kwargs)
+
 
 # ============================================================
 # DNSCovertChannelAnalyzer
@@ -651,6 +899,38 @@ class DNSCovertChannelAnalyzer(ProtocolAnalyzer):
             extracted_files=extracted_files,
             output_dir=output_dir
         )
+
+    # DNS 层实际只用 qry.name/txt 两个字段。pyshark 的
+    # `layers[2].get_field_value("stream")` 对 dns 层恒返回 None
+    # （dns 层没有 stream 键），所以 stream_index 从来都是 None ——
+    # 迁移后 dns 层没有 "stream" 键，get_field_value 同样返回 None，
+    # 行为自动等价。dns.txt 多值时 occurrence=f 取首个，与 pyshark
+    # get_field_value 相同。
+    _FIELD_NAMES = ["dns.qry.name", "dns.txt"]
+
+    def analyze_pcap(self, pcap_path: str, **kwargs) -> ProtocolAnalysisResult:
+        from services.analysis_service import AnalysisService
+        tshark_path = AnalysisService().find_tshark()
+        if not tshark_path:
+            return ProtocolAnalysisResult(
+                protocol=ProtocolType.DNS,
+                packet_count=0,
+                findings=[],
+                summary="tshark不可用"
+            )
+        display_filter = kwargs.get("display_filter") or "dns"
+        packets = []
+        for parts in _iter_field_lines(tshark_path, pcap_path,
+                                       display_filter, self._FIELD_NAMES):
+            qry_name, txt = \
+                (parts + [""] * len(self._FIELD_NAMES))[:len(self._FIELD_NAMES)]
+            dns = {}
+            if qry_name:
+                dns["qry_name"] = qry_name
+            if txt:
+                dns["txt"] = txt
+            packets.append(_LitePacket({"dns": dns}))
+        return self.analyze(packets, **kwargs)
 
 
 # ============================================================
@@ -2045,6 +2325,8 @@ class USBAnalyzer(ProtocolAnalyzer):
             "-e", "data.data"
         ]
 
+        start = time.perf_counter()
+        stdout = ""
         try:
             result = subprocess.run(
                 cmd,
@@ -2068,6 +2350,13 @@ class USBAnalyzer(ProtocolAnalyzer):
                     is_flag=False
                 )],
                 summary="tshark不可用"
+            )
+        finally:
+            _record_tshark_stage(
+                _tshark_stage_name(cmd),
+                time.perf_counter() - start,
+                lines=stdout.count("\n"),
+                output_chars=len(stdout),
             )
 
         kb_result = []
@@ -2569,6 +2858,8 @@ class TLSAnalyzer(ProtocolAnalyzer):
             return []
 
         cmd = [tshark_path, '-r', pcap_file] + extra_args + ['--export-objects', f'http,{output_dir}']
+        start = time.perf_counter()
+        stdout = ""
         try:
             result = subprocess.run(
                 cmd,
@@ -2579,8 +2870,16 @@ class TLSAnalyzer(ProtocolAnalyzer):
                 timeout=180,
             )
             stderr = result.stderr
+            stdout = result.stdout or ""
         except FileNotFoundError:
             return []
+        finally:
+            _record_tshark_stage(
+                _tshark_stage_name(cmd),
+                time.perf_counter() - start,
+                lines=stdout.count("\n"),
+                output_chars=len(stdout),
+            )
 
         exported = []
         for fpath, fname in iter_safe_child_files(output_dir):
@@ -2764,6 +3063,7 @@ class TLSAnalyzer(ProtocolAnalyzer):
         server_ip = kwargs.get('server_ip', self.server_ip)
         port = kwargs.get('port', self.port)
         output_dir = kwargs.get('output_dir', self.output_dir)
+        protocol_counts = kwargs.get('protocol_counts')
 
         if not os.path.isfile(pcap_path):
             print(f'[!] 文件不存在: {pcap_path}')
@@ -2799,10 +3099,15 @@ class TLSAnalyzer(ProtocolAnalyzer):
         print(f'[*] 正在分析 SSL/TLS 流量: {pcap_path}')
         print('=' * 60)
 
-        # 1. 握手信息 + 证书
+        # 1. 握手信息 + 证书（三趟都是 tls.* 层过滤，TLS 层为 0 时必然
+        #    匹配 0 包，跳过与不跳结果集相同）
         print('[阶段1] TLS 握手信息与证书')
         print('-' * 60)
-        handshake = self.extract_tls_handshake(pcap_path, tshark_path)
+        if _layer_present(protocol_counts, "TLS", "SSL"):
+            handshake = self.extract_tls_handshake(pcap_path, tshark_path)
+        else:
+            print('[*] 无 TLS 层流量，跳过握手/证书提取')
+            handshake = {'client_hellos': [], 'server_hellos': [], 'certs': []}
 
         client_hellos = handshake.get('client_hellos', [])
         server_hellos = handshake.get('server_hellos', [])
@@ -2850,7 +3155,11 @@ class TLSAnalyzer(ProtocolAnalyzer):
         # 2. 会话统计
         print('[阶段2] TLS 会话统计')
         print('-' * 60)
-        sessions = self.extract_tls_sessions(pcap_path, tshark_path)
+        if _layer_present(protocol_counts, "TLS", "SSL"):
+            sessions = self.extract_tls_sessions(pcap_path, tshark_path)
+        else:
+            print('[*] 无 TLS 层流量，跳过会话统计')
+            sessions = {}
 
         # 2.5 自动从流量包中搜索 keylog 数据
         auto_keylog = None
@@ -3013,81 +3322,88 @@ class RDPAnalyzer(ProtocolAnalyzer):
     def _run_tshark(tshark_path, args):
         return _run_tshark_text(tshark_path, args)
 
-    def extract_rdp_sessions(self, pcap_file, tshark_path):
-        """提取 RDP 会话元数据: IP、端口、Cookie (含用户名)"""
+    def extract_rdp_sessions(self, pcap_file, tshark_path, protocol_counts=None):
+        """提取 RDP 会话元数据: IP、端口、Cookie (含用户名)
+
+        Cookie/协商两趟是 rdp.* 层过滤，可做层门控；TCP 会话统计趟是
+        裸端口 (tcp.port == 3389)，照跑。
+        """
 
         # 提取 RDP Cookie (mstshash=username)
-        cookie_stdout = self._run_tshark(tshark_path, [
-            "-r", pcap_file,
-            "-Y", "rdp.rt_cookie",
-            "-T", "fields",
-            "-e", "ip.src",
-            "-e", "ip.dst",
-            "-e", "tcp.srcport",
-            "-e", "tcp.dstport",
-            "-e", "rdp.rt_cookie",
-        ])
-
         cookies = []
         usernames = set()
-        for line in cookie_stdout.strip().splitlines():
-            fields = _split_tshark_fields(line)
-            if len(fields) >= 5:
-                cookie = fields[4]
-                cookies.append({
-                    'src_ip': fields[0],
-                    'dst_ip': fields[1],
-                    'src_port': fields[2],
-                    'dst_port': fields[3],
-                    'cookie': cookie,
-                })
-                # mstshash=username 格式提取用户名
-                if "mstshash=" in cookie:
-                    username = cookie.split("mstshash=")[-1].strip()
-                    if username:
-                        usernames.add(username)
-
-        if cookies:
-            print(f"[+] RDP Cookie 信息 ({len(cookies)} 条)")
-            for c in cookies:
-                print(f"    {c['src_ip']}:{c['src_port']} -> {c['dst_ip']}:{c['dst_port']}")
-                print(f"      Cookie: {c['cookie']}")
-            if usernames:
-                print(f"    [*] 提取到用户名: {', '.join(usernames)}")
-            print()
-
-        # RDP 协商信息
-        neg_stdout = self._run_tshark(tshark_path, [
-            "-r", pcap_file,
-            "-Y", "rdp.neg",
-            "-T", "fields",
-            "-e", "ip.src",
-            "-e", "ip.dst",
-            "-e", "rdp.neg.type",
-            "-e", "rdp.neg.selectedprotocol",
-        ])
-
         negotiations = []
-        for line in neg_stdout.strip().splitlines():
-            fields = _split_tshark_fields(line)
-            if len(fields) >= 3:
-                neg_type = fields[2]
-                proto = fields[3] if len(fields) > 3 else ""
-                negotiations.append({
-                    'src_ip': fields[0],
-                    'dst_ip': fields[1],
-                    'type': neg_type,
-                    'selected_protocol': proto,
-                })
+        if _layer_present(protocol_counts, "RDP"):
+            cookie_stdout = self._run_tshark(tshark_path, [
+                "-r", pcap_file,
+                "-Y", "rdp.rt_cookie",
+                "-T", "fields",
+                "-e", "ip.src",
+                "-e", "ip.dst",
+                "-e", "tcp.srcport",
+                "-e", "tcp.dstport",
+                "-e", "rdp.rt_cookie",
+            ])
 
-        if negotiations:
-            print(f"[+] RDP 协商信息 ({len(negotiations)} 条)")
-            proto_map = {"0": "标准RDP加密", "1": "TLS", "2": "CredSSP(NLA)", "3": "CredSSP+TLS"}
-            for n in negotiations:
-                proto_name = proto_map.get(n['selected_protocol'], n['selected_protocol'])
-                type_name = "请求" if n['type'] == "1" else "响应" if n['type'] == "2" else n['type']
-                print(f"    {n['src_ip']} -> {n['dst_ip']} | 类型: {type_name} | 安全协议: {proto_name}")
-            print()
+            for line in cookie_stdout.strip().splitlines():
+                fields = _split_tshark_fields(line)
+                if len(fields) >= 5:
+                    cookie = fields[4]
+                    cookies.append({
+                        'src_ip': fields[0],
+                        'dst_ip': fields[1],
+                        'src_port': fields[2],
+                        'dst_port': fields[3],
+                        'cookie': cookie,
+                    })
+                    # mstshash=username 格式提取用户名
+                    if "mstshash=" in cookie:
+                        username = cookie.split("mstshash=")[-1].strip()
+                        if username:
+                            usernames.add(username)
+
+            if cookies:
+                print(f"[+] RDP Cookie 信息 ({len(cookies)} 条)")
+                for c in cookies:
+                    print(f"    {c['src_ip']}:{c['src_port']} -> {c['dst_ip']}:{c['dst_port']}")
+                    print(f"      Cookie: {c['cookie']}")
+                if usernames:
+                    print(f"    [*] 提取到用户名: {', '.join(usernames)}")
+                print()
+
+            # RDP 协商信息
+            neg_stdout = self._run_tshark(tshark_path, [
+                "-r", pcap_file,
+                "-Y", "rdp.neg",
+                "-T", "fields",
+                "-e", "ip.src",
+                "-e", "ip.dst",
+                "-e", "rdp.neg.type",
+                "-e", "rdp.neg.selectedprotocol",
+            ])
+
+            for line in neg_stdout.strip().splitlines():
+                fields = _split_tshark_fields(line)
+                if len(fields) >= 3:
+                    neg_type = fields[2]
+                    proto = fields[3] if len(fields) > 3 else ""
+                    negotiations.append({
+                        'src_ip': fields[0],
+                        'dst_ip': fields[1],
+                        'type': neg_type,
+                        'selected_protocol': proto,
+                    })
+
+            if negotiations:
+                print(f"[+] RDP 协商信息 ({len(negotiations)} 条)")
+                proto_map = {"0": "标准RDP加密", "1": "TLS", "2": "CredSSP(NLA)", "3": "CredSSP+TLS"}
+                for n in negotiations:
+                    proto_name = proto_map.get(n['selected_protocol'], n['selected_protocol'])
+                    type_name = "请求" if n['type'] == "1" else "响应" if n['type'] == "2" else n['type']
+                    print(f"    {n['src_ip']} -> {n['dst_ip']} | 类型: {type_name} | 安全协议: {proto_name}")
+                print()
+        else:
+            print("[*] 无 RDP 层流量，跳过 Cookie/协商提取")
 
         # TCP 会话统计
         conv_stdout = self._run_tshark(tshark_path, [
@@ -3133,8 +3449,18 @@ class RDPAnalyzer(ProtocolAnalyzer):
 
         return {'cookies': cookies, 'usernames': usernames, 'streams': streams}
 
-    def extract_rdp_ntlm(self, pcap_file, tshark_path):
-        """提取 RDP 中 CredSSP(NLA) 使用的 NTLMSSP 认证凭证"""
+    def extract_rdp_ntlm(self, pcap_file, tshark_path, protocol_counts=None):
+        """提取 RDP 中 CredSSP(NLA) 使用的 NTLMSSP 认证凭证
+
+        两趟都是 ntlmssp.messagetype 层过滤；NTLMSSP 层在 io,phs 里为 0
+        时必然匹配 0 包，整段可跳过。
+        """
+
+        credentials = []
+        challenges = []
+        if not _layer_present(protocol_counts, "NTLMSSP"):
+            print("[*] 无 NTLMSSP 层流量，跳过凭证提取")
+            return credentials
 
         # NTLMSSP CHALLENGE
         challenge_stdout = self._run_tshark(tshark_path, [
@@ -3144,7 +3470,6 @@ class RDPAnalyzer(ProtocolAnalyzer):
             "-e", "ntlmssp.ntlmserverchallenge",
         ])
 
-        challenges = []
         for line in challenge_stdout.strip().splitlines():
             ch = line.strip().replace(":", "").replace(" ", "")
             if ch:
@@ -3161,7 +3486,7 @@ class RDPAnalyzer(ProtocolAnalyzer):
             "-e", "ntlmssp.auth.lmresponse",
         ])
 
-        credentials = []
+
         auth_lines = [l for l in auth_stdout.strip().splitlines() if l.strip()]
 
         for idx, line in enumerate(auth_lines):
@@ -3208,8 +3533,18 @@ class RDPAnalyzer(ProtocolAnalyzer):
 
         return credentials
 
-    def extract_rdp_certificates(self, pcap_file, tshark_path):
-        """提取 RDP TLS 握手中的服务器证书信息"""
+    def extract_rdp_certificates(self, pcap_file, tshark_path, protocol_counts=None):
+        """提取 RDP TLS 握手中的服务器证书信息
+
+        过滤器要求 tls.handshake.certificate，TLS 层为 0 时必然匹配 0 包。
+        RDP-over-TLS 的证书是 TLS 层的一部分，TLS 层为 0 也就没有 RDP
+        证书可提取 —— 门控安全。
+        """
+
+        certs = []
+        if not _layer_present(protocol_counts, "TLS", "SSL"):
+            print("[*] 无 TLS 层流量，跳过证书提取")
+            return certs
 
         cert_stdout = self._run_tshark(tshark_path, [
             "-r", pcap_file,
@@ -3221,7 +3556,6 @@ class RDPAnalyzer(ProtocolAnalyzer):
             "-e", "x509ce.dNSName",
         ])
 
-        certs = []
         for line in cert_stdout.strip().splitlines():
             fields = _split_tshark_fields(line)
             if len(fields) >= 2:
@@ -3243,11 +3577,16 @@ class RDPAnalyzer(ProtocolAnalyzer):
         print()
         return certs
 
-    def decrypt_rdp_with_key(self, pcap_file, tshark_path, key_file, server_ip=None):
+    def decrypt_rdp_with_key(self, pcap_file, tshark_path, key_file, server_ip=None,
+                             protocol_counts=None):
         """使用 RSA 私钥解密 RDP TLS 流量"""
 
         if not os.path.isfile(key_file):
             print(f"[!] 私钥文件不存在: {key_file}")
+            return ""
+
+        if not _layer_present(protocol_counts, "RDP"):
+            print("[*] 无 RDP 层流量，跳过私钥解密")
             return ""
 
         with open(key_file, 'r', errors='ignore') as f:
@@ -3300,11 +3639,15 @@ class RDPAnalyzer(ProtocolAnalyzer):
         print()
         return rdp_frames
 
-    def decrypt_rdp_with_keylog(self, pcap_file, tshark_path, keylog_file):
+    def decrypt_rdp_with_keylog(self, pcap_file, tshark_path, keylog_file, protocol_counts=None):
         """使用 TLS keylog 文件 (SSLKEYLOGFILE) 解密 RDP 流量"""
 
         if not os.path.isfile(keylog_file):
             print(f"[!] keylog 文件不存在: {keylog_file}")
+            return ""
+
+        if not _layer_present(protocol_counts, "RDP"):
+            print("[*] 无 RDP 层流量，跳过 keylog 解密")
             return ""
 
         print(f"[*] 使用 TLS keylog 文件: {keylog_file}")
@@ -3344,6 +3687,7 @@ class RDPAnalyzer(ProtocolAnalyzer):
         key_file = kwargs.get('key_file', self.key_file)
         keylog_file = kwargs.get('keylog_file', self.keylog_file)
         server_ip = kwargs.get('server_ip', self.server_ip)
+        protocol_counts = kwargs.get('protocol_counts')
 
         if not os.path.isfile(pcap_path):
             print(f"[!] 文件不存在: {pcap_path}")
@@ -3377,7 +3721,8 @@ class RDPAnalyzer(ProtocolAnalyzer):
         # 1. 会话元数据
         print("[阶段1] RDP 会话元数据")
         print("-" * 60)
-        session_info = self.extract_rdp_sessions(pcap_path, tshark_path)
+        session_info = self.extract_rdp_sessions(pcap_path, tshark_path,
+                                                 protocol_counts=protocol_counts)
 
         cookies = session_info.get('cookies', [])
         usernames = session_info.get('usernames', set())
@@ -3408,7 +3753,8 @@ class RDPAnalyzer(ProtocolAnalyzer):
         # 2. NTLM 凭证
         print("[阶段2] NTLMSSP 认证凭证")
         print("-" * 60)
-        credentials = self.extract_rdp_ntlm(pcap_path, tshark_path)
+        credentials = self.extract_rdp_ntlm(pcap_path, tshark_path,
+                                            protocol_counts=protocol_counts)
         print()
 
         if credentials:
@@ -3442,7 +3788,8 @@ class RDPAnalyzer(ProtocolAnalyzer):
         # 3. TLS 证书
         print("[阶段3] TLS 证书信息")
         print("-" * 60)
-        certs = self.extract_rdp_certificates(pcap_path, tshark_path)
+        certs = self.extract_rdp_certificates(pcap_path, tshark_path,
+                                              protocol_counts=protocol_counts)
 
         if certs:
             cert_names = []
@@ -3465,7 +3812,8 @@ class RDPAnalyzer(ProtocolAnalyzer):
         if key_file:
             print("[阶段4] RSA 私钥解密")
             print("-" * 60)
-            decrypted = self.decrypt_rdp_with_key(pcap_path, tshark_path, key_file, server_ip)
+            decrypted = self.decrypt_rdp_with_key(pcap_path, tshark_path, key_file, server_ip,
+                                                  protocol_counts=protocol_counts)
             if decrypted:
                 findings.append(AnalysisFinding(
                     finding_type=FindingType.HIDDEN_DATA,
@@ -3482,7 +3830,8 @@ class RDPAnalyzer(ProtocolAnalyzer):
         if keylog_file:
             print("[阶段5] TLS Keylog 解密")
             print("-" * 60)
-            keylog_decrypted = self.decrypt_rdp_with_keylog(pcap_path, tshark_path, keylog_file)
+            keylog_decrypted = self.decrypt_rdp_with_keylog(pcap_path, tshark_path, keylog_file,
+                                                            protocol_counts=protocol_counts)
             if keylog_decrypted:
                 findings.append(AnalysisFinding(
                     finding_type=FindingType.HIDDEN_DATA,
@@ -4120,14 +4469,21 @@ class SMBAnalyzer(ProtocolAnalyzer):
     def _run_tshark(tshark_path, args):
         return _run_tshark_text(tshark_path, args)
 
-    def extract_smb_credentials(self, pcap_file, tshark_path):
+    def extract_smb_credentials(self, pcap_file, tshark_path, protocol_counts=None):
         """提取 NTLMSSP 凭证，区分 NTLMv1 和 NTLMv2
 
         策略：
         1. 先从 NTLMSSP_CHALLENGE 包中提取 Server Challenge
         2. 再从 NTLMSSP_AUTH 包中提取用户名、域、NT Response 等
         3. 将 Challenge 与 Auth 关联（按出现顺序配对）
+
+        两趟都是 ntlmssp.messagetype 层过滤，NTLMSSP 层为 0 时必然匹配
+        0 包，整体跳过与跑完结果集相同。
         """
+
+        if not _layer_present(protocol_counts, "NTLMSSP"):
+            print("[*] 无 NTLMSSP 层流量，跳过凭证提取")
+            return []
 
         # --- 步骤1: 提取所有 NTLMSSP_CHALLENGE 中的 Server Challenge ---
         challenge_stdout = self._run_tshark(tshark_path, [
@@ -4236,16 +4592,26 @@ class SMBAnalyzer(ProtocolAnalyzer):
 
         return credentials
 
-    def extract_smb_files(self, pcap_file, tshark_path, output_dir):
-        """用 tshark --export-objects 提取 SMB/SMB2 传输的文件"""
+    def extract_smb_files(self, pcap_file, tshark_path, output_dir, protocol_counts=None):
+        """用 tshark --export-objects 提取 SMB/SMB2 传输的文件
+
+        --export-objects 没有 -Y 过滤器，它内部按 SMB/SMB2 dissector
+        工作；对应层帧数为 0 时必然导不出任何文件 —— 跳过与跑完
+        结果集相同。
+        """
         os.makedirs(output_dir, exist_ok=True)
         total_files = []
 
         for proto in ("smb", "smb2"):
+            if not _layer_present(protocol_counts, proto.upper()):
+                print(f"[*] 无 {proto.upper()} 层流量，跳过文件导出")
+                continue
             proto_dir = os.path.join(output_dir, proto)
             os.makedirs(proto_dir, exist_ok=True)
 
             cmd = [tshark_path, "-r", pcap_file, "--export-objects", f"{proto},{proto_dir}"]
+            start = time.perf_counter()
+            stdout = ""
             try:
                 result = subprocess.run(
                     cmd,
@@ -4256,9 +4622,18 @@ class SMBAnalyzer(ProtocolAnalyzer):
                     timeout=180,
                 )
                 stderr = result.stderr
+                stdout = result.stdout or ""
             except FileNotFoundError:
                 print(f"[!] 无法找到tshark: {tshark_path}")
                 continue
+            finally:
+                # continue 也会先走这里：失败的趟同样留痕
+                _record_tshark_stage(
+                    _tshark_stage_name(cmd),
+                    time.perf_counter() - start,
+                    lines=stdout.count("\n"),
+                    output_chars=len(stdout),
+                )
 
             # 列出导出的文件
             exported = []
@@ -4291,6 +4666,7 @@ class SMBAnalyzer(ProtocolAnalyzer):
         extracted_files_list = []
 
         output_dir = kwargs.get('output_dir', self.output_dir)
+        protocol_counts = kwargs.get('protocol_counts')
 
         if not os.path.isfile(pcap_path):
             print(f"[!] 文件不存在: {pcap_path}")
@@ -4329,7 +4705,8 @@ class SMBAnalyzer(ProtocolAnalyzer):
         # 1. 凭证提取
         print("[阶段1] NTLMSSP 凭证提取")
         print("-" * 60)
-        credentials = self.extract_smb_credentials(pcap_path, tshark_path)
+        credentials = self.extract_smb_credentials(pcap_path, tshark_path,
+                                                   protocol_counts=protocol_counts)
 
         for cred in credentials:
             version = cred.get('version', '')
@@ -4363,7 +4740,8 @@ class SMBAnalyzer(ProtocolAnalyzer):
         # 2. 文件提取
         print("[阶段2] SMB 文件导出")
         print("-" * 60)
-        files = self.extract_smb_files(pcap_path, tshark_path, output_dir)
+        files = self.extract_smb_files(pcap_path, tshark_path, output_dir,
+                                       protocol_counts=protocol_counts)
         extracted_files_list.extend(files)
 
         if files:
@@ -4430,10 +4808,18 @@ class SSHAnalyzer(ProtocolAnalyzer):
     def _run_tshark(tshark_path, args):
         return _run_tshark_text(tshark_path, args)
 
-    def extract_ssh_sessions(self, pcap_file, tshark_path):
-        """提取 SSH 会话元数据: banner、IP、端口、算法协商"""
+    def extract_ssh_sessions(self, pcap_file, tshark_path, protocol_counts=None):
+        """提取 SSH 会话元数据: banner、IP、端口、算法协商
+
+        三趟（banner/协商/会话统计）全是 ssh.* 层过滤；SSH 层为 0 时
+        必然匹配 0 包，整体跳过与跑完结果集相同。
+        """
 
         sessions = []
+
+        if not _layer_present(protocol_counts, "SSH"):
+            print("[*] 无 SSH 层流量，跳过会话元数据提取")
+            return {'banners': [], 'kex_info': [], 'streams': {}}
 
         # --- 提取 SSH banner (版本号) ---
         banner_stdout = self._run_tshark(tshark_path, [
@@ -4567,11 +4953,15 @@ class SSHAnalyzer(ProtocolAnalyzer):
 
         return {'banners': banners, 'kex_info': kex_info, 'streams': streams}
 
-    def decrypt_ssh_with_key(self, pcap_file, tshark_path, key_file):
+    def decrypt_ssh_with_key(self, pcap_file, tshark_path, key_file, protocol_counts=None):
         """使用 RSA 私钥尝试解密 SSH 会话"""
 
         if not os.path.isfile(key_file):
             print(f"[!] 私钥文件不存在: {key_file}")
+            return ""
+
+        if not _layer_present(protocol_counts, "SSH"):
+            print("[*] 无 SSH 层流量，跳过私钥解密")
             return ""
 
         # 读取私钥判断类型
@@ -4620,8 +5010,13 @@ class SSHAnalyzer(ProtocolAnalyzer):
             print()
             return []
 
-    def detect_bruteforce(self, pcap_file, tshark_path, threshold=10):
-        """检测 SSH 暴力破解行为: 短时间内大量连接"""
+    def detect_bruteforce(self, pcap_file, tshark_path, threshold=10, protocol_counts=None):
+        """检测 SSH 暴力破解行为: 短时间内大量连接
+
+        SYN 趟是裸端口过滤 (tcp.dstport == 22) —— 爆破/端口扫描恰恰是
+        没有 ssh 握手的那种流量，不能门控；成功会话检测趟带 ssh 层
+        过滤，按 SSH 层门控。
+        """
 
         # 提取所有 SSH TCP SYN 包 (新连接)
         syn_stdout = self._run_tshark(tshark_path, [
@@ -4677,17 +5072,27 @@ class SSHAnalyzer(ProtocolAnalyzer):
             print()
             print("[*] 检测是否有成功登录的会话...")
 
-            hasdata_stdout = self._run_tshark(tshark_path, [
-                "-r", pcap_file,
-                "-Y", "ssh && tcp.len > 0",
-                "-T", "fields",
-                "-e", "tcp.stream",
-                "-e", "ip.src",
-                "-e", "ip.dst",
-            ])
-
             stream_packets = defaultdict(int)
             stream_ips = {}
+            if _layer_present(protocol_counts, "SSH"):
+                hasdata_stdout = self._run_tshark(tshark_path, [
+                    "-r", pcap_file,
+                    "-Y", "ssh && tcp.len > 0",
+                    "-T", "fields",
+                    "-e", "tcp.stream",
+                    "-e", "ip.src",
+                    "-e", "ip.dst",
+                ])
+
+                for line in hasdata_stdout.strip().splitlines():
+                    fields = _split_tshark_fields(line)
+                    if len(fields) >= 3:
+                        sid = fields[0]
+                        stream_packets[sid] += 1
+                        if sid not in stream_ips:
+                            stream_ips[sid] = (fields[1], fields[2])
+            else:
+                print("[*] 无 SSH 层流量，跳过成功会话检测")
             for line in hasdata_stdout.strip().splitlines():
                 fields = _split_tshark_fields(line)
                 if len(fields) >= 3:
@@ -4716,6 +5121,7 @@ class SSHAnalyzer(ProtocolAnalyzer):
         findings = []
 
         key_file = kwargs.get('key_file', self.key_file)
+        protocol_counts = kwargs.get('protocol_counts')
 
         if not os.path.isfile(pcap_path):
             print(f"[!] 文件不存在: {pcap_path}")
@@ -4749,7 +5155,8 @@ class SSHAnalyzer(ProtocolAnalyzer):
         # 1. 会话元数据
         print("[阶段1] SSH 会话元数据提取")
         print("-" * 60)
-        session_info = self.extract_ssh_sessions(pcap_path, tshark_path)
+        session_info = self.extract_ssh_sessions(pcap_path, tshark_path,
+                                                 protocol_counts=protocol_counts)
 
         banners = session_info.get('banners', [])
         kex_info = session_info.get('kex_info', [])
@@ -4793,7 +5200,8 @@ class SSHAnalyzer(ProtocolAnalyzer):
         # 2. 暴力破解检测
         print("[阶段2] SSH 暴力破解检测")
         print("-" * 60)
-        brute_info = self.detect_bruteforce(pcap_path, tshark_path)
+        brute_info = self.detect_bruteforce(pcap_path, tshark_path,
+                                            protocol_counts=protocol_counts)
 
         bruteforce_ips = brute_info.get('bruteforce_ips', {})
         if bruteforce_ips:
@@ -4813,7 +5221,8 @@ class SSHAnalyzer(ProtocolAnalyzer):
         if key_file:
             print("[阶段3] SSH 私钥解密")
             print("-" * 60)
-            decrypted = self.decrypt_ssh_with_key(pcap_path, tshark_path, key_file)
+            decrypted = self.decrypt_ssh_with_key(pcap_path, tshark_path, key_file,
+                                                  protocol_counts=protocol_counts)
             if decrypted:
                 # 尝试解码并检查 flag
                 decoded_texts = []
@@ -5083,11 +5492,26 @@ class ProtocolAnalyzerManager:
             if observed.intersection(aliases)
         }
 
+    # 端口型分析器：它们的裸端口路径依赖的服务端口。
+    #
+    # 这三个**故意不在** _LAYER_GATED_ANALYZERS 里（理由见上面那段注释：
+    # 有不依赖协议层的裸端口路径）。但"层不在 && 端口也不在"这个**合取**
+    # 条件成立时，两条路径就都必然扫不到东西了 —— 那才能安全跳过。
+    #
+    # 实测收益：标定包里这三个分析器各跑 111 秒，输出 47/14/0 行，
+    # 而它们依赖的 3389/6379/22 全都只是客户端临时端口。
+    _PORT_GATED_ANALYZERS = {
+        ProtocolType.RDP: frozenset({3389}),
+        ProtocolType.REDIS: frozenset({6379}),
+        ProtocolType.SSH: frozenset({22}),
+    }
+
     @classmethod
     def select_runnable_protocols(
         cls,
         candidates: Iterable[ProtocolType],
         protocol_counts: Optional[Dict[str, int]] = None,
+        service_ports: Optional[set] = None,
     ) -> Tuple[set, set]:
         """按 `-z io,phs` 的分级统计裁掉跑了也没用的分析器。
 
@@ -5099,11 +5523,16 @@ class ProtocolAnalyzerManager:
         过滤器都必然匹配 0 个包 —— 分析器跑与不跑的**结果集完全相同**，
         省掉的是一趟全文件 tshark 解析，不是可见性。
 
-        两条安全边界：
-          1. 只对 `_LAYER_GATED_ANALYZERS` 里的分析器生效。带裸端口/裸
-             SYN 路径的（TLS/RDP/Redis/SSH）一律照跑。
+        `service_ports` 是 `collect_service_ports()` 的产物（一趟 conv,tcp）。
+        给了它才会额外门控 RDP/Redis/SSH —— 判据是**层不在且端口也不在**
+        的合取，两条路径同时扫空才跳过。传 None（没问出来）时这三个照跑。
+
+        三条安全边界：
+          1. 只对 `_LAYER_GATED_ANALYZERS` 里的分析器做层门控。
           2. 拿不到统计（`protocol_counts` 为空 = 统计失败）时**全部照跑**。
              "统计没出来"和"确实没有这个协议"是两回事，不能混。
+          3. 端口门控同理：`service_ports is None` 表示没问出来，照跑。
+             空集合才表示"确实一个服务端口都没有"。
         """
         wanted = set(candidates)
         if not protocol_counts:
@@ -5114,13 +5543,20 @@ class ProtocolAnalyzerManager:
         runnable, skipped = set(), set()
         for protocol in wanted:
             aliases = cls._PROTOCOL_STAT_ALIASES.get(protocol)
-            if protocol not in cls._LAYER_GATED_ANALYZERS or not aliases:
-                runnable.add(protocol)      # 门控管不到的，一律照跑
+            layer_seen = bool(aliases and observed.intersection(aliases))
+
+            if protocol in cls._LAYER_GATED_ANALYZERS and aliases:
+                (runnable if layer_seen else skipped).add(protocol)
                 continue
-            if observed.intersection(aliases):
-                runnable.add(protocol)
-            else:
-                skipped.add(protocol)
+
+            # 端口型：层不在 **且** 端口不在，两条路径才都扫空
+            ports = cls._PORT_GATED_ANALYZERS.get(protocol)
+            if ports is not None and service_ports is not None and not layer_seen:
+                if service_ports.isdisjoint(ports):
+                    skipped.add(protocol)
+                    continue
+
+            runnable.add(protocol)      # 门控管不到的，一律照跑
         return runnable, skipped
 
     @staticmethod
@@ -5199,9 +5635,17 @@ class ProtocolAnalyzerManager:
         progress_callback: Optional[Callable[[int, int, ProtocolType], None]] = None,
         parallel: bool = False,
         max_workers: Optional[int] = None,
+        protocol_counts: Optional[Dict[str, int]] = None,
         **kwargs,
     ) -> Dict[ProtocolType, ProtocolAnalysisResult]:
-        """Run selected analyzers against a PCAP without materializing all packets."""
+        """Run selected analyzers against a PCAP without materializing all packets.
+
+        `protocol_counts` 是 5% 阶段 `-z io,phs` 的分层统计，透传给每个
+        analyze_pcap 做 **per-pass 层门控**：TLS/RDP/SSH/SMB 这些整体不能
+        门控的分析器（有裸端口/裸 SYN 趟），其"层过滤趟"可以各自按依赖的
+        层计数跳过。判据与 select_runnable_protocols 同一条：
+        层帧数为 0 → 该趟必然匹配 0 包 → 结果集相同。统计缺失时全部照跑。
+        """
         selected = (
             self._normalize_enabled_protocols(enabled_protocols)
             if enabled_protocols is not None
@@ -5217,6 +5661,8 @@ class ProtocolAnalyzerManager:
 
         def analyze_one(protocol: ProtocolType, analyzer: ProtocolAnalyzer):
             analyzer_kwargs = dict(kwargs)
+            if protocol_counts:
+                analyzer_kwargs["protocol_counts"] = protocol_counts
             display_filter = self._BASE_ANALYZER_FILTERS.get(protocol)
             if display_filter and "display_filter" not in analyzer_kwargs:
                 analyzer_kwargs["display_filter"] = display_filter

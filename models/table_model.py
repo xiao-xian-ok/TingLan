@@ -5,7 +5,7 @@ from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QSortFilterProx
 from PySide6.QtGui import QColor
 
 from models.detection_result import DetectionResult
-from models.severity_policy import is_noise_level
+from models.severity_policy import effective_level_of, is_noise_level
 
 
 # 研判列的配色：确认得手要一眼看见，未生效要能被视觉忽略
@@ -80,15 +80,29 @@ class DetectionTableModel(QAbstractTableModel):
         if role == Qt.DisplayRole:
             row_data = detection.to_table_row()
             if col < len(row_data):
+                if col == 0 and detection.threat_downgrade_steps:
+                    # 被后果降过档的，显示"中危（原高危）"两个等级都给出来。
+                    # 只显示降后的等级会让人以为规则本来就只匹配到中危，
+                    # 而实际上是"打得挺狠但没打进去"——那是两回事。
+                    # 用 steps 而不是 reason 判断：信息级已经在底了降不动，
+                    # 那种情况显示"信息（原信息）"纯属废话。
+                    return (f"{detection.effective_threat_level.display_name}"
+                            f"（原{detection.threat_level.display_name}）")
                 return row_data[col]
 
         elif role == Qt.ForegroundRole:
-            if col == 0:  # 威胁等级列
-                return QColor(detection.threat_level.color)
+            if col == 0:  # 威胁等级列：按**有效**等级着色，噪声才沉得下去
+                return QColor(detection.effective_threat_level.color)
             if col == 1:  # 研判列
                 return QColor(_OUTCOME_COLORS.get(detection.success_outcome, "#757575"))
 
         elif role == Qt.ToolTipRole:
+            if col == 0 and detection.threat_downgrade_steps:
+                return (f"规则判定为{detection.threat_level.display_name}，"
+                        f"但{detection.threat_downgrade_note}，\n"
+                        f"已降 {detection.threat_downgrade_steps} 档至"
+                        f"{detection.effective_threat_level.display_name}。\n"
+                        f"原始权重 {detection.total_weight} 未被修改，导出报告中两个等级都保留。")
             if col == 1:
                 reasons = detection.success_reasons
                 if reasons:
@@ -182,7 +196,9 @@ class DetectionFilterProxyModel(QSortFilterProxyModel):
 
         # 低危/信息级收敛。放在最前面：命中过万时这条能最快把候选砍掉，
         # 后面几个字符串比较就不用做了。
-        if self._suppress_noise and is_noise_level(detection.threat_level):
+        # 用**有效**等级：一批返回 404 的扫描器探测原本是高危，逃得过这条
+        # 收敛，正是"命中过万"的主要来源。
+        if self._suppress_noise and is_noise_level(effective_level_of(detection)):
             return False
 
         # 文本过滤

@@ -14,6 +14,7 @@ dashboard 的 `_refresh()` 一进去就 return。所以下面的公开 API **是
     register_heartbeat_callback           <- metrics_dashboard.py:343
     get_dashboard_data()                  <- metrics_dashboard.py:438
         {"rates": {...}, "sampling": {...}, "alerts": {...}}
+    record_stage / record_tshark_pass     <- 趟级埋点（protocol_analyzer / tshark_stream）
 
 改 key 之前先搜一遍这两个文件。
 
@@ -28,7 +29,7 @@ dashboard 的 `_refresh()` 一进去就 return。所以下面的公开 API **是
 import threading
 import time
 from collections import OrderedDict
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import logging
 
@@ -205,6 +206,27 @@ class ObservabilityHub:
                 stats = self._stages[name] = _StageStats()
             stats.add(elapsed_s, items)
 
+    def record_stage(self, name: str, elapsed_s: float, items: int = 0) -> None:
+        """手动记录一个阶段的耗时（stage() 的命令式版本）。
+
+        上下文管理器拿不到的地方——比如要计时的不是代码块，而是
+        subprocess.run 的一整趟——就用这个直接给耗时和吞吐量。
+        与 stage() 共用一个统计桶，同名累加。
+        """
+        self._record_stage(name, elapsed_s, items)
+
+    def record_tshark_pass(self, name: str, elapsed_s: float, lines: int = 0,
+                           output_chars: int = 0) -> None:
+        """一趟 tshark 跑完后的埋点：耗时/行数进 stage，趟数/输出量进 counter。
+
+        name 是这趟的稳定 ID（如 `tshark.tls.handshake.type == 1`），
+        同名趟累加 —— 同一过滤器被多次调用时，报告里能看到总耗时与总输出。
+        """
+        self.record_stage(name, elapsed_s, lines)
+        self.incr("tshark.calls")
+        if output_chars:
+            self.incr("tshark.output_chars", output_chars)
+
     # ---------- 业务埋点 ----------
 
     def record_packet(self, n: int = 1) -> None:
@@ -323,6 +345,41 @@ class ObservabilityHub:
                 "critical_count": critical,
             },
         }
+
+    def get_stage_breakdown(self, limit: int = 0) -> List[Tuple[str, Dict[str, object]]]:
+        """各阶段/各趟 tshark 的耗时明细，按总耗时降序。
+
+        `_stages` 里一直躺着这份数据（record_tshark_pass 每趟都记），但
+        get_dashboard_data() 从来没把它暴露出去 —— 于是"分析卡了 10 秒"
+        永远只能靠猜是哪一趟。这个方法就是那个出口。
+
+        key 的形态见 protocol_analyzer._tshark_stage_name：
+        `tshark.icmp`、`tshark.tcp.flags.syn==1 && tcp.flags.ack==0`、
+        `tshark.export_smb` 之类，一眼能对应到具体哪条命令。
+
+        limit > 0 时只返回最慢的前 N 个。
+        """
+        with self._lock:
+            items = [(name, stats.to_dict(), stats.elapsed_s)
+                     for name, stats in self._stages.items()]
+        items.sort(key=lambda row: -row[2])
+        if limit > 0:
+            items = items[:limit]
+        return [(name, data) for name, data, _elapsed in items]
+
+    def format_stage_breakdown(self, limit: int = 12) -> str:
+        """把耗时明细排成可直接进日志的表格。"""
+        rows = self.get_stage_breakdown(limit=limit)
+        if not rows:
+            return "（无阶段耗时数据）"
+        width = max(len(name) for name, _ in rows)
+        lines = [f"{'阶段 / tshark 趟':<{width}}  {'耗时':>9}  {'趟数':>4}  {'行数':>9}"]
+        lines.append("-" * (width + 28))
+        for name, data in rows:
+            lines.append(
+                f"{name:<{width}}  {data['elapsed_ms'] / 1000.0:>8.2f}s"
+                f"  {data['runs']:>4}  {data['items']:>9}")
+        return "\n".join(lines)
 
     def _ast_metrics(self) -> Dict[str, object]:
         """AST 侧命中率

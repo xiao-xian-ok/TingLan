@@ -552,9 +552,6 @@ class FastFilter:
 
     def _scan_chunk(self, chunk: str, base: int):
         """扫一个分块，返回 (危险函数命中, 污点源命中, 后端)
-
-        命中项是 (绝对偏移, 原文片段)。AC 路径与正则路径结果一致，
-        tests/test_fast_filter_coverage.py 里有交叉验证。
         """
         if self._use_ac and FastFilter._KEYWORD_MATCHER is not None:
             try:
@@ -1004,7 +1001,7 @@ def get_score_breakdown(payload_data: bytes, content_type: str = "",
         structure_result = _analyze_structure(scan_text)
         char_freq_result = _analyze_char_frequency(scan_text)
         length_result = _analyze_payload_length(payload_data)
-        ast_result = _analyze_ast(scan_text)
+        ast_result = _analyze_ast(scan_text, external_taint=True)
         filter_result = _fast_filter.filter(scan_text, content_type)
 
         combined_result = _calculate_combined_verdict(
@@ -1231,7 +1228,13 @@ def _analyze_payload_length(payload_data: bytes) -> dict:  # 载荷长度分析
     return result
 
 
-def _analyze_ast(payload_str: str) -> dict:  # AST语法树分析
+def _analyze_ast(payload_str: str, external_taint: bool = False) -> dict:  # AST语法树分析
+    """
+    external_taint 要跟检测器保持同一个口径，否则面板上显示的 AST 结论会和
+    检测器算出来的分数对不上（"AST: 1个危险调用(未污染)"配一个高分判定）。
+    get_score_breakdown 拿的是**请求体**，所以那边传 True。
+    详见 ast_engine.SemanticAnalyzer.analyze。
+    """
     result = {
         'display': 'AST: 未分析',
         'hit': False,
@@ -1256,7 +1259,8 @@ def _analyze_ast(payload_str: str) -> dict:  # AST语法树分析
             global _ast_engine_singleton
             if _ast_engine_singleton is None:
                 _ast_engine_singleton = PHPASTEngine()
-            ast_result = _ast_engine_singleton.analyze(payload_str)
+            ast_result = _ast_engine_singleton.analyze(
+                payload_str, external_taint=external_taint)
 
             result['dangerous_calls'] = [
                 {
@@ -1282,7 +1286,12 @@ def _analyze_ast(payload_str: str) -> dict:  # AST语法树分析
                     result['hit'] = True
                     result['display'] = f"AST: {tainted_count}个污染的危险调用"
                 else:
-                    result['display'] = f"AST: {len(ast_result.dangerous_calls)}个危险调用(未污染)"
+                    # 请求侧别说"未污染" —— 那读起来像"无害"，但代码本身就是
+                    # 攻击者投递的，只是参数写死了而已。如实说清是哪种情况。
+                    n = len(ast_result.dangerous_calls)
+                    result['display'] = (
+                        f"AST: {n}个危险调用(参数硬编码)" if external_taint
+                        else f"AST: {n}个危险调用(未污染)")
             elif ast_result.obfuscation_score > 0.3:
                 result['hit'] = True
                 result['display'] = f"AST: 混淆代码 ({ast_result.obfuscation_score:.0%})"

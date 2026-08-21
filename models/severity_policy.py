@@ -75,8 +75,29 @@ def should_suppress_noise(attack_count: int) -> bool:
     return attack_count > ATTACK_OVERLOAD_THRESHOLD
 
 
+def effective_level_of(detection):
+    """取一条检测**用于排序和收敛**的等级。
+
+    优先用 `effective_threat_level` —— 它是原始判定叠加研判结论之后的等级：
+    响应确实是 404/403 且研判为 FAILED、又没有反弹连接/主机证据/污点/带外
+    这些豁免时降档（高危/严重降 1 档，中危/低危降 2 档）。原因见
+    DetectionResult.effective_threat_level。
+
+    没有这个属性的对象（AttackDetectionInfo 用的是裸字符串 risk_level）
+    退回 threat_level，行为与接入前一致。
+    """
+    level = getattr(detection, "effective_threat_level", None)
+    if level is None:
+        level = getattr(detection, "threat_level", ThreatLevel.MEDIUM)
+    return level
+
+
 def sort_by_severity(detections: Sequence) -> List:
     """按 (威胁等级, 权重) 降序返回**新列表**，原列表不动。
+
+    等级取 `effective_threat_level`：一屏 404 扫描器噪声本来会靠原始高危
+    霸占列表顶部，把真正打成的那几条挤到下面去。权重仍用原始 total_weight，
+    同等级内部的相对顺序不变。
 
     Python 的 sorted 是稳定排序，同等级同权重的条目保持原有先后（通常是
     抓包顺序），时间线不会被打乱。
@@ -84,7 +105,7 @@ def sort_by_severity(detections: Sequence) -> List:
     return sorted(
         detections,
         key=lambda d: (
-            level_priority(getattr(d, "threat_level", ThreatLevel.MEDIUM)),
+            level_priority(effective_level_of(d)),
             getattr(d, "total_weight", 0) or 0,
         ),
         reverse=True,
@@ -105,7 +126,4 @@ def sort_attacks_by_severity(attacks: Sequence) -> List:
 
 def filter_noise(detections: Iterable) -> List:
     """滤掉低危/信息级，返回新列表。"""
-    return [
-        d for d in detections
-        if not is_noise_level(getattr(d, "threat_level", ThreatLevel.MEDIUM))
-    ]
+    return [d for d in detections if not is_noise_level(effective_level_of(d))]

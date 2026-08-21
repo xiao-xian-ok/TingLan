@@ -120,6 +120,33 @@ class DetailTable(QWidget):
 
         layout.addLayout(toolbar)
 
+        # 攻击者聚合摘要条。
+        #
+        # 详情表是**逐条**平铺的，而攻击是**成链**发生的。实测一个 166MB
+        # 的抓包：6747 条检测来自同一个来源 IP，真正得手的只有一条
+        # `/images/article/a.php` 上的菜刀 WebShell。分析员要在 6747 行里
+        # 把它找出来 —— 而"这个人试了 6747 次、成了 19 次"这个信息本身
+        # 就淹没在那 6747 行里，反而看不出来。
+        #
+        # 这里先只加一条摘要（不改表格结构）：把结论摆到眼前，
+        # 逐条列表仍然原样保留，需要细看时照旧。
+        self.chain_summary = QLabel()
+        self.chain_summary.setWordWrap(True)
+        self.chain_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.chain_summary.setVisible(False)
+        self.chain_summary.setStyleSheet("""
+            QLabel {
+                padding: 8px 12px;
+                margin: 0 10px;
+                border-radius: 4px;
+                border-left: 3px solid #D32F2F;
+                background-color: #FFF3F3;
+                color: #333;
+                font-size: 12px;
+            }
+        """)
+        layout.addWidget(self.chain_summary)
+
         # 表格视图
         self.table_view = QTableView()
         self.table_view.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -247,6 +274,61 @@ class DetailTable(QWidget):
         total_attacks = len(summary.detections) + len(summary.attack_detections)
         self.setSuppressNoise(should_suppress_noise(total_attacks))
         self.setDetections(summary.detections)
+        self._updateChainSummary(summary.detections)
+
+    def _updateChainSummary(self, detections: List[DetectionResult]):
+        """把检测聚成攻击者会话，把结论摆到表格上方。
+
+        只读不写：worker 已经在 raw_result 里写过 chain_* 字段了，这里
+        重算一遍纯粹是为了让控件自足（单独喂一批检测给它也能工作）。
+        聚合是 O(n) 的字典分组，几千条检测的开销可以忽略。
+
+        聚合失败绝不能影响表格本身 —— 它只是个摘要条。
+        """
+        try:
+            from core.attack_chain import build_chains, build_sessions
+        except ImportError:
+            self.chain_summary.setVisible(False)
+            return
+
+        try:
+            sessions = build_sessions(build_chains(detections or []))
+        except Exception:
+            self.chain_summary.setVisible(False)
+            return
+
+        landed = [s for s in sessions if s.landed_chains]
+        if not landed:
+            # 一条都没得手时不摆这个条 —— 它的价值在于"指出那几条"，
+            # 没有可指的就别占地方，更不能显示成绿色的"安全"结论：
+            # 研判没发现得手迹象 ≠ 没被打进来。
+            self.chain_summary.setVisible(False)
+            return
+
+        lines = []
+        tips = []
+        for session in landed[:3]:
+            hit = sum(chain.size for chain in session.landed_chains)
+            lines.append(
+                f"<b>{session.src_ip or '未知来源'}</b> → "
+                f"{session.dst_ip or '未知目标'}　"
+                f"尝试 <b>{session.attempts}</b> 次，"
+                f"<b style='color:#D32F2F'>得手 {hit} 次</b>")
+            for chain in session.landed_chains[:5]:
+                lines.append(
+                    f"　　★ <code>{chain.path}</code>　"
+                    f"{chain.size} 条交互，研判 {chain.outcome}")
+                tips.append(f"{session.src_ip} → {session.dst_ip}{chain.path}"
+                            f"（{chain.size} 条，{chain.outcome}）")
+
+        extra = len(landed) - 3
+        if extra > 0:
+            lines.append(f"　　…… 另有 {extra} 个来源存在得手迹象")
+
+        self.chain_summary.setText("　攻击链聚合：<br>" + "<br>".join(lines))
+        self.chain_summary.setToolTip(
+            "已证实得手的攻击链：\n" + "\n".join(tips) if tips else "")
+        self.chain_summary.setVisible(True)
 
     def setSuppressNoise(self, suppress: bool):
         """同步开关状态到复选框、代理模型和结果树。"""

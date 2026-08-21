@@ -424,6 +424,10 @@ class DetectionContext:
     uri: str = ""
     content_type: str = ""
     headers: Dict[str, str] = field(default_factory=dict)
+    # "request" = 这段载荷是攻击者投递的（请求体/查询串/URI）
+    # "response" = 服务器回的内容
+    # 决定 AST 的污点建模方式，见 ast_engine.SemanticAnalyzer.analyze
+    direction: str = "request"
 
     entropy: float = 0.0
     entropy_class: str = ""
@@ -678,14 +682,34 @@ class ASTEnhancedDetector(BaseDetector):
             result.weight += ast_result.confidence_adjustment
             result.tags.append("ast:tainted")
         elif untainted_count > 0 and tainted_count == 0 and result.weight < 100:
-            # 有危险函数但没污点，降低权重减少误报
-            adjustment = min(30, result.weight // 3)
-            result.weight -= adjustment
-            result.tags.append("ast:no_taint")
+            if getattr(ast_result, "external_taint", False):
+                # 请求侧：代码本身是攻击者投递的，"参数没追到超全局"不构成
+                # 无害证据，不降权。confidence_adjustment 里已经按方向算过
+                # （高危 sink 给正分、低危只免罚），这里照单接受即可。
+                result.weight += ast_result.confidence_adjustment
+                result.tags.append("ast:attacker_delivered")
+            else:
+                # 响应侧：可能是服务器回显了自己的源码，有危险函数但没污点
+                # 确实更可能是正常代码，保留降权
+                adjustment = min(30, result.weight // 3)
+                result.weight -= adjustment
+                result.tags.append("ast:no_taint")
 
         if ast_result.obfuscation_score > 0.5:
             result.weight += int(ast_result.obfuscation_score * 30)
             result.tags.append(f"ast:obfuscated:{ast_result.obfuscation_score:.1f}")
+
+        # 语义解码闭环的产出：解出来的链条要进证据，撞到预算上限要留痕。
+        for chain in getattr(ast_result, "decode_chains", [])[:3]:
+            result.tags.append(f"ast:decoded:{'>'.join(chain)}")
+
+        if getattr(ast_result, "decode_notes", None):
+            # "没展开"和"展开了没事"是两个结论，别混成一个
+            result.tags.append("ast:decode_budget_exhausted")
+            logger.warning(
+                "语义解码撞到预算上限 %s，部分编码内容未被展开，本条结论不完整",
+                ast_result.decode_notes,
+            )
 
     def _get_sink_weight(self, func_name: str) -> int:
         func_lower = func_name.lower()
@@ -1281,15 +1305,52 @@ class CommandInjectionDetector(ASTEnhancedDetector):
     }
 
     PATTERNS = {
-        'semicolon': (r";\s{0,10}(ls|cat|id|whoami|pwd|uname|curl|wget|nc|bash|sh)\b", 80),
-        'pipe': (r"\|\s{0,10}(ls|cat|id|whoami|pwd|bash|sh)\b", 75),
-        'ampersand': (r"&{1,2}\s{0,10}(ls|cat|id|whoami|pwd)\b", 70),
+        # ── 注入型：往**已有命令**里塞东西，所以命令前面必然有 shell 元字符 ──
+        #
+        # 末尾那个 (?![=\w]) 不能省。原来是 `\b` 收尾，于是：
+        #     cmd=save&id=3      → `&id` 命中 ampersand 规则，权重 95
+        #     ?page=1&cat=news   → `&cat` 命中
+        #     &pwd=123456        → `&pwd` 命中
+        # `&id=` / `&cat=` / `&pwd=` 是 web 上最常见的参数形态之一，这条规则
+        # 等于给一大批正常请求发高危。`\b` 在 `id=` 的 `=` 前面是成立的，
+        # 所以光靠 \b 挡不住 —— 必须明确排掉"后面跟等号"这种参数形态。
+        #
+        # 真正的命令注入长这样：`;id`、`; id -a`、`|whoami`、`&&pwd`，
+        # 命令后面是空白、另一个元字符、或者到头了，不会是 `=`。
+        'semicolon': (r";\s{0,10}(ls|cat|id|whoami|pwd|uname|curl|wget|nc|bash|sh)(?![=\w])", 80),
+        'pipe': (r"\|\s{0,10}(ls|cat|id|whoami|pwd|bash|sh)(?![=\w])", 75),
+        'ampersand': (r"&{1,2}\s{0,10}(ls|cat|id|whoami|pwd)(?![=\w])", 70),
         'backtick_cmd': (r"`[^`]{1,200}`", 70),
         'dollar_paren': (r"\$\([^)]{1,200}\)", 70),
         'reverse_shell': (r"(nc|ncat|netcat)\s{1,20}[^\s]{1,50}\s{1,20}\d{1,5}\s{1,10}-e\s{1,10}(ba)?sh", 100),
         'bash_reverse': (r"bash\s{1,10}-i\s{1,10}>&", 100),
         'curl_pipe': (r"curl\s{1,50}[^\|]{1,200}\|\s{0,10}(ba)?sh", 90),
         'wget_pipe': (r"wget\s{1,50}[^\|]{1,200}\|\s{0,10}(ba)?sh", 90),
+
+        # ── 直传型：参数值**本身就是**一条命令，没有元字符 ──
+        #
+        # 上面那三条注入规则都要求命令前面有 `;` `|` `&`，因为它们针对的是
+        # "往已有命令里注入"。但 WebShell 的标准交互形态是
+        #     POST /uploads/shell.php    cmd=whoami
+        # 参数值直接就是要执行的命令，一个元字符都没有 —— 三条规则全不匹配。
+        #
+        # 实测后果：`cmd=whoami` 打到一个 FFI WebShell 上，服务器回
+        # "[+] Executing command via FFI -> libc::system():"，而检测器给的
+        # 权重是 **0**，一个指标都没命中，界面上显示"信息"级 —— 比同一个包
+        # 里的正常登录请求还低。
+        #
+        # 判据是**参数名 + 参数值**的合取，两边都要高信号才算：
+        #   参数名   只收 cmd/exec/command/shell/execute/system 这几个明确
+        #            指示执行的（不收 do/act/run/c —— 正常业务里太常见）
+        #   参数值   必须是可识别的系统命令，不是任意字符串
+        # 单看任何一边都会误报，合起来在正常业务里几乎不可能出现。
+        'shell_cmd_param': (
+            r"(?:^|[&?])(?:cmd|exec|command|shell|execute|system|cmdline)"
+            r"=(?:%20|\+|\s){0,5}"
+            r"(?:whoami|id|uname|hostname|pwd|ifconfig|ipconfig|netstat|arp"
+            r"|route|tasklist|systeminfo|ps|ls|dir|cat|type|env|set"
+            r"|wget|curl|nc|ncat|bash|sh|powershell|python|perl|php)"
+            r"(?:[\s+%&]|$)", 85),
     }
 
     def __init__(self):
@@ -1946,9 +2007,18 @@ class AttackDetector:
         method: str = "GET",
         uri: str = "/",
         content_type: str = "",
-        headers: Dict[str, str] = None
+        headers: Dict[str, str] = None,
+        direction: str = "request"
     ) -> Dict[str, Any]:
-        """执行检测，返回兼容DetectionResult的字典"""
+        """执行检测，返回兼容DetectionResult的字典
+
+        direction 默认 "request"：本方法当前所有调用点喂的都是请求侧数据
+        （stream_worker 的 body/query/URI、mcp_server 的待检测载荷）。
+        它决定 AST 怎么给这段代码建模 —— 请求体里的代码是攻击者投递的，
+        "危险函数参数没追到超全局"不构成无害证据。详见
+        ast_engine.SemanticAnalyzer.analyze。将来要拿响应体调本方法，
+        传 direction="response" 即可恢复原来的降权行为。
+        """
         start_time = time.time()
         headers = headers or {}
 
@@ -1962,6 +2032,7 @@ class AttackDetector:
             uri=uri,
             content_type=content_type,
             headers=headers,
+            direction=direction,
             start_time=start_time,
             is_sampled=sampled.is_sampled
         )
@@ -2263,19 +2334,53 @@ class AttackDetector:
             pass
         return ""
 
+    # _looks_like_code 用。拆成两组是纯性能考虑，语义与原来的 6 条一致。
+    #
+    #   CHEAP    起始字符确定（`$` / `<`），re 能走 memchr 快扫，16MB 只要 4ms
+    #   GUARDED  以 `\b` 开头，`\b` 挡掉了 re 的字面量前缀优化，只能逐位置
+    #            尝试 —— 16MB 上每条要 130~500ms。所以先用 C 层的子串查找
+    #            确认必含关键字存在，不存在就可证明该正则不可能命中。
+    #
+    # 便宜的排前面短路：真 PHP 载荷几乎一定含 `$var=` 或 `<?php`，立刻返回，
+    # 根本跑不到贵的那四条。实测 16MB 最坏情况 524ms -> 41ms。
+    _CODE_PATTERNS_CHEAP = [
+        re.compile(r'\$\w{1,50}\s{0,5}=', re.IGNORECASE),
+        re.compile(r'<\?php', re.IGNORECASE),
+    ]
+    _CODE_PATTERNS_GUARDED = [
+        (('function',), re.compile(r'\bfunction\s{1,10}\w{1,50}\s{0,5}\(', re.IGNORECASE)),
+        (('class',), re.compile(r'\bclass\s{1,10}\w{1,50}', re.IGNORECASE)),
+        (('if', 'for', 'while'), re.compile(r'\b(if|for|while)\s{0,5}\(', re.IGNORECASE)),
+        (('eval',), re.compile(r'\beval\s{0,5}\(', re.IGNORECASE)),
+    ]
+
     def _looks_like_code(self, text: str) -> bool:
-        text = text[:5000]
-        patterns = [
-            r'\bfunction\s{1,10}\w{1,50}\s{0,5}\(',
-            r'\bclass\s{1,10}\w{1,50}',
-            r'\b(if|for|while)\s{0,5}\(',
-            r'\$\w{1,50}\s{0,5}=',
-            r'\beval\s{0,5}\(',
-            r'<\?php',
-        ]
-        for p in patterns:
-            if re.search(p, text, re.IGNORECASE):
+        """判断这段文本里有没有代码结构
+
+        这里原来是 `text = text[:5000]` —— 只看前 5000 字符。那是一个纯粹靠
+        **填充**就能绕过的门：请求体开头塞 5KB 空白或无害文本，后面接整段
+        webshell，`is_code_like` 判 False，`_run_shared_ast_analysis` 整个
+        不跑，语义分析对这条流量彻底消失。
+
+        和 fast_filter 头部注释里记的那四个"填充即绕过"是同一类 bug，只是
+        当时没扫到这里。攻击者控制的量（前缀长度）绝不能决定我们看不看。
+
+        改成全量扫，代价靠上面那两组模式的拆分压住（16MB 最坏 41ms，每条
+        流量一次，不是每条规则一次）。真正贵的 AST 后面还有 fast_filter 和
+        sink 检查两道门把关。
+        """
+        if not text:
+            return False
+
+        for pattern in self._CODE_PATTERNS_CHEAP:
+            if pattern.search(text):
                 return True
+
+        lowered = text.lower()
+        for keywords, pattern in self._CODE_PATTERNS_GUARDED:
+            if any(k in lowered for k in keywords) and pattern.search(text):
+                return True
+
         return False
 
     def list_detectors(self) -> List[str]:
@@ -2284,6 +2389,7 @@ class AttackDetector:
     def _run_shared_ast_analysis(self, context: DetectionContext) -> None:
         """统一跑一次AST，结果放context.ast_result里"""
         text = context.decoded_text
+        external_taint = (context.direction != "response")
 
         if context.ast_analyzed:
             return
@@ -2312,7 +2418,11 @@ class AttackDetector:
             try:
                 ast_cache = get_ast_cache()
                 cached = ast_cache.get(text)
-                if cached is not None:
+                # 缓存键是文本的哈希，但分析结果现在还取决于方向 —— 同一段
+                # 代码在请求侧和响应侧的结论不一样（见 ast_engine.analyze）。
+                # 方向不匹配就当没命中，重算，别把请求侧的结论套到响应侧。
+                if cached is not None and \
+                        getattr(cached, "external_taint", False) == external_taint:
                     context.ast_result = cached
                     return
             except Exception:
@@ -2331,7 +2441,8 @@ class AttackDetector:
         # 跑AST
         try:
             _obs_incr("ast.executed")
-            ast_result = self._execute_shared_ast(text)
+            ast_result = self._execute_shared_ast(
+                text, external_taint=external_taint)
             if ast_result:
                 context.ast_result = ast_result
                 if getattr(ast_result, "dangerous_calls", None) or \
@@ -2344,9 +2455,9 @@ class AttackDetector:
         except Exception as e:
             logger.debug(f"Shared AST analysis failed: {e}")
 
-    def _execute_shared_ast(self, code: str):
+    def _execute_shared_ast(self, code: str, external_taint: bool = False):
         """直接调用AST，不走线程池(Windows上submit开销太大)"""
-        return self._ast_engine.analyze(code)
+        return self._ast_engine.analyze(code, external_taint=external_taint)
 
 
 def detect_attack(

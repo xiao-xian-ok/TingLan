@@ -13,14 +13,17 @@
 
 import html
 import json
+import logging
 import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.provenance import (
     KIND_META, STAGE_COLORS, STAGE_LABELS, STAGES,
-    ProvenanceGraph, ProvenanceNode, build_provenance_graph,
+    ProvenanceGraph, ProvenanceNode, build_provenance_graph, focus_graph,
 )
+
+logger = logging.getLogger(__name__)
 
 # 画布几何
 NODE_W = 200
@@ -723,9 +726,24 @@ footer {{ text-align:center; color:#94a3b8; font-size:12px; padding:14px; }}
 
 
 def export_provenance_html(summary, output_path: str,
-                           graph: Optional[ProvenanceGraph] = None) -> ProvenanceGraph:
-    """建图 + 落盘。返回建好的图，方便调用方拿统计数据。"""
+                           graph: Optional[ProvenanceGraph] = None,
+                           focus: bool = True) -> ProvenanceGraph:
+    """建图 + 落盘。返回**实际渲染的**那张图，方便调用方拿统计数据。
+
+    `focus=True`（默认）会把图收敛成"以得手为中心 + 上下文"，其余端点
+    折叠成一个聚合节点 —— 见 provenance.focus_graph 的说明。实测标定包
+    2311 个端点节点里真正得手的只有 1 个，不收敛的图没法看。
+
+    传 focus=False 拿完整图（导出全量证据、或者要自己做分析时用）。
+    收敛是**折叠不是删除**：聚合节点带着条数和样本清单，
+    stats['collapsed_nodes'] 也如实写明折了多少。
+    """
     graph = graph if graph is not None else build_provenance_graph(summary)
+    if focus:
+        try:
+            graph = focus_graph(graph)
+        except Exception as e:
+            logger.warning("溯源图聚焦失败，回退完整图: %s", e)
     content = render_provenance_html(graph)
     directory = os.path.dirname(os.path.abspath(output_path))
     if directory:

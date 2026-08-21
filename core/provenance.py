@@ -735,3 +735,163 @@ def build_provenance_graph(summary) -> ProvenanceGraph:
             file_path=getattr(summary, "file_path", "") or "",
             total_packets=int(getattr(summary, "total_packets", 0) or 0),
         )
+
+
+# ---------------------------------------------------------------- 聚焦收敛
+
+# 没有任何得手锚点时，退而保留最活跃的这么多个端点。
+# 全折叠成一个点等于什么都没说；全展开又是 2000+ 个节点。
+_FALLBACK_ANCHORS = 12
+
+# 折叠节点详情里列出的样本条数
+_COLLAPSE_SAMPLES = 15
+
+
+def _aggregate_key(node: ProvenanceNode) -> str:
+    return "collapsed"
+
+
+def focus_graph(graph: ProvenanceGraph, hops: int = 1) -> ProvenanceGraph:
+    """把溯源图收敛成"以得手为中心 + 上下文"，其余**折叠**而不是删除。
+
+    ── 为什么不按威胁等级过滤 ──
+
+    实测标定包：6793 条检测 → 2311 个端点节点，其中 2236 个只有 1 条检测
+    （Acunetix 往每个 URL 都 POST 一个 XXE 载荷），而真正得手的路径只有
+    **1 个**。图完全不可用。
+
+    但"只显示高危/严重"解决不了：这 2311 个节点的原始等级绝大多数就是
+    critical（载荷本身确实像严重攻击）。更要命的是**按等级切会断链** ——
+    溯源图要回答的是"他怎么进来的、下一步做了什么"，链里必然有单看无害的
+    环节（探测、上传接口调用、失败的试探）。删掉中间节点，剩下几个孤立的
+    红点，恰恰丢掉了"路径"这个溯源图唯一的价值。
+
+    ── 做法 ──
+
+      锚点    研判 confirmed / suspected 的节点
+      上下文  从锚点沿边向前后各扩 hops 跳（链不断）
+      骨架    攻击者 / 目标节点恒保留（没有它们图就没有框）
+      其余    折叠成**一个**聚合节点，不删除
+
+    折叠而非隐藏的理由：取证工具里"我没看到"和"这里没有"必须能区分。
+    而且"这个人试了 6774 次"本身就是重要情报（说明是自动化工具、有针对
+    性），删掉反而看不见。聚合节点的 detail 里留了样本清单。
+
+    一个锚点都没有时（研判认为通篇无事发生）退回"保留最活跃的
+    _FALLBACK_ANCHORS 个端点" —— 全折叠等于什么都没说。
+    """
+    if graph is None or graph.is_empty:
+        return graph
+
+    # 攻击者 / 目标是**枢纽**：图上每个端点都直接挂在目标底下，所以
+    # 任何经过它们的扩散都会一跳吃掉全图。它们要恒保留（没有骨架图就没有
+    # 框），但**不能当锚点，也不能作为扩散的中转**。
+    #
+    # 这一条是实测踩出来的：第一版把它们一起算进锚点，因为
+    # ProvenanceNode 的 outcome 取的是该节点上所有检测的最大值 ——
+    # 攻击者只要有一条得手，整个 attacker 节点就是 confirmed，
+    # 于是从它扩一跳就把 2311 个端点全捞回来了（2314 → 2289，等于没收敛）。
+    hubs = {n.id for n in graph.nodes if n.kind in ("attacker", "target")}
+
+    anchors = {n.id for n in graph.nodes
+               if n.outcome in ("confirmed", "suspected") and n.id not in hubs}
+    if not anchors:
+        ranked = sorted(
+            (n for n in graph.nodes if n.id not in hubs),
+            key=lambda n: (-n.weight, -n.events, n.id))
+        anchors = {n.id for n in ranked[:_FALLBACK_ANCHORS]}
+
+    # 邻接表**跳过枢纽**：端点之间真正的关系边（causal / temporal / drop）
+    # 才用来扩散，"目标 → 端点"这种结构边不参与。
+    neighbours: Dict[str, set] = {}
+    for edge in graph.edges:
+        if edge.src in hubs or edge.dst in hubs:
+            continue
+        neighbours.setdefault(edge.src, set()).add(edge.dst)
+        neighbours.setdefault(edge.dst, set()).add(edge.src)
+
+    keep = set(anchors) | hubs
+    frontier = set(anchors)
+    for _ in range(max(0, hops)):
+        nxt = set()
+        for nid in frontier:
+            nxt |= neighbours.get(nid, set())
+        nxt -= keep
+        if not nxt:
+            break
+        keep |= nxt
+        frontier = nxt
+
+    collapsed = [n for n in graph.nodes if n.id not in keep]
+    if not collapsed:
+        return graph
+
+    nodes = [n for n in graph.nodes if n.id in keep]
+
+    agg = ProvenanceNode(
+        id="n_collapsed", kind="endpoint",
+        label=f"另有 {len(collapsed)} 个端点未见得手",
+        sublabel=f"{sum(n.events for n in collapsed)} 次尝试 · 已折叠",
+        stage=STAGE_EXPLOIT,
+        threat=max((n.threat for n in collapsed),
+                   key=lambda t: _THREAT_RANK.get(t, 0)),
+        outcome=max((n.outcome for n in collapsed),
+                    key=lambda o: _OUTCOME_RANK.get(o, 0)),
+        weight=sum(n.weight for n in collapsed),
+        events=sum(n.events for n in collapsed),
+        detail=[
+            ("折叠原因", "研判未发现得手迹象，且不在得手链的上下文内"),
+            ("折叠端点数", str(len(collapsed))),
+            ("累计检测", str(sum(n.events for n in collapsed))),
+        ] + [
+            ("端点", f"{n.label}（{n.events} 次）")
+            for n in sorted(collapsed, key=lambda x: -x.events)[:_COLLAPSE_SAMPLES]
+        ],
+    )
+    frames = sorted({f for n in collapsed for f in n.frames})
+    agg.frames = frames[:50]
+    agg.first_frame = frames[0] if frames else 0
+    agg.last_frame = frames[-1] if frames else 0
+    nodes.append(agg)
+
+    # 边改接到聚合节点上；两端都被折叠的边直接丢（它们的信息已经在计数里）
+    remap: Dict[Tuple[str, str, str], ProvenanceEdge] = {}
+    for edge in graph.edges:
+        src_in, dst_in = edge.src in keep, edge.dst in keep
+        if src_in and dst_in:
+            key = (edge.src, edge.dst, edge.kind)
+            remap[key] = edge
+            continue
+        if not src_in and not dst_in:
+            continue
+        src = edge.src if src_in else agg.id
+        dst = edge.dst if dst_in else agg.id
+        if src == dst:
+            continue
+        key = (src, dst, "flow")
+        merged = remap.get(key)
+        if merged is None:
+            merged = ProvenanceEdge(src=src, dst=dst, kind="flow",
+                                    label="未见得手的尝试", count=0)
+            remap[key] = merged
+        merged.count += edge.count
+
+    focused = ProvenanceGraph(
+        nodes=nodes,
+        edges=list(remap.values()),
+        timeline=[t for t in graph.timeline if t.node in keep],
+        file_path=graph.file_path,
+        total_packets=graph.total_packets,
+        analysis_time=graph.analysis_time,
+    )
+    focused.stats = dict(graph.stats)
+    focused.stats.update({
+        "nodes": len(nodes),
+        "edges": len(focused.edges),
+        "stage_counts": focused.stage_counts(),
+        "focused": True,
+        "collapsed_nodes": len(collapsed),
+        "collapsed_events": sum(n.events for n in collapsed),
+        "anchors": len(anchors),
+    })
+    return focused

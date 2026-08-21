@@ -28,6 +28,19 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _record_tshark_pass(name, elapsed_s, lines=0, output_chars=0):
+    """一趟 tshark 的耗时/输出量埋点（与 core/protocol_analyzer 同名约定）。
+
+    埋点自身绝不允许影响分析结果：取数或写数任何一步异常都静默吞掉。
+    """
+    try:
+        from core.observability import get_observability_hub
+        get_observability_hub().record_tshark_pass(
+            name, elapsed_s, lines, output_chars)
+    except Exception:
+        logger.debug("tshark 趟埋点失败: %s", name, exc_info=True)
+
+
 class TsharkError(Exception):
     pass
 
@@ -375,10 +388,29 @@ class ProcessManager:
 
     @staticmethod
     def get_popen_kwargs(config):
+        # bufsize 千万别改回 0。
+        #
+        # bufsize=0 时 proc.stdout 是裸 FileIO，**没有 peek()**；而
+        # io.IOBase.readline() 在拿不到 peek() 时会退化成「一次 read(1)
+        # 一个字节」。下面 stream_packets 读的正是 readline()，于是一行
+        # 20KB 的 EK JSON 要走 20000 次系统调用。
+        #
+        # 实测（同一台机器，8KB/行）：
+        #     bufsize=0      48 行/秒
+        #     bufsize=-1  33277 行/秒        —— 695 倍
+        # 按行长分档：150B 17x，1200B 89x，8KB 251x，20KB(EK) 263x。
+        # 行越长差距越大，而 EK 恰好是行最长的格式。
+        #
+        # 唯一可能为 bufsize=0 辩护的理由是「实时抓包要低延迟」，但这个
+        # 理由不成立：管道上的 BufferedReader.readline() 是有多少读多少，
+        # 不会等缓冲区填满。实测慢速生产者（每 200ms 一行）在两种设置下
+        # 各行到达时刻完全一致（0.06/0.26/0.46/0.66/0.86s）。
+        #
+        # 同理 stderr：StderrMonitor 也是阻塞 readline，缓冲不会推迟报错。
         kwargs = {
             "stdout": subprocess.PIPE,
             "stderr": subprocess.PIPE,
-            "bufsize": 0,
+            "bufsize": -1,
         }
 
         if sys.platform == "win32":
@@ -743,6 +775,10 @@ class TsharkProcessHandler:
     def stream_packets(self, config):
         self._stop_requested = False
         self._packet_count = 0
+        # 趟级埋点：主通道整趟的耗时/行数在 finally 里记账。
+        # line_count 必须在 try 前初始化——Popen 失败时 finally 也要能引用。
+        _pass_start = time.perf_counter()
+        line_count = 0
 
         cmd = self._build_command(config)
         logger.info(f"启动 tshark: {' '.join(cmd)}")
@@ -767,7 +803,6 @@ class TsharkProcessHandler:
             first_data_timeout = config.first_data_timeout
             start_time = time.time()
             got_first_packet = False
-            line_count = 0
 
             while not self._stop_requested:
                 if self._stderr_monitor.has_error:
@@ -845,6 +880,11 @@ class TsharkProcessHandler:
         finally:
             self._is_running = False
             self.stop()
+            _record_tshark_pass(
+                "tshark.stream_packets",
+                time.perf_counter() - _pass_start,
+                lines=line_count,
+            )
 
     def stream_pyshark_compatible(self, config):
         # 直接yield PacketWrapper，可以丢给现有检测器用
@@ -938,7 +978,18 @@ def get_protocol_stats(pcap_path, tshark_path=None):
     if sys.platform == "win32":
         popen_kwargs["creationflags"] = 0x08000000
 
-    result = subprocess.run(cmd, **popen_kwargs)
+    # finally 记账：超时/找不到 tshark 的失败趟同样留痕，异常继续向上抛
+    _pass_start = time.perf_counter()
+    stdout = ""
+    try:
+        result = subprocess.run(cmd, **popen_kwargs)
+        stdout = result.stdout or ""
+    finally:
+        _record_tshark_pass(
+            "tshark.io_phs",
+            time.perf_counter() - _pass_start,
+            lines=stdout.count("\n"),
+        )
 
     protocol_counts = {}
     total = 0

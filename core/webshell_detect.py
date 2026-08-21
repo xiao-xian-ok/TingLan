@@ -1345,6 +1345,30 @@ def analyze_params(params: Dict[str, str]) -> Dict[str, Dict]:
     return decoded_payloads
 
 
+def _payload_is_request_side(param_name: str, payload_info) -> bool:
+    """这条载荷是攻击者投递的（请求侧），还是服务器回的（响应侧）
+
+    决定 AST 怎么给它建模：请求体里的 PHP 代码整体就是攻击者写的，外层污点
+    在协议层已经成立，不该因为"危险函数参数没追到 $_POST"就倒扣分；响应侧
+    可能是服务器回显了自己的源码，那个降权仍然是对的。
+    详见 ast_engine.SemanticAnalyzer.analyze。
+
+    优先读显式的 ``direction`` 字段。哥斯拉是唯一会把两侧塞进同一个 payloads
+    dict 的家族（``payloads['response']``），那三处已经显式标注。键名/类型名
+    的推断只是兜底 —— 新增响应侧载荷时请显式写 ``'direction': 'response'``，
+    别依赖这里猜。
+    """
+    if isinstance(payload_info, dict):
+        declared = str(payload_info.get('direction', '')).lower()
+        if declared in ('request', 'response'):
+            return declared == 'request'
+        ptype = str(payload_info.get('type', '')).lower()
+        if 'response' in ptype:
+            return False
+
+    return 'response' not in str(param_name).lower()
+
+
 class FeatureMatcher:
     """特征匹配引擎"""
 
@@ -2144,9 +2168,29 @@ class WebShellDetector:
                 result['total_weight'] += 45
 
             # 熵值检测
+            #
+            # 阈值从 4.5 提到 5.2。4.5 太低了 —— 它是**正常文本**的熵，
+            # 不是加密数据的熵：
+            #
+            #     英文散文            ~4.2
+            #     URL 编码表单        ~4.7    ← DVWA 登录包实测 4.75
+            #     base64             ~6.0    （理论上限 log2(64)=6）
+            #     加密/压缩原始字节    ~7.9
+            #
+            # 实测后果：`username=admin&password=password&Login=Login
+            # &user_token=6e20816a…` 这样一个**再普通不过的登录表单**熵是
+            # 4.75，命中这条规则拿 25 分，再叠加 post_to_php 的 20 分就到
+            # 45 分，被报成"疑似 WebShell"。而 `user_token` 这类 CSRF
+            # 令牌是十六进制串，正是把表单熵推过 4.5 的东西 —— 于是**每个
+            # 带 CSRF 令牌的 PHP 登录页**都会中招。
+            #
+            # 5.2 卡在"正常表单"和"base64"中间：4.75 的表单不再命中，
+            # 6.0 的冰蝎/哥斯拉 base64 载荷照常命中。
+            _ENTROPY_ENCRYPTED = 5.2      # 疑似编码/加密
+            _ENTROPY_STRONG = 6.5         # 基本可以确定不是明文
             body_entropy = self._calculate_entropy(body_stripped)
-            if body_entropy > 4.5:
-                ent_weight = 40 if body_entropy > 5.5 else 25
+            if body_entropy > _ENTROPY_ENCRYPTED:
+                ent_weight = 40 if body_entropy > _ENTROPY_STRONG else 25
                 result['indicators'].append({
                     'name': 'high_entropy_body',
                     'weight': ent_weight,
@@ -2390,95 +2434,105 @@ class WebShellDetector:
 
     @staticmethod
     def _check_behinder_headers(http_layer) -> int:
-        """检查冰蝎HTTP头特征"""
-        weight = 0
-        matched_features = 0
+        """检查冰蝎 HTTP 头特征。
 
-        # Content-Type检查
+        ── 这里原来是个稳定的误报源 ──
+
+        原实现给下面这些"特征"逐个加分并计入组合奖励：
+
+            application/x-www-form-urlencoded   +10  ← 每个 HTML 表单
+            Accept-Language: zh-CN,en-US        +15  ← 每个中文浏览器
+            Connection: keep-alive              +10  ← 每个现代浏览器
+            Accept: text/html                    +5
+            Accept-Encoding 含 gzip              +5
+            3 个特征组合奖励                     +15
+                                                ────
+                                                 60
+
+        于是**任何一个中文环境的浏览器提交普通表单**都稳拿 60 分。实测
+        DVWA 的登录包 `username=admin&password=password&Login=Login…`
+        因此被报成"疑似 WebShell（低危）"——而同一个抓包里真正的
+        WebShell 访问只有"信息"级。排序完全反了。
+
+        问题不在阈值，在**特征选得不对**：上面那些是"浏览器常态"，
+        不是"冰蝎特征"。任何以它们为主体的打分都必然对全体正常流量成立。
+
+        ── 现在的做法：区分「家族证据」和「佐证」 ──
+
+        家族证据  只有**非浏览器常态**的才算：octet-stream 请求体、
+                  冰蝎 v4 那个 json+text/javascript 的 Accept 组合、
+                  几个写死的老 UA、单独一个 gzip（浏览器发的是
+                  `gzip, deflate, br`）
+        佐证      form-urlencoded / keep-alive / 大 body 这些**只在已经
+                  有家族证据时**才叠加，自己不能立案
+
+        一条家族证据都没有 → 直接返回 0。宁可这条规则少报，也不能让它
+        给全体正常表单发"疑似 WebShell"—— 冰蝎真正的判据是密钥协商和
+        AES 解密（见 behinder_v3_handshake / try_decrypt_behinder），
+        头部特征本来就只配当佐证。
+        """
         content_type = getattr(http_layer, 'content_type', '') or ''
-
-        # 冰蝎v3/v4 常用Content-Type
-        if 'application/x-www-form-urlencoded' in content_type:
-            weight += 10
-            matched_features += 1
-
-        # 冰蝎v4有时使用 application/octet-stream
-        if 'application/octet-stream' in content_type:
-            weight += 15
-            matched_features += 1
-
-        # 冰蝎4特征Accept头
         accept = getattr(http_layer, 'accept', '') or ''
-        # 冰蝎4典型Accept头
-        if 'application/json' in accept and 'text/javascript' in accept:
-            weight += 25
-            matched_features += 1
-        elif accept == '*/*' or 'text/html' in accept:
-            weight += 5
-
-        # Accept-Language
-        accept_language = getattr(http_layer, 'accept_language', '') or ''
-        if 'zh-CN' in accept_language and 'en-US' in accept_language:
-            weight += 15
-            matched_features += 1
-
-        # Accept-Encoding
         accept_encoding = getattr(http_layer, 'accept_encoding', '') or ''
-        # 单独的gzip比较可疑
-        if accept_encoding == 'gzip' or accept_encoding.strip() == 'gzip':
-            weight += 15  # 单独的gzip是可疑的
-            matched_features += 1
-        elif 'gzip' in accept_encoding:
-            weight += 5
+        user_agent = getattr(http_layer, 'user_agent', '') or ''
 
-        # Connection: Keep-Alive
-        connection = getattr(http_layer, 'connection', '') or ''
-        if 'keep-alive' in connection.lower():
-            weight += 10
-            matched_features += 1
+        # ---- 家族证据：正常浏览器不会这么发 ----
+        family_weight = 0
+        family_hits = 0
 
-        # Content-Length
+        if 'application/octet-stream' in content_type:
+            family_weight += 15
+            family_hits += 1
+
+        # 冰蝎 4 的典型 Accept 组合
+        if 'application/json' in accept and 'text/javascript' in accept:
+            family_weight += 25
+            family_hits += 1
+
+        # 浏览器发的是 `gzip, deflate` / `gzip, deflate, br`，
+        # 光秃秃一个 gzip 是客户端库手写的
+        if accept_encoding.strip() == 'gzip':
+            family_weight += 15
+            family_hits += 1
+
+        for ua in ('Mozilla/5.0 (compatible; MSIE 9.0; Windows NT 6.1; Win64; x64; Trident/5.0)',
+                   'Mozilla/4.0 (compatible; MSIE 8.0;',
+                   'Mozilla/5.0 (Linux; U; Android 2.2;'):
+            if ua in user_agent:
+                family_weight += 20
+                family_hits += 1
+                break
+
+        # 一条家族证据都没有 —— 剩下的全是浏览器常态，不立案
+        if family_hits == 0:
+            return 0
+
+        # ---- 佐证：只在已有家族证据时叠加 ----
+        support = 0
+        if 'application/x-www-form-urlencoded' in content_type:
+            support += 10
+        if 'keep-alive' in (getattr(http_layer, 'connection', '') or '').lower():
+            support += 5
+
         content_length = getattr(http_layer, 'content_length', '') or ''
         try:
             cl_value = int(content_length)
             if cl_value > 5000:
-                weight += 20  # 非常大的请求体
-                matched_features += 1
+                support += 20
             elif cl_value > 2000:
-                weight += 15
-                matched_features += 1
+                support += 15
             elif cl_value > 1000:
-                weight += 10
-                matched_features += 1
+                support += 10
         except (ValueError, TypeError):
             pass
 
-        # User-Agent
-        user_agent = getattr(http_layer, 'user_agent', '') or ''
-        behinder_uas = [
-            'Mozilla/5.0 (compatible; MSIE 9.0; Windows NT 6.1; Win64; x64; Trident/5.0)',
-            'Mozilla/4.0 (compatible; MSIE 8.0;',
-            'Mozilla/5.0 (Linux; U; Android 2.2;',
-        ]
-        for ua in behinder_uas:
-            if ua in user_agent:
-                weight += 20
-                matched_features += 1
-                break
+        # 多条**家族证据**同现才给组合奖励（原来是拿浏览器常态凑数）
+        if family_hits >= 3:
+            family_weight += 30
+        elif family_hits >= 2:
+            family_weight += 15
 
-        # Pragma/Cache-Control
-        pragma = getattr(http_layer, 'pragma', '') or ''
-        cache_control = getattr(http_layer, 'cache_control', '') or ''
-        if 'no-cache' in pragma or 'no-cache' in cache_control:
-            weight += 5
-
-        # 多特征组合加权
-        if matched_features >= 4:
-            weight += 30  # 多特征组合强指标
-        elif matched_features >= 3:
-            weight += 15
-
-        return weight
+        return family_weight + support
 
     # 哥斯拉会话扫描
 
@@ -2701,6 +2755,7 @@ class WebShellDetector:
                                 result['payloads']['response'] = {
                                     'type': 'Godzilla Response',
                                     'method': 'md5+base64+md5',
+                                    'direction': 'response',
                                     'encoded_sample': resp_stripped[:100],
                                     'decoded': decoded_str[:500]
                                 }
@@ -2708,6 +2763,7 @@ class WebShellDetector:
                                 result['payloads']['response'] = {
                                     'type': 'Godzilla Response (Encrypted)',
                                     'method': 'md5+base64+md5',
+                                    'direction': 'response',
                                     'raw_data': godzilla_resp_match['base64_data'][:100] + '...',
                                     'note': '响应数据可能经过二次加密'
                                 }
@@ -2715,6 +2771,7 @@ class WebShellDetector:
                             result['payloads']['response'] = {
                                 'type': 'Godzilla Response (Binary)',
                                 'method': 'md5+base64+md5',
+                                'direction': 'response',
                                 'raw_data': godzilla_resp_match['base64_data'][:100] + '...',
                                 'note': '响应数据为二进制格式'
                             }
@@ -2921,6 +2978,11 @@ class WebShellDetector:
         同一个 bug。现在：参数全跑（按解码长度降序，先看最可能是代码的），
         超长走 PHPASTEngine.analyze_windowed 的滑动窗口而不是跳过，并且一旦
         走了窗口就必须留痕 —— "分段看的"和"看全了"是两个不同的结论。
+
+        方向要**逐 payload** 判，不能按调用点整体传：哥斯拉那条路径会把
+        请求参数和 `payloads['response']`（响应体解密结果）塞进同一个 dict。
+        请求侧的代码是攻击者投递的，AST 不该因为"参数没追到 $_POST"倒扣；
+        响应侧则可能是服务器回显了自己的源码，降权仍然成立。
         """
         # AST 未启用
         if not self._ast_enabled or not self.ast_engine:
@@ -2948,6 +3010,7 @@ class WebShellDetector:
 
         for param_name, payload_info in ordered:
             decoded_content = _decoded_of((param_name, payload_info))
+            is_request_side = _payload_is_request_side(param_name, payload_info)
 
             # 太短装不下任何 sink+taint 组合，这个跳过是可证明安全的
             if not decoded_content or len(decoded_content) < 15:
@@ -2958,7 +3021,8 @@ class WebShellDetector:
                 continue
 
             try:
-                ast_result, windowed = self.ast_engine.analyze_windowed(decoded_content)
+                ast_result, windowed = self.ast_engine.analyze_windowed(
+                    decoded_content, external_taint=is_request_side)
                 if windowed:
                     windowed_params.append((param_name, len(decoded_content)))
                     logger.warning(
@@ -2973,19 +3037,38 @@ class WebShellDetector:
                 if ast_result.findings or ast_result.dangerous_calls:
                     ast_analysis_results.append({
                         'param': param_name,
+                        'direction': 'request' if is_request_side else 'response',
                         'obfuscation_score': ast_result.obfuscation_score,
                         'is_likely_webshell': ast_result.is_likely_webshell,
                         'windowed': windowed,
+                        # 语义解码闭环解开了哪几层。报告要能写出
+                        # "eval ← base64_decode ← system('whoami')"，
+                        # 而不只是"有个 eval"。
+                        'decode_chains': ast_result.decode_chains,
+                        'decode_notes': ast_result.decode_notes,
                         'dangerous_calls': [
                             {
                                 'func': c.function_name,
                                 'tainted': c.is_tainted,
-                                'severity': c.severity
+                                'severity': c.severity,
+                                'nesting_depth': c.nesting_depth,
+                                'decode_chain': c.decode_chain
                             }
                             for c in ast_result.dangerous_calls
                         ],
                         'findings_count': len(ast_result.findings)
                     })
+
+                # 解码预算耗尽 = 有些编码参数没被解开看过。
+                # "没看"和"看了没事"是两个结论，必须留痕。
+                if ast_result.decode_notes:
+                    logger.warning(
+                        "[%s][AST] 参数 %s 的语义解码撞到预算上限 %s，"
+                        "部分编码内容未被展开（本条结论不完整）",
+                        tool_name, param_name, ast_result.decode_notes,
+                    )
+                    _record_partial_coverage(
+                        "ast_decode_budget", len(decoded_content), 0)
 
                 total_adjustment += ast_result.confidence_adjustment
 
@@ -2999,12 +3082,27 @@ class WebShellDetector:
                     })
 
                 if ast_result.is_likely_webshell:
+                    # 文案要说**这一条实际是怎么判出来的**。原来固定写
+                    # "存在污点数据流入危险函数"，但 is_likely_webshell 有三条
+                    # 独立的成立路径，另外两条根本没有污点链 —— 那样写等于在
+                    # 报告里伪造证据。取证工具不能这么说话。
+                    if any(c.is_tainted for c in ast_result.dangerous_calls):
+                        _why = '存在污点数据流入危险函数'
+                    elif any(f.type == 'decoded_sink' for f in ast_result.findings):
+                        _chains = '、'.join(
+                            ' -> '.join(c) for c in ast_result.decode_chains[:2])
+                        _why = f'sink 的编码参数经 {_chains} 解码后仍是可执行代码'
+                    elif ast_result.external_taint:
+                        _why = '攻击者投递的代码中直接调用了高危函数(参数硬编码)'
+                    else:
+                        _why = f'混淆特征评分 {ast_result.obfuscation_score:.0%}'
+
                     result['indicators'].append({
                         'name': 'ast_webshell_confirmed',
                         'weight': 40,
                         'pattern': '',
                         'matched_text': param_name,
-                        'description': '[AST] 语义分析确认: 存在污点数据流入危险函数'
+                        'description': f'[AST] 语义分析确认: {_why}'
                     })
                     total_adjustment += 40
 
